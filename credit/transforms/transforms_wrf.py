@@ -92,10 +92,30 @@ class NormalizeWRF:
         # ======================================================================= #
         # boundary condition data handling
         # ======================================================================= #
-        self.mean_ds_outside = xr.open_dataset(conf["data"]["boundary"]["mean_path"]).load()
-        self.std_ds_outside = xr.open_dataset(conf["data"]["boundary"]["std_path"]).load()
+        boundary_conf = conf["data"]["boundary"]
+        varnames_all_outside = boundary_conf.get(
+            "all_varnames",
+            boundary_conf.get("variables", []) + boundary_conf.get("surface_variables", []),
+        )
 
-        varnames_all_outside = conf["data"]["boundary"]["all_varnames"]
+        reuse_interior_boundary_stats = boundary_conf.get("reuse_interior_stats", False)
+        has_boundary_stats = ("mean_path" in boundary_conf) and ("std_path" in boundary_conf)
+
+        if has_boundary_stats and not reuse_interior_boundary_stats:
+            self.mean_ds_outside = xr.open_dataset(boundary_conf["mean_path"]).load()
+            self.std_ds_outside = xr.open_dataset(boundary_conf["std_path"]).load()
+            logger.info("Boundary domain z-score parameters loaded")
+        else:
+            missing_vars = [var for var in varnames_all_outside if var not in self.mean_ds.data_vars or var not in self.std_ds.data_vars]
+            if missing_vars:
+                raise KeyError(
+                    "Boundary stats are configured to reuse interior stats, but these boundary variables are missing "
+                    f"from interior mean/std files: {missing_vars}"
+                )
+
+            self.mean_ds_outside = self.mean_ds[varnames_all_outside].load()
+            self.std_ds_outside = self.std_ds[varnames_all_outside].load()
+            logger.info("Boundary domain reuses interior z-score parameters")
 
         self.mean_tensors_outside = {}
         self.std_tensors_outside = {}
@@ -117,11 +137,9 @@ class NormalizeWRF:
         )
 
         # Get surface varnames
-        if self.flag_surface:
+        if self.flag_surface_outside:
             self.varname_surface_outside = conf["data"]["boundary"]["surface_variables"]
             self.num_surface_outside = len(self.varname_surface_outside)
-
-        logger.info("Boundary domain z-score parameters loaded")
 
     def __call__(self, sample, inverse: bool = False):
         if inverse:
@@ -354,6 +372,7 @@ class ToTensorWRF:
 
         # get dynamic forcing varnames
         self.num_forcing_static = 0
+        self.flag_static_first = ("static_first" in conf["data"]) and (conf["data"]["static_first"])
 
         if self.flag_dyn_forcing:
             self.varname_dyn_forcing = conf["data"]["dynamic_forcing_variables"]
@@ -379,13 +398,8 @@ class ToTensorWRF:
         else:
             self.varname_static = []
 
-        if self.flag_forcing or self.flag_static:
+        if self.flag_dyn_forcing or self.flag_forcing or self.flag_static:
             self.has_forcing_static = True
-            # ======================================================================================== #
-            # forcing variable first (new models) vs. static variable first (some old models)
-            # this flag makes sure that the class is compatible with some old CREDIT models
-            self.flag_static_first = ("static_first" in conf["data"]) and (conf["data"]["static_first"])
-            # ======================================================================================== #
         else:
             self.has_forcing_static = False
 

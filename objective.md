@@ -1,0 +1,4 @@
+My current objective is to correct a weather forecast's microphysical state by learning relationship between radar reflectivity errors (Z; delta REFL_10) and ther required adjustments to rain mixing ratio and rain number concentration.
+The grid or spatial input consists of 2D spatial fields of: delta Z (reflectivity difference), Background Z (reflectivity of current timestamp), Background atmospheric state (T,Z,Q,U,V,W)
+Condition input: A scalar representing the forecasting lead time or time difference normalized between 0 and 1
+The grid output will be 3D spatial fields consisting of the increments delta rain mixing ratio and delta rain number concentration.

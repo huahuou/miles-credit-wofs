@@ -133,7 +133,7 @@ class Trainer(BaseTrainer):
 
                 # save training metrics
                 for name, value in metrics_dict.items():
-                    value = torch.Tensor([value]).cuda(self.device, non_blocking=True)
+                    value = torch.tensor([value], device=self.device)
                     if distributed:
                         dist.all_reduce(value, dist.ReduceOp.AVG, async_op=False)
                     results_dict[f"train_{name}"].append(value[0].item())
@@ -159,7 +159,7 @@ class Trainer(BaseTrainer):
             optimizer.zero_grad()
 
             # Handle batch_loss
-            batch_loss = torch.Tensor([logs["loss"]]).cuda(self.device)
+            batch_loss = torch.tensor([logs["loss"]], device=self.device)
 
             if distributed:
                 dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
@@ -303,14 +303,14 @@ class Trainer(BaseTrainer):
                 metrics_dict = metrics(y_pred.float(), y.float())
 
                 for name, value in metrics_dict.items():
-                    value = torch.Tensor([value]).cuda(self.device, non_blocking=True)
+                    value = torch.tensor([value], device=self.device)
 
                     if distributed:
                         dist.all_reduce(value, dist.ReduceOp.AVG, async_op=False)
 
                     results_dict[f"valid_{name}"].append(value[0].item())
 
-                batch_loss = torch.Tensor([loss.item()]).cuda(self.device)
+                batch_loss = torch.tensor([loss.item()], device=self.device)
 
                 if distributed:
                     torch.distributed.barrier()

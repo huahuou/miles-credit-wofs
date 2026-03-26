@@ -6,8 +6,17 @@ import logging
 from credit.datasets.multi_source import MultiSourceDataset
 from credit.datasets.era5 import ERA5Dataset, ARCOERA5Dataset
 from credit.datasets.MRMS import MRMSDataset
+from credit.datasets.wrf_wofs_singlestep import WoFSSingleStepDataset
+from credit.datasets.wrf_wofs_multistep import WoFSMultiStep
 
-__all__ = ["MultiSourceDataset", "ERA5Dataset", "MRMSDataset", "ARCOERA5Dataset"]
+__all__ = [
+    "MultiSourceDataset",
+    "ERA5Dataset",
+    "MRMSDataset",
+    "ARCOERA5Dataset",
+    "WoFSSingleStepDataset",
+    "WoFSMultiStep",
+]
 
 
 logger = logging.getLogger(__name__)

@@ -19,6 +19,20 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _rollout_length(batch):
+    return int(batch["forecast_step"].shape[1])
+
+
+def _select_rollout_step(batch, step_index):
+    step_batch = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim >= 2:
+            step_batch[key] = value[:, step_index, ...]
+        else:
+            step_batch[key] = value
+    return step_batch
+
+
 class Trainer(BaseTrainer):
     """
     Trainer class for handling the training, validation, and checkpointing of models.
@@ -128,43 +142,45 @@ class Trainer(BaseTrainer):
         for steps in range(batches_per_epoch):
             logs = {}
             loss = 0
-            stop_forecast = False
             y_pred = None  # Place holder that gets updated after first roll-out
 
-            while not stop_forecast:
-                batch = next(dl)
-                forecast_step = batch["forecast_step"].item()
+            batch = next(dl)
+            rollout_len = _rollout_length(batch)
+
+            for step_index in range(rollout_len):
+                step_batch = _select_rollout_step(batch, step_index)
+                forecast_step = int(step_batch["forecast_step"][0].item())
 
                 if forecast_step == 1:
                     # --------------------------------------------------------------------------------- #
-                    if "x_surf" in batch:
+                    if "x_surf" in step_batch:
                         # combine x and x_surf
                         # input: (batch_num, time, var, level, lat, lon), (batch_num, time, var, lat, lon)
                         # output: (batch_num, var, time, lat, lon), 'x' first and then 'x_surf'
-                        x = concat_and_reshape(batch["x"], batch["x_surf"]).to(self.device)
+                        x = concat_and_reshape(step_batch["x"], step_batch["x_surf"]).to(self.device)
                     else:
                         # no x_surf
-                        x = reshape_only(batch["x"]).to(self.device)
+                        x = reshape_only(step_batch["x"]).to(self.device)
 
                 # --------------------------------------------------------------------------------- #
                 # add forcing and static variables
-                if "x_forcing_static" in batch:
+                if "x_forcing_static" in step_batch:
                     # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                    x_forcing_batch = batch["x_forcing_static"].to(self.device).permute(0, 2, 1, 3, 4)
+                    x_forcing_batch = step_batch["x_forcing_static"].to(self.device).permute(0, 2, 1, 3, 4)
 
                     # concat on var dimension
                     x = torch.cat((x, x_forcing_batch), dim=1)
 
                 # --------------------------------------------------------------------------------- #
                 # boundary conditions
-                if "x_surf_boundary" in batch:
-                    x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device)
+                if "x_surf_boundary" in step_batch:
+                    x_boundary = concat_and_reshape(step_batch["x_boundary"], step_batch["x_surf_boundary"]).to(self.device)
                 else:
-                    x_boundary = reshape_only(batch["x_boundary"]).to(self.device)
+                    x_boundary = reshape_only(step_batch["x_boundary"]).to(self.device)
 
                 # --------------------------------------------------------------------------------- #
                 # time encoding
-                x_time_encode = batch["x_time_encode"].to(self.device)
+                x_time_encode = step_batch["x_time_encode"].to(self.device)
 
                 # predict with the model
                 with autocast(enabled=amp):
@@ -175,14 +191,14 @@ class Trainer(BaseTrainer):
                     # calculate rolling loss
                     # --------------------------------------------------------------------------------- #
                     # combine y and y_surf
-                    if "y_surf" in batch:
-                        y = concat_and_reshape(batch["y"], batch["y_surf"]).to(self.device)
+                    if "y_surf" in step_batch:
+                        y = concat_and_reshape(step_batch["y"], step_batch["y_surf"]).to(self.device)
                     else:
-                        y = reshape_only(batch["y"]).to(self.device)
+                        y = reshape_only(step_batch["y"]).to(self.device)
 
-                    if "y_diag" in batch:
+                    if "y_diag" in step_batch:
                         # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                        y_diag_batch = batch["y_diag"].to(self.device).permute(0, 2, 1, 3, 4)
+                        y_diag_batch = step_batch["y_diag"].to(self.device).permute(0, 2, 1, 3, 4)
 
                         # concat on var dimension
                         y = torch.cat((y, y_diag_batch), dim=1)
@@ -200,14 +216,14 @@ class Trainer(BaseTrainer):
                     torch.distributed.barrier()
 
                 # stop after X steps
-                stop_forecast = batch["stop_forecast"].item()
+                stop_forecast = bool(step_batch["stop_forecast"][0].item())
                 if stop_forecast:
                     break
 
                 # step-in-step-out
                 if x.shape[2] == 1:
                     # cut diagnostic vars from y_pred, they are not inputs
-                    if "y_diag" in batch:
+                    if "y_diag" in step_batch:
                         x = y_pred[:, :-varnum_diag, ...].detach()
                     else:
                         x = y_pred.detach()
@@ -222,7 +238,7 @@ class Trainer(BaseTrainer):
                         x_detach = x[:, :-static_dim_size, 1:, ...].detach()
 
                     # cut diagnostic vars from y_pred, they are not inputs
-                    if "y_diag" in batch:
+                    if "y_diag" in step_batch:
                         x = torch.cat([x_detach, y_pred[:, :-varnum_diag, ...].detach()], dim=2)
                     else:
                         x = torch.cat([x_detach, y_pred.detach()], dim=2)
@@ -239,12 +255,12 @@ class Trainer(BaseTrainer):
             # Metrics
             metrics_dict = metrics(y_pred, y)
             for name, value in metrics_dict.items():
-                value = torch.Tensor([value]).cuda(self.device, non_blocking=True)
+                value = torch.tensor([value], device=self.device)
                 if distributed:
                     dist.all_reduce(value, dist.ReduceOp.AVG, async_op=False)
                 results_dict[f"train_{name}"].append(value[0].item())
 
-            batch_loss = torch.Tensor([logs["loss"]]).cuda(self.device)
+            batch_loss = torch.tensor([logs["loss"]], device=self.device)
             if distributed:
                 dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
             results_dict["train_loss"].append(batch_loss[0].item())
@@ -253,9 +269,9 @@ class Trainer(BaseTrainer):
             if not np.isfinite(np.mean(results_dict["train_loss"])):
                 print(
                     results_dict["train_loss"],
-                    batch["x"].shape,
-                    batch["y"].shape,
-                    batch["index"],
+                    step_batch["x"].shape,
+                    step_batch["y"].shape,
+                    step_batch["index"],
                 )
                 try:
                     raise optuna.TrialPruned()
@@ -343,48 +359,49 @@ class Trainer(BaseTrainer):
 
         batch_group_generator = tqdm.tqdm(range(valid_batches_per_epoch), total=valid_batches_per_epoch, leave=True)
 
-        stop_forecast = False
         dl = cycle(valid_loader)
         with torch.no_grad():
             for steps in range(valid_batches_per_epoch):
                 loss = 0
-                stop_forecast = False
                 y_pred = None  # Place holder that gets updated after first roll-out
-                while not stop_forecast:
-                    batch = next(dl)
-                    forecast_step = batch["forecast_step"].item()
-                    stop_forecast = batch["stop_forecast"].item()
+                batch = next(dl)
+                rollout_len = _rollout_length(batch)
+
+                for step_index in range(rollout_len):
+                    step_batch = _select_rollout_step(batch, step_index)
+                    forecast_step = int(step_batch["forecast_step"][0].item())
+                    stop_forecast = bool(step_batch["stop_forecast"][0].item())
 
                     if forecast_step == 1:
                         # --------------------------------------------------------------------------------- #
-                        if "x_surf" in batch:
+                        if "x_surf" in step_batch:
                             # combine x and x_surf
                             # input: (batch_num, time, var, level, lat, lon), (batch_num, time, var, lat, lon)
                             # output: (batch_num, var, time, lat, lon), 'x' first and then 'x_surf'
-                            x = concat_and_reshape(batch["x"], batch["x_surf"]).to(self.device)
+                            x = concat_and_reshape(step_batch["x"], step_batch["x_surf"]).to(self.device)
                         else:
                             # no x_surf
-                            x = reshape_only(batch["x"]).to(self.device)
+                            x = reshape_only(step_batch["x"]).to(self.device)
 
                     # --------------------------------------------------------------------------------- #
                     # add forcing and static variables
-                    if "x_forcing_static" in batch:
+                    if "x_forcing_static" in step_batch:
                         # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                        x_forcing_batch = batch["x_forcing_static"].to(self.device).permute(0, 2, 1, 3, 4)
+                        x_forcing_batch = step_batch["x_forcing_static"].to(self.device).permute(0, 2, 1, 3, 4)
 
                         # concat on var dimension
                         x = torch.cat((x, x_forcing_batch), dim=1)
 
                     # --------------------------------------------------------------------------------- #
                     # boundary conditions
-                    if "x_surf_boundary" in batch:
-                        x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device)
+                    if "x_surf_boundary" in step_batch:
+                        x_boundary = concat_and_reshape(step_batch["x_boundary"], step_batch["x_surf_boundary"]).to(self.device)
                     else:
-                        x_boundary = reshape_only(batch["x_boundary"]).to(self.device)
+                        x_boundary = reshape_only(step_batch["x_boundary"]).to(self.device)
 
                     # --------------------------------------------------------------------------------- #
                     # time encoding
-                    x_time_encode = batch["x_time_encode"].to(self.device)
+                    x_time_encode = step_batch["x_time_encode"].to(self.device)
 
                     y_pred = self.model(x, x_boundary, x_time_encode)
 
@@ -394,14 +411,14 @@ class Trainer(BaseTrainer):
                         # calculate rolling loss
                         # --------------------------------------------------------------------------------- #
                         # combine y and y_surf
-                        if "y_surf" in batch:
-                            y = concat_and_reshape(batch["y"], batch["y_surf"]).to(self.device)
+                        if "y_surf" in step_batch:
+                            y = concat_and_reshape(step_batch["y"], step_batch["y_surf"]).to(self.device)
                         else:
-                            y = reshape_only(batch["y"]).to(self.device)
+                            y = reshape_only(step_batch["y"]).to(self.device)
 
-                        if "y_diag" in batch:
+                        if "y_diag" in step_batch:
                             # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                            y_diag_batch = batch["y_diag"].to(self.device).permute(0, 2, 1, 3, 4)
+                            y_diag_batch = step_batch["y_diag"].to(self.device).permute(0, 2, 1, 3, 4)
 
                             # concat on var dimension
                             y = torch.cat((y, y_diag_batch), dim=1)
@@ -415,7 +432,7 @@ class Trainer(BaseTrainer):
                         metrics_dict = metrics(y_pred.float(), y.float())
 
                         for name, value in metrics_dict.items():
-                            value = torch.Tensor([value]).cuda(self.device, non_blocking=True)
+                            value = torch.tensor([value], device=self.device)
 
                             if distributed:
                                 dist.all_reduce(value, dist.ReduceOp.AVG, async_op=False)
@@ -431,7 +448,7 @@ class Trainer(BaseTrainer):
                     # step-in-step-out
                     elif history_len == 1:
                         # cut diagnostic vars from y_pred, they are not inputs
-                        if "y_diag" in batch:
+                        if "y_diag" in step_batch:
                             x = y_pred[:, :-varnum_diag, ...].detach()
                         else:
                             x = y_pred.detach()
@@ -444,12 +461,12 @@ class Trainer(BaseTrainer):
                             x_detach = x[:, :-static_dim_size, 1:, ...].detach()
 
                         # cut diagnostic vars from y_pred, they are not inputs
-                        if "y_diag" in batch:
+                        if "y_diag" in step_batch:
                             x = torch.cat([x_detach, y_pred[:, :-varnum_diag, ...].detach()], dim=2)
                         else:
                             x = torch.cat([x_detach, y_pred.detach()], dim=2)
 
-                batch_loss = torch.Tensor([loss.item()]).cuda(self.device)
+                batch_loss = torch.tensor([loss.item()], device=self.device)
 
                 if distributed:
                     torch.distributed.barrier()

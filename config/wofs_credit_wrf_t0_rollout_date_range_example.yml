@@ -1,0 +1,104 @@
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment'
+seed: 1000
+
+data:
+  scaler_type: 'std-wrf'
+
+  # Interior WoFS prognostic/state dataset produced by the credit_wrf target.
+  variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  surface_variables: ['T2', 'Q2', 'U10', 'V10']
+  dynamic_forcing_variables: ['cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation']
+  diagnostic_variables: ['COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+  forcing_variables: ['cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude']
+  static_variables: ['XLAND', 'HGT']
+
+  # Per-case/per-member zarr files, e.g. wofs_20190429_0000_mem01.zarr
+  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
+  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
+  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
+  save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
+
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/std.nc'
+
+  # Keep the legacy year fields because the parser expects them.
+  # The WoFS train/test apps will use the date ranges below when present.
+  train_years: [2019]
+  valid_years: [2019]
+
+  # Inclusive YYYYMMDD date filtering for WoFS case filenames.
+  train_date_range: ['20190401', '20190701']
+  valid_date_range: ['20190702', '20191030']
+
+  history_len: 1
+  valid_history_len: 1
+  forecast_len: 1
+  valid_forecast_len: 1
+  lead_time_periods: 1
+  levels: 8
+  static_first: False
+
+  boundary:
+    variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+    surface_variables: ['T2', 'Q2', 'U10', 'V10']
+    reuse_interior_stats: True
+    levels: 8
+    history_len: 1
+    forecast_len: 0
+    all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10']
+
+  all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+
+model:
+  type: 'wrf'
+  levels: 8
+  param_interior:
+    frames: 1
+    image_height: 300
+    image_width: 300
+    levels: 8
+    channels: 6
+    surface_channels: 4
+    input_only_channels: 10
+    output_only_channels: 6
+    patch_height: 1
+    patch_width: 1
+    frame_patch_size: 1
+    dim: 96
+  param_outside:
+    frames: 1
+    image_height: 300
+    image_width: 300
+    levels: 8
+    channels: 6
+    surface_channels: 4
+    patch_height: 1
+    patch_width: 1
+    frame_patch_size: 1
+    dim: 96
+  depth: 2
+  num_heads: 4
+  window_size: 5
+  use_spectral_norm: True
+
+loss:
+  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/latitude_weights_placeholder.nc'
+  use_latitude_weights: False
+  use_variable_weights: False
+  training_loss: 'mse'
+  variable_weights:
+    T: 1.0
+    QVAPOR: 1.0
+    U: 1.0
+    V: 1.0
+    W: 1.0
+    GEOPOT: 1.0
+
+predict:
+  mode: 'none'
+  save_forecast: '/tmp/credit_wofs_rollout_example'
+  save_vars: []
+  metadata: False
+  # Inclusive file-date selection on case filenames.
+  custom_date_range: ['20190702', '20191030']
+  max_cases: 1
