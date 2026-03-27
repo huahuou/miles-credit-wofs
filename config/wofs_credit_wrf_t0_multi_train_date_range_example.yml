@@ -1,4 +1,4 @@
-save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi'
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0327'
 seed: 1000
 
 data:
@@ -57,10 +57,10 @@ model:
     surface_channels: 4
     input_only_channels: 10
     output_only_channels: 6
-    patch_height: 1
-    patch_width: 1
+    patch_height: 4
+    patch_width: 4
     frame_patch_size: 1
-    dim: 96
+    dim: 192
   param_outside:
     frames: 1
     image_height: 300
@@ -68,13 +68,13 @@ model:
     levels: 17
     channels: 6
     surface_channels: 4
-    patch_height: 1
-    patch_width: 1
+    patch_height: 4
+    patch_width: 4
     frame_patch_size: 1
-    dim: 96
-  depth: 2
-  num_heads: 4
-  window_size: 5
+    dim: 192
+  depth: 24
+  num_heads: 8
+  window_size: 7
   use_spectral_norm: True
 
 trainer:
@@ -86,19 +86,34 @@ trainer:
   valid_batches_per_epoch: 0
   thread_workers: 16
   valid_thread_workers: 16
+  prefetch_factor: 4
+  update_learning_rate: False
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   amp: False
-  epochs: 60
+  epochs: 30
   start_epoch: 0
   load_weights: False
   load_optimizer: False
   load_scheduler: False
   load_scaler: False
   skip_validation: True
-  use_scheduler: False
+  use_scheduler: True
+  reload_epoch: True
+  epochs: &epochs 30
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 250
+    cycle_mult: 6.0
+    max_lr: 1.0e-03
+    min_lr: 1.0e-06
+    warmup_steps: 249
+    gamma: 0.7
   grad_max_norm: 1.0
-
+  grad_accum_every: 4
+  save_backup_weights: True
+  save_best_weights: True
+  save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
 loss:
   latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/latitude_weights_placeholder.nc'
   use_latitude_weights: False

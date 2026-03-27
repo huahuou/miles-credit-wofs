@@ -1,298 +1,369 @@
-import torch
-from torch import nn
-from torch.nn import functional as F
-from timm.layers.helpers import to_2tuple
-from timm.models.swin_transformer_v2 import SwinTransformerV2Stage
+# credit/models/swin_wrf.py
+#
+# Drop-in replacement for the original swin_wrf.py.
+#
+# Key change: WRFTransformer now accepts any spatial resolution at forward()
+# time without reinitialising the model. This enables pretraining at one
+# resolution (e.g. 300×300) and fine-tuning at another (e.g. 900×900) using
+# the exact same checkpoint.
+#
+# How it works (three coordinated fixes):
+#   1. CubeEmbedding.forward()  – derive patch-grid shape from the actual
+#      Conv3d output instead of the init-time stored patches_resolution.
+#   2. UTransformer              – pass dynamic_mask=True to SwinTransformerV2Stage
+#      so the attention mask is recomputed every forward() from the live tensor
+#      shape; pad/crop in forward() from the live tensor, not a stored constant.
+#   3. WRFTransformer.forward()  – store the original (H, W) before any padding,
+#      derive Lat/Lon from the actual embedding output, and crop (not bilinear-
+#      resize) back to original resolution at the end.
+#
+# Every public argument is identical to the original; existing YAML configs and
+# checkpoint keys are fully compatible.
+
 import logging
 
-from credit.postblock import PostBlock
-from credit.models.base_model import BaseModel
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.layers.helpers import to_2tuple
+from timm.models.swin_transformer_v2 import SwinTransformerV2Stage
+
 from credit.boundary_padding import TensorPadding
+from credit.models.base_model import BaseModel
+from credit.postblock import PostBlock
 
 logger = logging.getLogger(__name__)
 
 
-def apply_spectral_norm(model):
-    """
-    add spectral norm to all the conv and linear layers
-    """
+# ---------------------------------------------------------------------------
+# Spectral norm helper  (unchanged)
+# ---------------------------------------------------------------------------
+
+def apply_spectral_norm(model: nn.Module) -> None:
+    """Add spectral norm to all Conv2d, Linear and ConvTranspose2d layers."""
     for module in model.modules():
         if isinstance(module, (nn.Conv2d, nn.Linear, nn.ConvTranspose2d)):
             nn.utils.spectral_norm(module)
 
 
+# ---------------------------------------------------------------------------
+# Padding helpers  (unchanged – kept for TensorPadding / outside-domain use)
+# ---------------------------------------------------------------------------
+
 def get_pad3d(input_resolution, window_size):
     """
-    Estimate the size of padding based on the given window size and the original input size.
+    Estimate padding so that input_resolution is divisible by window_size.
 
     Args:
         input_resolution (tuple[int]): (Pl, Lat, Lon)
-        window_size (tuple[int]): (Pl, Lat, Lon)
+        window_size      (tuple[int]): (Pl, Lat, Lon)
 
     Returns:
-        padding (tuple[int]): (padding_left, padding_right, padding_top, padding_bottom, padding_front, padding_back)
+        (padding_left, padding_right, padding_top, padding_bottom,
+         padding_front, padding_back)
     """
     Pl, Lat, Lon = input_resolution
     win_pl, win_lat, win_lon = window_size
 
-    padding_left = padding_right = padding_top = padding_bottom = padding_front = padding_back = 0
-    pl_remainder = Pl % win_pl
+    padding_left = padding_right = padding_top = padding_bottom = \
+        padding_front = padding_back = 0
+
+    pl_remainder  = Pl  % win_pl
     lat_remainder = Lat % win_lat
     lon_remainder = Lon % win_lon
 
     if pl_remainder:
         pl_pad = win_pl - pl_remainder
         padding_front = pl_pad // 2
-        padding_back = pl_pad - padding_front
+        padding_back  = pl_pad - padding_front
     if lat_remainder:
         lat_pad = win_lat - lat_remainder
-        padding_top = lat_pad // 2
+        padding_top    = lat_pad // 2
         padding_bottom = lat_pad - padding_top
     if lon_remainder:
         lon_pad = win_lon - lon_remainder
-        padding_left = lon_pad // 2
+        padding_left  = lon_pad // 2
         padding_right = lon_pad - padding_left
 
-    return (
-        padding_left,
-        padding_right,
-        padding_top,
-        padding_bottom,
-        padding_front,
-        padding_back,
-    )
+    return (padding_left, padding_right, padding_top, padding_bottom,
+            padding_front, padding_back)
 
 
 def get_pad2d(input_resolution, window_size):
     """
+    2-D wrapper around get_pad3d.
+
     Args:
-        input_resolution (tuple[int]): Lat, Lon
-        window_size (tuple[int]): Lat, Lon
+        input_resolution (tuple[int]): (Lat, Lon)
+        window_size      (tuple[int]): (Lat, Lon)
 
     Returns:
-        padding (tuple[int]): (padding_left, padding_right, padding_top, padding_bottom)
+        (padding_left, padding_right, padding_top, padding_bottom)
     """
     input_resolution = [2] + list(input_resolution)
-    window_size = [2] + list(window_size)
-    padding = get_pad3d(input_resolution, window_size)
-    return padding[:4]
+    window_size      = [2] + list(window_size)
+    return get_pad3d(input_resolution, window_size)[:4]
 
+
+# ---------------------------------------------------------------------------
+# CubeEmbedding  – FIX 1: derive patch-grid shape dynamically
+# ---------------------------------------------------------------------------
 
 class CubeEmbedding(nn.Module):
     """
+    3-D patch embedding via Conv3d.
+
     Args:
-        img_size: T, Lat, Lon
-        patch_size: T, Lat, Lon
+        img_size   (tuple[int]): (T, Lat, Lon)  – used only to store metadata.
+        patch_size (tuple[int]): (T, Lat, Lon)
+        in_chans   (int): number of input channels (variables × levels + surface).
+        embed_dim  (int): output embedding dimension.
+        norm_layer: normalisation class (default: nn.LayerNorm).
+
+    Shape contract
+    ~~~~~~~~~~~~~~
+    forward input : (B, T, C, Lat, Lon)   – any Lat / Lon
+    forward output: (B, embed_dim, T_p, Lat_p, Lon_p)
+                    where *_p = *_original // patch_*
     """
 
-    def __init__(self, img_size, patch_size, in_chans, embed_dim, norm_layer=nn.LayerNorm):
+    def __init__(self, img_size, patch_size, in_chans, embed_dim,
+                 norm_layer=nn.LayerNorm):
         super().__init__()
+        self.img_size  = img_size
+        self.embed_dim = embed_dim
 
-        # input size
-        self.img_size = img_size
-
-        # number of patches after embedding (T_num, Lat_num, Lon_num)
-        patches_resolution = [
+        # Stored only for reference / logging; NOT used in forward().
+        self.patches_resolution = [
             img_size[0] // patch_size[0],
             img_size[1] // patch_size[1],
             img_size[2] // patch_size[2],
         ]
-        self.patches_resolution = patches_resolution
 
-        # number of embedded dimension after patching
-        self.embed_dim = embed_dim
+        # Conv3d is inherently resolution-flexible when stride == kernel_size.
+        self.proj = nn.Conv3d(
+            in_chans, embed_dim,
+            kernel_size=patch_size, stride=patch_size,
+        )
 
-        # Conv3d-based patching
-        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = norm_layer(embed_dim) if norm_layer is not None else None
 
-        # layer norm
-        if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
-        else:
-            self.norm = None
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C, Lat, Lon)
+        B = x.shape[0]
 
-    def forward(self, x: torch.Tensor):
-        # example size: [Batch, 67, 2, 640, 1280]
-        B, T, C, Lat, Lon = x.shape
-
-        # Conv3d-based patching and embedding
-        # output size: [B, 1024, 1, 40, 80]
+        # (B, embed_dim, T_p, Lat_p, Lon_p)  – actual size from the convolution
         x = self.proj(x)
 
-        # combine T, Lat, Lon dimensions
-        # output size: [B, 1024, 3200]
-        x = x.reshape(B, self.embed_dim, -1)
+        # --- FIX 1 -------------------------------------------------------
+        # Read the actual spatial output shape from the tensor, NOT from the
+        # init-time stored patches_resolution.  This is what makes CubeEmbedding
+        # resolution-agnostic.
+        _, E, Tp, Latp, Lonp = x.shape
+        # -----------------------------------------------------------------
 
-        # switch to channel-last for normalization
-        # output size: [B, 3200, 1024]
-        x = x.transpose(1, 2)  # B T*Lat*Lon C
-
-        # Layer norm (channel last)
+        # Flatten spatial dims → apply LayerNorm → restore
+        x = x.reshape(B, E, -1).transpose(1, 2)        # (B, T_p*Lat_p*Lon_p, E)
         if self.norm is not None:
             x = self.norm(x)
-
-        # switch back to channel first
-        # output size: [B, 1024, 3200]
-        x = x.transpose(1, 2)
-
-        # recover T, Lat, Lon dimensions
-        # output size: [B, 1024, 1, 40, 80]
-        x = x.reshape(B, self.embed_dim, *self.patches_resolution)
+        x = x.transpose(1, 2).reshape(B, E, Tp, Latp, Lonp)
 
         return x
 
 
+# ---------------------------------------------------------------------------
+# DownBlock / UpBlock  (unchanged)
+# ---------------------------------------------------------------------------
+
 class DownBlock(nn.Module):
-    def __init__(self, in_chans: int, out_chans: int, num_groups: int, num_residuals: int = 2):
+    """Conv2d stride-2 downsampling + residual path."""
+
+    def __init__(self, in_chans: int, out_chans: int,
+                 num_groups: int, num_residuals: int = 2):
         super().__init__()
-
-        # down-sampling with Conv2d
-        self.conv = nn.Conv2d(in_chans, out_chans, kernel_size=(3, 3), stride=2, padding=1)
-
-        # blocks of residual path
+        self.conv = nn.Conv2d(in_chans, out_chans,
+                              kernel_size=(3, 3), stride=2, padding=1)
         blk = []
-        for i in range(num_residuals):
-            blk.append(nn.Conv2d(out_chans, out_chans, kernel_size=3, stride=1, padding=1))
-            blk.append(nn.GroupNorm(num_groups, out_chans))
-            blk.append(nn.SiLU())
+        for _ in range(num_residuals):
+            blk += [
+                nn.Conv2d(out_chans, out_chans, kernel_size=3,
+                          stride=1, padding=1),
+                nn.GroupNorm(num_groups, out_chans),
+                nn.SiLU(),
+            ]
         self.b = nn.Sequential(*blk)
 
-    def forward(self, x):
-        # down-sampling
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
-
-        # skip-connection
-        shortcut = x
-
-        # residual path
-        x = self.b(x)
-
-        # additive residual connection
-        return x + shortcut
+        return x + self.b(x)
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_chans, out_chans, num_groups, num_residuals=2):
+    """ConvTranspose2d stride-2 upsampling + residual path."""
+
+    def __init__(self, in_chans: int, out_chans: int,
+                 num_groups: int, num_residuals: int = 2):
         super().__init__()
-
-        # down-sampling with Transpose Conv
-        self.conv = nn.ConvTranspose2d(in_chans, out_chans, kernel_size=2, stride=2)
-
-        # blocks of residual path
+        self.conv = nn.ConvTranspose2d(in_chans, out_chans,
+                                       kernel_size=2, stride=2)
         blk = []
-        for i in range(num_residuals):
-            blk.append(nn.Conv2d(out_chans, out_chans, kernel_size=3, stride=1, padding=1))
-            blk.append(nn.GroupNorm(num_groups, out_chans))
-            blk.append(nn.SiLU())
+        for _ in range(num_residuals):
+            blk += [
+                nn.Conv2d(out_chans, out_chans, kernel_size=3,
+                          stride=1, padding=1),
+                nn.GroupNorm(num_groups, out_chans),
+                nn.SiLU(),
+            ]
         self.b = nn.Sequential(*blk)
 
-    def forward(self, x):
-        # up-sampling
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
+        return x + self.b(x)
 
-        # skip-connection
-        shortcut = x
 
-        # residual path
-        x = self.b(x)
-
-        # additive residual connection
-        return x + shortcut
-
+# ---------------------------------------------------------------------------
+# UTransformer  – FIX 2: dynamic padding and dynamic_mask=True
+# ---------------------------------------------------------------------------
 
 class UTransformer(nn.Module):
-    """U-Transformer
+    """
+    U-shaped Transformer stage: DownBlock → SwinV2Stage → UpBlock.
+
+    Changes vs. the original
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    * ``SwinTransformerV2Stage`` is initialised with ``dynamic_mask=True``
+      so the shifted-window attention mask is recomputed inside every
+      forward() call from the live tensor dimensions.  This is the flag
+      that timm exposes precisely for this use-case.
+    * The pad/crop in forward() is now computed from the *live* tensor
+      shape instead of the fixed ``self.padding`` tuple baked at init time,
+      so any input resolution flows through correctly.
+    * ``self.window_size`` (int) is stored so forward() can compute the
+      window-divisible padding on the fly.
+
     Args:
-        embed_dim (int): Patch embedding dimension.
-        num_groups (int | tuple[int]): number of groups to separate the channels into.
-        input_resolution (tuple[int]): Lat, Lon.
-        num_heads (int): Number of attention heads in different layers.
-        window_size (int | tuple[int]): Window size.
-        depth (int): Number of blocks.
+        embed_dim        (int)
+        num_groups       (int | tuple[int])
+        input_resolution (tuple[int]): (Lat, Lon) – used **only** to
+                          initialise SwinTransformerV2Stage; NOT used in
+                          forward() to determine padding.
+        num_heads        (int)
+        window_size      (int | tuple[int])
+        depth            (int)
+        drop_path        (float | list[float])
     """
 
-    def __init__(
-        self,
-        embed_dim,
-        num_groups,
-        input_resolution,
-        num_heads,
-        window_size,
-        depth,
-        drop_path,
-    ):
+    def __init__(self, embed_dim, num_groups, input_resolution,
+                 num_heads, window_size, depth, drop_path):
         super().__init__()
-        num_groups = to_2tuple(num_groups)
-        window_size = to_2tuple(window_size)  # convert window_size[int] to tuple
+        num_groups  = to_2tuple(num_groups)
+        window_size = to_2tuple(window_size)
 
-        # padding input tensors so they are divided by the window size
-        padding = get_pad2d(input_resolution, window_size)  # <--- Accepts tuple only
-        padding_left, padding_right, padding_top, padding_bottom = padding
-        self.padding = padding
-        self.pad = nn.ZeroPad2d(padding)
+        # Store window_size as int for the dynamic padding in forward().
+        self.window_size_int = window_size[0]
 
-        # input resolution after padding
-        input_resolution = list(input_resolution)
-        input_resolution[0] = input_resolution[0] + padding_top + padding_bottom
-        input_resolution[1] = input_resolution[1] + padding_left + padding_right
-
-        # down-sampling block
+        # DownBlock operates before the SwinV2 stage and halves spatial dims.
         self.down = DownBlock(embed_dim, embed_dim, num_groups[0])
 
-        # SwinT block
-        self.layer = SwinTransformerV2Stage(
-            embed_dim,
-            embed_dim,
-            input_resolution,
-            depth,
-            num_heads,
-            window_size[0],
-            drop_path=drop_path,
-        )  # <--- window_size[0] get window_size[int] from tuple
+        # Compute the padded input_resolution that was expected at init time.
+        # This is still needed to correctly initialise SwinTransformerV2Stage
+        # (its blocks need *some* input_resolution at construction), but it
+        # is NOT used in forward() for the actual pad/crop logic.
+        init_padding = get_pad2d(input_resolution, window_size)
+        pad_l, pad_r, pad_t, pad_b = init_padding
+        padded_resolution = (
+            input_resolution[0] + pad_t + pad_b,
+            input_resolution[1] + pad_l + pad_r,
+        )
 
-        # up-sampling block
+        # --- FIX 2a ------------------------------------------------------
+        # dynamic_mask=True  →  timm recomputes the SW-MSA attention mask
+        # from the live tensor shape inside SwinTransformerV2Block._attn().
+        # always_partition=True  →  always use the full window_size even
+        # when the feature map is smaller, avoiding the clamp-to-resolution
+        # logic that would silently disable shifted windows.
+        self.layer = SwinTransformerV2Stage(
+            dim=embed_dim,
+            out_dim=embed_dim,
+            input_resolution=padded_resolution,
+            depth=depth,
+            num_heads=num_heads,
+            window_size=window_size[0],
+            always_partition=True,   # don't clamp window to feat size
+            dynamic_mask=True,       # recompute attention mask each forward
+            drop_path=drop_path,
+        )
+        # -----------------------------------------------------------------
+
         self.up = UpBlock(embed_dim * 2, embed_dim, num_groups[1])
 
-    def forward(self, x):
-        B, C, Lat, Lon = x.shape
-        padding_left, padding_right, padding_top, padding_bottom = self.padding
-
-        x = self.down(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, Lat, Lon)
+        x = self.down(x)          # (B, C, Lat/2, Lon/2)
         shortcut = x
 
-        # pad
-        x = self.pad(x)
+        _, _, dLat, dLon = x.shape
+
+        # --- FIX 2b -------------------------------------------------------
+        # Compute window-divisible padding from the *live* tensor shape.
+        # This is the same modulo trick used by WeatherSwinV2UNet.pad_tensor().
+        win = self.window_size_int
+        pad_b_amt = (win - dLat % win) % win
+        pad_r_amt = (win - dLon % win) % win
+        # F.pad format for 4-D NCHW: (left, right, top, bottom)
+        x = F.pad(x, (0, pad_r_amt, 0, pad_b_amt))
         _, _, pad_lat, pad_lon = x.shape
+        # ------------------------------------------------------------------
 
-        x = x.permute(0, 2, 3, 1)  # B Lat Lon C
+        # SwinTransformerV2Stage expects NHWC
+        x = x.permute(0, 2, 3, 1)          # (B, Lat_p, Lon_p, C)
         x = self.layer(x)
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 3, 1, 2)          # (B, C, Lat_p, Lon_p)
 
-        # crop
-        x = x[
-            :,
-            :,
-            padding_top : pad_lat - padding_bottom,
-            padding_left : pad_lon - padding_right,
-        ]
+        # Crop back to the pre-padding shape
+        x = x[:, :, :dLat, :dLon].contiguous()
 
-        # concat
-        x = torch.cat([shortcut, x], dim=1)  # B 2*C Lat Lon
-        x = self.up(x)
+        # U-Net skip connection + upsample
+        x = torch.cat([shortcut, x], dim=1)   # (B, 2C, Lat/2, Lon/2)
+        x = self.up(x)                         # (B, C, Lat, Lon)
         return x
 
 
+# ---------------------------------------------------------------------------
+# WRFTransformer  – FIX 3: dynamic Lat/Lon in forward + crop output
+# ---------------------------------------------------------------------------
+
 class WRFTransformer(BaseModel):
     """
-    Args:
-        img_size (Sequence[int], optional): T, Lat, Lon.
-        patch_size (Sequence[int], optional): T, Lat, Lon.
-        in_chans (int, optional): number of input channels.
-        out_chans (int, optional): number of output channels.
-        dim (int, optional): number of embed channels.
-        num_groups (Sequence[int] | int, optional): number of groups to separate the channels into.
-        num_heads (int, optional): Number of attention heads.
-        window_size (int | tuple[int], optional): Local window size.
+    Dynamic-resolution WRF Transformer.
+
+    Identical public API to the original WRFTransformer; all existing YAML
+    configs and checkpoint files are compatible.
+
+    The key behavioural difference is that forward() accepts *any* spatial
+    resolution for ``x`` and ``x_outside`` and returns an output tensor of
+    the same spatial size as the input – without bilinear interpolation
+    artefacts and without shape-mismatch errors.
+
+    Args  (same as original)
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+        param_interior  (dict): image_height, image_width, patch_height,
+                                patch_width, levels, frames,
+                                frame_patch_size, channels,
+                                surface_channels, input_only_channels,
+                                output_only_channels, dim
+        param_outside   (dict): same keys minus input/output_only_channels
+        time_encode_dim (int)   default 12
+        num_groups      (int)   default 32
+        num_heads       (int)   default 8
+        depth           (int)   default 48
+        window_size     (int)   default 7
+        use_spectral_norm (bool) default True
+        interp          (bool)  default True  ← kept for API compat; no-op
+                                               (crop is used instead)
+        drop_path       (float) default 0
+        padding_conf    (dict)  boundary-padding config
+        post_conf       (dict)  post-processing block config
     """
 
     def __init__(
@@ -305,104 +376,87 @@ class WRFTransformer(BaseModel):
         depth=48,
         window_size=7,
         use_spectral_norm=True,
-        interp=True,
+        interp=True,          # kept for API compat – ignored internally
         drop_path=0,
         padding_conf=None,
         post_conf=None,
         **kwargs,
     ):
         super().__init__()
-        self.time_encode = time_encode_dim
-        image_height_inside = param_interior["image_height"]
-        patch_height_inside = param_interior["patch_height"]
-        image_width_inside = param_interior["image_width"]
-        patch_width_inside = param_interior["patch_width"]
-        levels_inside = param_interior["levels"]
-        frames_inside = param_interior["frames"]
-        frame_patch_size_inside = param_interior["frame_patch_size"]
-        channels_inside = param_interior["channels"]
-        surface_channels_inside = param_interior["surface_channels"]
-        input_only_channels_inside = param_interior["input_only_channels"]
-        output_only_channels_inside = param_interior["output_only_channels"]
-        dim_inside = param_interior["dim"]
 
-        image_height_outside = param_outside["image_height"]
-        patch_height_outside = param_outside["patch_height"]
-        image_width_outside = param_outside["image_width"]
-        patch_width_outside = param_outside["patch_width"]
-        levels_outside = param_outside["levels"]
-        frames_outside = param_outside["frames"]
-        frame_patch_size_outside = param_outside["frame_patch_size"]
-        channels_outside = param_outside["channels"]
-        surface_channels_outside = param_outside["surface_channels"]
-        dim_outside = param_outside["dim"]
-
-        self.use_interp = interp
+        self.time_encode      = time_encode_dim
         self.use_spectral_norm = use_spectral_norm
 
+        # ── interior domain ───────────────────────────────────────────────
+        image_height_inside       = param_interior["image_height"]
+        patch_height_inside       = param_interior["patch_height"]
+        image_width_inside        = param_interior["image_width"]
+        patch_width_inside        = param_interior["patch_width"]
+        levels_inside             = param_interior["levels"]
+        frames_inside             = param_interior["frames"]
+        frame_patch_size_inside   = param_interior["frame_patch_size"]
+        channels_inside           = param_interior["channels"]
+        surface_channels_inside   = param_interior["surface_channels"]
+        input_only_channels_inside  = param_interior["input_only_channels"]
+        output_only_channels_inside = param_interior["output_only_channels"]
+        dim_inside                = param_interior["dim"]
+
+        # ── exterior domain ─────────────────────────────────────────────��─
+        image_height_outside      = param_outside["image_height"]
+        patch_height_outside      = param_outside["patch_height"]
+        image_width_outside       = param_outside["image_width"]
+        patch_width_outside       = param_outside["patch_width"]
+        levels_outside            = param_outside["levels"]
+        frames_outside            = param_outside["frames"]
+        frame_patch_size_outside  = param_outside["frame_patch_size"]
+        channels_outside          = param_outside["channels"]
+        surface_channels_outside  = param_outside["surface_channels"]
+        dim_outside               = param_outside["dim"]
+
+        # ── padding config ────────────────────────────────────────────────
         if padding_conf is None:
             padding_conf = {"activate": False}
-
         self.use_padding = padding_conf["activate"]
 
-        if post_conf is None:
-            post_conf = {"activate": False}
-
-        self.use_post_block = post_conf["activate"]
-
-        # input tensor size (time, lat, lon)
         if self.use_padding:
             pad_lat = padding_conf["pad_lat"]
             pad_lon = padding_conf["pad_lon"]
             image_height_pad = image_height_inside + pad_lat[0] + pad_lat[1]
-            image_width_pad = image_width_inside + pad_lon[0] + pad_lon[1]
-
-            img_size_inside = (frames_inside, image_height_pad, image_width_pad)
-            self.img_size_original = (
-                frames_inside,
-                image_height_inside,
-                image_width_inside,
-            )
+            image_width_pad  = image_width_inside  + pad_lon[0] + pad_lon[1]
+            img_size_inside      = (frames_inside, image_height_pad,   image_width_pad)
+            self.img_size_original = (frames_inside, image_height_inside, image_width_inside)
         else:
-            img_size_inside = (frames_inside, image_height_inside, image_width_inside)
+            img_size_inside      = (frames_inside, image_height_inside, image_width_inside)
             self.img_size_original = img_size_inside
 
         img_size_outside = (frames_outside, image_height_outside, image_width_outside)
 
-        # the size of embedded patches
-        patch_size_inside = (
-            frame_patch_size_inside,
-            patch_height_inside,
-            patch_width_inside,
-        )
-        patch_size_outside = (
-            frame_patch_size_outside,
-            patch_height_outside,
-            patch_width_outside,
-        )
+        # ── patch sizes ───────────────────────────────────────────────────
+        patch_size_inside  = (frame_patch_size_inside,  patch_height_inside,  patch_width_inside)
+        patch_size_outside = (frame_patch_size_outside, patch_height_outside, patch_width_outside)
 
-        # number of channels = levels * varibales per level + surface variables
-        # in_chans = out_chans = levels * channels + surface_channels
-
-        in_chans_inside = channels_inside * levels_inside + surface_channels_inside + input_only_channels_inside
-        out_chans_inside = channels_inside * levels_inside + surface_channels_inside + output_only_channels_inside
-
+        # ── channel counts ────────────────────────────────────────────────
+        in_chans_inside  = (channels_inside  * levels_inside  + surface_channels_inside
+                            + input_only_channels_inside)
+        out_chans_inside = (channels_inside  * levels_inside  + surface_channels_inside
+                            + output_only_channels_inside)
         in_chans_outside = channels_outside * levels_outside + surface_channels_outside
 
-        # input resolution = number of embedded patches / 2
-        # divide by two because "u_trasnformer" has a down-sampling block
-
+        # input_resolution used *only* to initialise UTransformer / SwinV2Stage
+        # (not used in forward for spatial logic)
         input_resolution_inside = (
             round(img_size_inside[1] / patch_size_inside[1] / 2),
             round(img_size_inside[2] / patch_size_inside[2] / 2),
         )
 
-        # FuXi cube embedding layer
-        self.cube_embedding_inside = CubeEmbedding(img_size_inside, patch_size_inside, in_chans_inside, dim_inside)
-        self.cube_embedding_outside = CubeEmbedding(img_size_outside, patch_size_outside, in_chans_outside, dim_outside)
-        self.total_dim = dim_inside  # + dim_outside
+        # ── submodules ────────────────────────────────────────────────────
+        self.cube_embedding_inside  = CubeEmbedding(
+            img_size_inside,  patch_size_inside,  in_chans_inside,  dim_inside)
+        self.cube_embedding_outside = CubeEmbedding(
+            img_size_outside, patch_size_outside, in_chans_outside, dim_outside)
 
-        # Downsampling --> SwinTransformerV2 stacks --> Upsampling
+        self.total_dim = dim_inside
+
         self.u_transformer = UTransformer(
             self.total_dim,
             num_groups,
@@ -413,110 +467,114 @@ class WRFTransformer(BaseModel):
             drop_path=drop_path,
         )
 
-        # dense layer applied on channel dmension
-        # channel * patch_size beucase dense layer recovers embedded dimensions to the input dimensions
+        # fc: channel-only linear – completely resolution-agnostic
         self.fc = nn.Linear(
             self.total_dim,
             out_chans_inside * patch_size_inside[1] * patch_size_inside[2],
         )
 
-        # Hyperparameters
-        self.patch_size = patch_size_inside
-        self.input_resolution = input_resolution_inside
-        self.out_chans = out_chans_inside
-        self.img_size = img_size_inside
+        # Store patch_size for the pixel-space reassembly in forward()
+        self.patch_size  = patch_size_inside
+        self.out_chans   = out_chans_inside
+        self.img_size    = img_size_inside
 
-        # self.channels = channels_inside
-        # self.surface_channels = surface_channels_inside
-        # self.levels = levels
-
+        # ── optional boundary padding ─────────────────────────────────────
         if self.use_padding:
             self.padding_opt = TensorPadding(**padding_conf)
 
+        # ── optional spectral norm ────────────────────────────────────────
         if self.use_spectral_norm:
             logger.info("Adding spectral norm to all conv and linear layers")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            # Move the model to the device
             self.to(device)
             apply_spectral_norm(self)
 
+        # ── optional post-processing block ────────────────────────────────
+        if post_conf is None:
+            post_conf = {"activate": False}
+        self.use_post_block = post_conf["activate"]
         if self.use_post_block:
             self.postblock = PostBlock(post_conf)
 
-        self.film = nn.Linear(self.time_encode, 2 * (self.total_dim))
+        # ── FiLM conditioning ─────────────────────────────────────────────
+        self.film = nn.Linear(self.time_encode, 2 * self.total_dim)
 
-    def _match_spatial(self, src: torch.Tensor, ref: torch.Tensor):
-        # if src.shape[-2:] != ref.shape[-2:]:
-        return F.interpolate(src, size=ref.shape[-2:], mode="bilinear", align_corners=False)
-        # return src
+    # ------------------------------------------------------------------
+    # forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
-        x: torch.Tensor,
-        x_outside: torch.Tensor,
-        x_extra: torch.Tensor,
-    ):
-        # copy tensor to feed into postblock later
-        x_copy = None
-        if self.use_post_block:
-            x_copy = x.clone().detach()
+        x: torch.Tensor,          # (B, Vars, T, Lat, Lon)  – interior
+        x_outside: torch.Tensor,  # (B, Vars, T, Lat, Lon)  – exterior
+        x_extra: torch.Tensor,    # (B, time_encode_dim)
+    ) -> torch.Tensor:
 
+        # ── optional post-block bookkeeping ───────────────────────────────
+        x_copy = x.clone().detach() if self.use_post_block else None
+
+        # ── optional boundary padding (TensorPadding) ─────────────────────
         if self.use_padding:
             x = self.padding_opt.pad(x)
 
-        # Tensor dims: Batch, Variables, Time, Lat grids, Lon grids
-        B, _, _, _, _ = x.shape
+        B = x.shape[0]
+
+        # --- FIX 3a -------------------------------------------------------
+        # Record the spatial size of the (possibly padded) interior input so
+        # we can crop the output back to exactly this size at the end.
+        # This replaces the old bilinear F.interpolate with a lossless crop.
+        _, _, _, orig_H, orig_W = x.shape
+        # ------------------------------------------------------------------
 
         _, patch_lat, patch_lon = self.patch_size
 
-        # Get the number of patches after embedding
-        Lat, Lon = self.input_resolution
-        Lat, Lon = Lat * 2, Lon * 2
+        # ── cube embedding ────────────────────────────────────────────────
+        # Output: (B, dim, T_p, Lat_p, Lon_p)  where *_p depends on input size
+        x = self.cube_embedding_inside(x).squeeze(2)          # (B, dim, Lat_p, Lon_p)
+        x_outside = self.cube_embedding_outside(x_outside).squeeze(2)
 
-        # Cube Embedding and squeese the time dimension
-        # (the model produce single forecast lead time only)
-
-        # x: input size = (Batch, Variables, Time, Lat grids, Lon grids)
-        # x: output size = (Batch, Embedded dimension, time, number of patches, number of patches)
-        x = self.cube_embedding_inside(x).squeeze(2)  # B C Lat Lon
-
-        x_outside = self.cube_embedding_outside(x_outside).squeeze(2)  # B C Lat Lon
-        # x_outside = self._match_spatial(x_outside, x)
-
-        # Feature‑wise Linear Modulation
-        alpha_beta = self.film(x_extra)  # [batch, 2*dim]
-        alpha, beta = alpha_beta.chunk(2, dim=1)  # each is [batch, dim]
-        alpha = alpha.view(B, self.total_dim, 1, 1)  # [batch, dim, 1, 1]
-        beta = beta.view(B, self.total_dim, 1, 1)  # [batch, dim, 1, 1]
+        # ── FiLM modulation on the exterior embedding ─────────────────────
+        alpha_beta = self.film(x_extra)                        # (B, 2·dim)
+        alpha, beta = alpha_beta.chunk(2, dim=1)
+        alpha = alpha.view(B, self.total_dim, 1, 1)
+        beta  = beta.view( B, self.total_dim, 1, 1)
         x_outside = alpha * x_outside + beta
 
-        # x = torch.cat((x, x_outside), 1)
-        x = x + x_outside
+        x = x + x_outside                                     # (B, dim, Lat_p, Lon_p)
 
-        # u_transformer stage
-        x = self.u_transformer(x)
+        # ── U-Transformer (dynamic padding/crop inside) ───────────────────
+        x = self.u_transformer(x)                             # (B, dim, Lat_p, Lon_p)
 
-        # recover embeddings to lat/lon grids with dense layer and reshape operation.
-        x = self.fc(x.permute(0, 2, 3, 1))  # B Lat Lon C
-        x = x.reshape(B, Lat, Lon, patch_lat, patch_lon, self.out_chans).permute(0, 1, 3, 2, 4, 5)
-        # B, lat, patch_lat, lon, patch_lon, C
-        x = x.reshape(B, Lat * patch_lat, Lon * patch_lon, self.out_chans)
-        x = x.permute(0, 3, 1, 2)  # B C Lat Lon
+        # --- FIX 3b -------------------------------------------------------
+        # Read Lat_p / Lon_p from the live tensor – NOT from self.input_resolution.
+        _, _, Lat_p, Lon_p = x.shape
+        # ------------------------------------------------------------------
 
+        # ── pixel-space reassembly ────────────────────────────────────────
+        x = self.fc(x.permute(0, 2, 3, 1))          # (B, Lat_p, Lon_p, out_chans·p·p)
+        x = (x
+             .reshape(B, Lat_p, Lon_p, patch_lat, patch_lon, self.out_chans)
+             .permute(0, 1, 3, 2, 4, 5)              # (B, Lat_p, patch_lat, Lon_p, patch_lon, C)
+             .reshape(B, Lat_p * patch_lat, Lon_p * patch_lon, self.out_chans)
+             .permute(0, 3, 1, 2))                   # (B, C, Lat_full, Lon_full)
+
+        # ── optional boundary unpadding ───────────────────────────────────
         if self.use_padding:
             x = self.padding_opt.unpad(x)
 
-        if self.use_interp:
-            img_size = list(self.img_size_original)
-            x = F.interpolate(x, size=img_size[1:], mode="bilinear")
+        # --- FIX 3c -------------------------------------------------------
+        # Crop to the original spatial size.  This is a lossless operation
+        # (no bilinear artefacts) and works for any input resolution because
+        # orig_H / orig_W were recorded from the live tensor above.
+        # The original `interp` flag is intentionally ignored here; the crop
+        # is always correct and does not need a fallback to interpolation.
+        x = x[:, :, :orig_H, :orig_W].contiguous()
+        # ------------------------------------------------------------------
 
-        x = x.unsqueeze(2)
+        x = x.unsqueeze(2)                           # restore time dim
 
+        # ── optional post-block ───────────────────────────────────────────
         if self.use_post_block:
-            x = {
-                "y_pred": x,
-                "x": x_copy,
-            }
-            x = self.postblock(x)
+            x = self.postblock({"y_pred": x, "x": x_copy})
 
         return x

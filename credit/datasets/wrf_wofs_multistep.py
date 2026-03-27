@@ -70,13 +70,16 @@ def worker(
     start_index_offset: int,
     transform: Optional[Callable],
 ) -> Dict[str, Any]:
-    index, ind_start_current_step = tuple_index
+    start_index, step_offset = tuple_index
 
     try:
-        ind_file = find_key_for_number(ind_start_current_step, WRF_file_indices)
+        ind_file = find_key_for_number(start_index, WRF_file_indices)
+        if ind_file is None:
+            raise KeyError(f"No WoFS file mapping found for start index {start_index}")
+
         file_range = WRF_file_indices[ind_file]
 
-        ind_start_in_file = (ind_start_current_step - file_range[1]) + start_index_offset
+        ind_start_in_file = (start_index - file_range[1]) + start_index_offset + step_offset
 
         ind_end_in_file = ind_start_in_file + history_len
 
@@ -144,7 +147,7 @@ def worker(
         if transform:
             sample = transform(sample)
 
-        sample["index"] = index
+        sample["index"] = start_index
         sample["datetime"] = [
             int(WRF_input.time.values[0].astype("datetime64[s]").astype(int)),
             int(WRF_target.time.values[0].astype("datetime64[s]").astype(int)),
@@ -293,10 +296,9 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         rollout_samples: List[Dict[str, Any]] = []
 
         for step_offset in range(self.forecast_len + 1):
-            current_index = index + step_offset
-            sample = self.worker((index, current_index))
+            sample = self.worker((index, step_offset))
             sample["forecast_step"] = step_offset + 1
-            sample["index"] = current_index
+            sample["index"] = index
             sample["stop_forecast"] = step_offset == self.forecast_len
             rollout_samples.append(sample)
 
