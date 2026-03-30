@@ -182,38 +182,21 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         world_size=1,
         max_forecast_len=None,
     ):
-        varname_upper_air = param_interior["varname_upper_air"]
-        varname_surface = param_interior["varname_surface"]
-        varname_dyn_forcing = param_interior["varname_dyn_forcing"]
-        varname_forcing = param_interior["varname_forcing"]
-        varname_static = param_interior["varname_static"]
-        varname_diagnostic = param_interior["varname_diagnostic"]
-        filenames = sorted(param_interior["filenames"])
-        filename_surface = param_interior["filename_surface"]
-        filename_dyn_forcing = param_interior["filename_dyn_forcing"]
-        filename_forcing = param_interior["filename_forcing"]
-        filename_static = param_interior["filename_static"]
-        filename_diagnostic = param_interior["filename_diagnostic"]
+        # Save config info but do NOT open heavy datasets here. We'll open in workers.
+        self.varname_upper_air = param_interior["varname_upper_air"]
+        self.varname_surface = param_interior["varname_surface"]
+        self.varname_dyn_forcing = param_interior["varname_dyn_forcing"]
+        self.varname_forcing = param_interior["varname_forcing"]
+        self.varname_static = param_interior["varname_static"]
+        self.varname_diagnostic = param_interior["varname_diagnostic"]
+        self.filenames = sorted(param_interior["filenames"])
+        self.filename_surface = param_interior["filename_surface"]
+        self.filename_dyn_forcing = param_interior["filename_dyn_forcing"]
+        self.filename_forcing = param_interior["filename_forcing"]
+        self.filename_static = param_interior["filename_static"]
+        self.filename_diagnostic = param_interior["filename_diagnostic"]
 
-        all_ds = [get_forward_data(fn) for fn in filenames]
-
-        self.list_upper_ds = [filter_ds(ds, varname_upper_air) for ds in all_ds]
-
-        if filename_surface:
-            self.list_surf_ds = [filter_ds(ds, varname_surface) for ds in all_ds]
-        else:
-            self.list_surf_ds = False
-
-        if filename_dyn_forcing:
-            self.list_dyn_forcing_ds = [filter_ds(ds, varname_dyn_forcing) for ds in all_ds]
-        else:
-            self.list_dyn_forcing_ds = False
-
-        if filename_diagnostic:
-            self.list_diag_ds = [filter_ds(ds, varname_diagnostic) for ds in all_ds]
-        else:
-            self.list_diag_ds = False
-
+        # workflow parameters
         self.history_len = param_interior["history_len"]
         self.forecast_len = param_interior["forecast_len"]
         self.seed = seed
@@ -225,6 +208,64 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             raise ValueError("target_start_step must be >= 1")
         self.start_index_offset = max(0, self.target_start_step - self.history_len)
 
+        # outside branch parameters (store them, will be used in _open_datasets)
+        self.varname_upper_air_outside = param_outside["varname_upper_air"]
+        self.varname_surface_outside = param_outside.get("varname_surface") or []
+        self.history_len_outside = param_outside["history_len"]
+        self.forecast_len_outside = param_outside["forecast_len"]
+        self.boundary_seq_len = max(1, self.history_len_outside + self.forecast_len_outside)
+
+        # transforms & rng
+        self.transform = transform
+        self.rng = np.random.default_rng(seed=seed)
+
+        # internal state: we'll open datasets per-worker via _open_datasets()
+        self._opened = False
+        self.list_upper_ds = None
+        self.list_surf_ds = None
+        self.list_dyn_forcing_ds = None
+        self.list_diag_ds = None
+        self.xarray_forcing = False
+        self.xarray_static = False
+        self.list_upper_ds_outside = None
+        self.list_surf_ds_outside = None
+        self.WRF_file_indices = None
+        self.total_length = None
+        self.worker = None
+        self.current_epoch = None
+
+    def _open_datasets(self):
+        """
+        Called inside each DataLoader worker (or first __getitem__ call) to open
+        xarray/zarr datasets and build the worker partial. This avoids
+        pickling/opening in main process.
+        """
+        if getattr(self, "_opened", False):
+            return
+
+        filenames = self.filenames
+        # Open forward data for each file
+        all_ds = [get_forward_data(fn) for fn in filenames]
+
+        # interior sets
+        self.list_upper_ds = [filter_ds(ds, self.varname_upper_air) for ds in all_ds]
+
+        if self.filename_surface:
+            self.list_surf_ds = [filter_ds(ds, self.varname_surface) for ds in all_ds]
+        else:
+            self.list_surf_ds = False
+
+        if self.filename_dyn_forcing:
+            self.list_dyn_forcing_ds = [filter_ds(ds, self.varname_dyn_forcing) for ds in all_ds]
+        else:
+            self.list_dyn_forcing_ds = False
+
+        if self.filename_diagnostic:
+            self.list_diag_ds = [filter_ds(ds, self.varname_diagnostic) for ds in all_ds]
+        else:
+            self.list_diag_ds = False
+
+        # compute indices mapping (available indices per file)
         ind_start = 0
         self.WRF_file_indices = {}
         for ind_file, WRF_file_xarray in enumerate(self.list_upper_ds):
@@ -234,39 +275,29 @@ class WoFSMultiStep(torch.utils.data.Dataset):
                 continue
             self.WRF_file_indices[str(ind_file)] = [available, ind_start, ind_start + available - 1]
             ind_start += available
-
         self.total_length = ind_start
 
-        self.filename_forcing = filename_forcing
+        # forcing and static (load once)
         if self.filename_forcing is not None:
-            ds = get_forward_data(filename_forcing)
-            self.xarray_forcing = drop_var_from_dataset(ds, varname_forcing).load()
+            ds = get_forward_data(self.filename_forcing)
+            self.xarray_forcing = drop_var_from_dataset(ds, self.varname_forcing).load()
         else:
             self.xarray_forcing = False
 
-        self.filename_static = filename_static
         if self.filename_static is not None:
-            ds = get_forward_data(filename_static)
-            self.xarray_static = drop_var_from_dataset(ds, varname_static).load()
+            ds = get_forward_data(self.filename_static)
+            self.xarray_static = drop_var_from_dataset(ds, self.varname_static).load()
         else:
             self.xarray_static = False
 
-        self.varname_upper_air_outside = param_outside["varname_upper_air"]
-        self.varname_surface_outside = param_outside.get("varname_surface") or []
-
+        # outside branch data
         self.list_upper_ds_outside = [filter_ds(ds, self.varname_upper_air_outside) for ds in all_ds]
         if self.varname_surface_outside:
             self.list_surf_ds_outside = [filter_ds(ds, self.varname_surface_outside) for ds in all_ds]
         else:
             self.list_surf_ds_outside = False
 
-        self.history_len_outside = param_outside["history_len"]
-        self.forecast_len_outside = param_outside["forecast_len"]
-        self.boundary_seq_len = max(1, self.history_len_outside + self.forecast_len_outside)
-
-        self.transform = transform
-        self.rng = np.random.default_rng(seed=seed)
-
+        # build the worker partial with references to these opened datasets
         self.worker = partial(
             worker,
             WRF_file_indices=self.WRF_file_indices,
@@ -284,18 +315,51 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             transform=self.transform,
         )
 
-        self.current_epoch = None
+        self._opened = True
 
     def __len__(self):
-        return self.total_length
+        # # Ensure datasets are opened to compute length
+        # if not self._opened:
+        #     # safe to open here, e.g., when __len__ is called in main process (but __len__ should be fast)
+        #     self._open_datasets()
+        # return self.total_length
+        # Compute total length without persisting heavy xarray objects in the main process.
+        # If we've already computed it, return the cached value.
+        if getattr(self, "total_length", None) is not None:
+            return self.total_length
 
+        total = 0
+        for fn in self.filenames:
+            ds = get_forward_data(fn)
+            try:
+                ds_upper = filter_ds(ds, self.varname_upper_air)
+                n_time = int(ds_upper["time"].size)
+                available = n_time - (self.history_len + self.forecast_len + 1) + 1
+                available -= self.start_index_offset
+                if available > 0:
+                    total += available
+            finally:
+                # attempt to close and release quickly so main process doesn't retain xarray handles
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+                del ds
+
+        self.total_length = int(total)
+        return self.total_length
     def set_epoch(self, epoch):
         self.current_epoch = epoch
 
     def __getitem__(self, index):
+        # ensure per-worker opens have happened
+        if not self._opened:
+            self._open_datasets()
+
         rollout_samples: List[Dict[str, Any]] = []
 
         for step_offset in range(self.forecast_len + 1):
+            # worker is now a partial bound to opened arrays (per-worker)
             sample = self.worker((index, step_offset))
             sample["forecast_step"] = step_offset + 1
             sample["index"] = index

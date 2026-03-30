@@ -1,4 +1,4 @@
-save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0327'
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0330'
 seed: 1000
 
 data:
@@ -80,8 +80,8 @@ model:
 trainer:
   type: 'multi-step-wrf'
   mode: 'none'
-  train_batch_size: 1
-  valid_batch_size: 1
+  train_batch_size: 4
+  valid_batch_size: 4
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
   thread_workers: 16
@@ -97,7 +97,7 @@ trainer:
   load_optimizer: False
   load_scheduler: False
   load_scaler: False
-  skip_validation: True
+  skip_validation: False
   use_scheduler: True
   reload_epoch: True
   epochs: &epochs 30
@@ -110,7 +110,7 @@ trainer:
     warmup_steps: 249
     gamma: 0.7
   grad_max_norm: 1.0
-  grad_accum_every: 4
+  # grad_accum_every: 4
   save_backup_weights: True
   save_best_weights: True
   save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']

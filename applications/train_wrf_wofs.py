@@ -35,6 +35,23 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
+def _worker_init_fn(worker_id):
+    """
+    DataLoader worker init: if the dataset exposes _open_datasets, call it here
+    so each worker opens xarray/zarr resources once in-worker.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return
+    ds = worker_info.dataset
+    if hasattr(ds, "_open_datasets") and callable(ds._open_datasets):
+        try:
+            ds._open_datasets()
+        except Exception as e:
+            logging.warning(f"worker_init_fn failed in worker {worker_id}: {e}")
+            raise
+
+
 def _extract_case_date(file_path: str) -> str | None:
     match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr$", Path(file_path).name)
     return match.group(1) if match else None
@@ -179,6 +196,7 @@ def main(rank, world_size, conf, backend, trial=False):
         num_workers=thread_workers,
         drop_last=True,
         prefetch_factor=4 if thread_workers > 0 else None,
+        worker_init_fn=_worker_init_fn,
     )
 
     valid_loader = torch.utils.data.DataLoader(
@@ -191,6 +209,7 @@ def main(rank, world_size, conf, backend, trial=False):
         num_workers=valid_thread_workers,
         drop_last=True,
         prefetch_factor=4 if valid_thread_workers > 0 else None,
+        worker_init_fn=_worker_init_fn,
     )
 
     m = load_model(conf)
