@@ -6,14 +6,12 @@ import os
 import re
 import warnings
 from argparse import ArgumentParser
-from datetime import datetime
 from glob import glob
 from pathlib import Path
 
 import pandas as pd
 import torch
 import torch.distributed as dist
-import xarray as xr
 import yaml
 from pandas.errors import EmptyDataError
 
@@ -23,13 +21,11 @@ from credit.distributed import distributed_model_wrapper, get_rank_info, setup
 from credit.metrics import LatWeightedMetrics
 from credit.models import load_model
 from credit.models.checkpoint import load_model_state, load_state_dict_error_handler
-from credit.output import load_metadata, make_xarray, save_netcdf_clean
 from credit.parser import credit_main_parser
 from credit.seed import seed_everything
 from credit.transforms.transforms_wrf import NormalizeWRF, ToTensorWRF
 
 warnings.filterwarnings("ignore")
-
 logger = logging.getLogger(__name__)
 
 
@@ -49,16 +45,6 @@ def _select_files(glob_pattern: str, date_range: list[str] | tuple[str, str] | N
         for file_path in files
         if (case_date := _extract_case_date(file_path)) is not None and start_date <= case_date <= end_date
     ]
-
-
-def _expand_anchor_dataset(dataset: xr.Dataset, boundary_seq_len: int) -> xr.Dataset:
-    anchor = dataset.isel(time=slice(0, 1)).load()
-    if boundary_seq_len == 1:
-        return anchor
-    anchor_time = anchor["time"].values[0]
-    repeated = xr.concat([anchor] * boundary_seq_len, dim="time")
-    repeated = repeated.assign_coords(time=[anchor_time] * boundary_seq_len)
-    return repeated
 
 
 def _build_case_dataset(case_path: str, conf: dict) -> WoFSSingleStepDataset:
@@ -91,7 +77,7 @@ def _build_case_dataset(case_path: str, conf: dict) -> WoFSSingleStepDataset:
 def _distributed_conf(conf: dict) -> dict:
     rollout_conf = copy.deepcopy(conf)
     rollout_conf.setdefault("trainer", {})
-    rollout_conf["trainer"]["mode"] = rollout_conf["predict"]["mode"]
+    rollout_conf["trainer"]["mode"] = rollout_conf["predict"].get("mode", "none")
     rollout_conf["trainer"].setdefault("activation_checkpoint", False)
     return rollout_conf
 
@@ -181,12 +167,11 @@ def _case_name(case_path: str) -> str:
     return Path(case_path).stem
 
 
-def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: torch.device) -> pd.DataFrame:
+def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, device: torch.device) -> pd.DataFrame:
     dataset = _build_case_dataset(case_path, conf)
     state_transformer = NormalizeWRF(conf)
     to_tensor = ToTensorWRF(conf)
     metrics = LatWeightedMetrics(conf)
-    meta_data = load_metadata(conf)
 
     history_len = conf["data"]["history_len"]
     max_steps = max(0, len(dataset) - 1)
@@ -198,17 +183,11 @@ def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: tor
     )
 
     case_results: list[dict] = []
-    x_state = None
+    x_state: torch.Tensor | None = None
     case_name = _case_name(case_path)
-    y_coord = None
-    x_coord = None
 
     for step in range(max_steps):
         raw_sample = dataset[step]
-        if y_coord is None or x_coord is None:
-            target_ds = raw_sample["WRF_target"]
-            y_coord = target_ds["y"].values if "y" in target_ds.coords else target_ds["south_north"].values
-            x_coord = target_ds["x"].values if "x" in target_ds.coords else target_ds["west_east"].values
         sample = to_tensor(state_transformer(raw_sample))
 
         if step == 0:
@@ -233,10 +212,6 @@ def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: tor
         result_row.update({k: float(v) for k, v in metrics_dict.items()})
         case_results.append(result_row)
 
-        valid_time = datetime.utcfromtimestamp(int(raw_sample["WRF_target"]["time"].values[0].astype("datetime64[s]").astype(int)))
-        darray_upper_air, darray_single_level = make_xarray(y_pred_denorm, valid_time, y_coord, x_coord, conf)
-        save_netcdf_clean(darray_upper_air, darray_single_level, case_name, step + 1, meta_data, conf, use_logger=False)
-
         if history_len == 1:
             x_state = y_pred[:, :-varnum_diag, ...].detach().cpu() if varnum_diag > 0 else y_pred.detach().cpu()
         else:
@@ -253,10 +228,37 @@ def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: tor
     return pd.DataFrame(case_results)
 
 
+def _aggregate_rank_metrics(out_dir: str, world_size: int, output_name: str) -> str:
+    rank_paths = [
+        os.path.join(out_dir, f"rollout_metrics_rank{rank}.csv")
+        for rank in range(world_size)
+        if os.path.exists(os.path.join(out_dir, f"rollout_metrics_rank{rank}.csv"))
+    ]
+
+    if rank_paths:
+        rank_frames = []
+        for path in rank_paths:
+            if os.path.getsize(path) == 0:
+                continue
+            try:
+                rank_df = pd.read_csv(path)
+            except EmptyDataError:
+                continue
+            if not rank_df.empty:
+                rank_frames.append(rank_df)
+        summary_df = pd.concat(rank_frames, ignore_index=True) if rank_frames else pd.DataFrame()
+    else:
+        summary_df = pd.DataFrame()
+
+    summary_path = os.path.join(out_dir, output_name)
+    summary_df.to_csv(summary_path, index=False)
+    return summary_path
+
+
 def main() -> None:
-    parser = ArgumentParser(description="Roll out the WoFS WRF model on same-file t0 conditioning cases")
-    parser.add_argument("config", help="Path to the WoFS rollout YAML config")
-    parser.add_argument("--max-cases", type=int, default=None, help="Optional limit on number of cases to roll out")
+    parser = ArgumentParser(description="Compute rollout metrics for WoFS WRF t0-conditioning runs")
+    parser.add_argument("config", help="Path to the WoFS YAML config")
+    parser.add_argument("--max-cases", type=int, default=None, help="Optional limit on number of cases to process")
     parser.add_argument(
         "-m",
         "--mode",
@@ -270,6 +272,11 @@ def main() -> None:
         choices=["nccl", "gloo", "mpi"],
         help="Distributed backend when using ddp/fsdp rollout",
     )
+    parser.add_argument(
+        "--output-name",
+        default="rollout_metrics.csv",
+        help="Filename for merged metrics CSV under predict.save_forecast",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -278,16 +285,21 @@ def main() -> None:
         conf = yaml.safe_load(f)
 
     conf = credit_main_parser(conf, parse_training=False, parse_predict=False, print_summary=False)
+    conf.setdefault("predict", {})
+
     if args.mode is not None:
-        conf.setdefault("predict", {})["mode"] = args.mode
+        conf["predict"]["mode"] = args.mode
+    conf["predict"].setdefault("mode", "none")
+
     conf["save_loc"] = os.path.expandvars(conf["save_loc"])
     conf["predict"]["save_forecast"] = os.path.expandvars(conf["predict"]["save_forecast"])
     os.makedirs(conf["predict"]["save_forecast"], exist_ok=True)
 
     seed_everything(conf["seed"])
-    local_rank, world_rank, world_size = get_rank_info(conf["predict"].get("mode", "none"))
+    local_rank, world_rank, world_size = get_rank_info(conf["predict"]["mode"])
 
-    if conf["predict"].get("mode", "none") in ["ddp", "fsdp"]:
+    distributed = conf["predict"]["mode"] in ["ddp", "fsdp"]
+    if distributed:
         setup(world_rank, world_size, conf["predict"]["mode"], backend=args.backend)
 
     if torch.cuda.is_available():
@@ -308,50 +320,26 @@ def main() -> None:
     case_files = case_files[world_rank::world_size]
 
     if not case_files:
-        logger.warning("No WoFS case files matched the rollout selection on rank %s", world_rank)
-        case_files = []
+        logger.warning("No WoFS case files matched rollout selection on rank %s", world_rank)
 
     all_results = []
     for case_path in case_files:
-        logger.info("Rank %s rolling out %s", world_rank, case_path)
-        case_df = rollout_case(case_path, conf, model, device)
+        logger.info("Rank %s computing metrics for %s", world_rank, case_path)
+        case_df = rollout_case_metrics(case_path, conf, model, device)
         all_results.append(case_df)
 
     partial_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
     partial_path = os.path.join(conf["predict"]["save_forecast"], f"rollout_metrics_rank{world_rank}.csv")
     partial_df.to_csv(partial_path, index=False)
 
-    if conf["predict"].get("mode", "none") in ["ddp", "fsdp"]:
+    if distributed:
         dist.barrier()
 
     if world_rank == 0:
-        rank_paths = [
-            os.path.join(conf["predict"]["save_forecast"], f"rollout_metrics_rank{rank}.csv")
-            for rank in range(world_size)
-            if os.path.exists(os.path.join(conf["predict"]["save_forecast"], f"rollout_metrics_rank{rank}.csv"))
-        ]
-
-        if rank_paths:
-            rank_frames = []
-            for path in rank_paths:
-                if os.path.getsize(path) == 0:
-                    continue
-                try:
-                    rank_df = pd.read_csv(path)
-                except EmptyDataError:
-                    continue
-                if not rank_df.empty:
-                    rank_frames.append(rank_df)
-
-            summary_df = pd.concat(rank_frames, ignore_index=True) if rank_frames else pd.DataFrame()
-        else:
-            summary_df = pd.DataFrame()
-
-        summary_path = os.path.join(conf["predict"]["save_forecast"], "rollout_metrics.csv")
-        summary_df.to_csv(summary_path, index=False)
+        summary_path = _aggregate_rank_metrics(conf["predict"]["save_forecast"], world_size, args.output_name)
         logger.info("Saved rollout metrics to %s", summary_path)
 
-    if conf["predict"].get("mode", "none") in ["ddp", "fsdp"]:
+    if distributed:
         dist.barrier()
         dist.destroy_process_group()
 
