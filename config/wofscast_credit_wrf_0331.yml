@@ -1,13 +1,13 @@
-save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0331'
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0401'
 seed: 1000
 
 data:
   scaler_type: 'std-wrf'
 
   variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
-  surface_variables: ['T2', 'Q2', 'U10', 'V10']
+  surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
   dynamic_forcing_variables: ['cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation']
-  diagnostic_variables: ['COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+  diagnostic_variables: ['UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP']
   forcing_variables: []
   static_variables: []
 
@@ -16,13 +16,13 @@ data:
   save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
   save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
 
-  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/mean.nc'
-  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/std.nc'
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/std.nc'
 
-  train_years: [2019]
+  train_years: [2019, 2020]
   valid_years: [2022]
 
-  train_date_range: ['20190101', '20191231']
+  train_date_range: ['20190101', '20201231']
   valid_date_range: ['20220402', '20220415']
 
   history_len: 1
@@ -36,12 +36,12 @@ data:
 
   boundary:
     variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
-    surface_variables: ['T2', 'Q2', 'U10', 'V10']
+    surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
     reuse_interior_stats: True
     levels: 17
     history_len: 1
     forecast_len: 0
-    all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10']
+    all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
 
   all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
 
@@ -54,9 +54,9 @@ model:
     image_width: 300
     levels: 17
     channels: 6
-    surface_channels: 4
+    surface_channels: 6
     input_only_channels: 10
-    output_only_channels: 6
+    output_only_channels: 4
     patch_height: 2
     patch_width: 2
     frame_patch_size: 1
@@ -67,7 +67,7 @@ model:
     image_width: 300
     levels: 17
     channels: 6
-    surface_channels: 4
+    surface_channels: 6
     patch_height: 2
     patch_width: 2
     frame_patch_size: 1
@@ -80,13 +80,14 @@ model:
 trainer:
   type: 'multi-step-wrf'
   mode: 'none'
-  train_batch_size: 4
-  valid_batch_size: 2
+  train_batch_size: 8
+  valid_batch_size: 8
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 16
-  valid_thread_workers: 16
-  # prefetch_factor: 4
+  thread_workers: 9
+  valid_thread_workers: 9
+  prefetch_factor: 1
+  residual_prediction: True
   update_learning_rate: False
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
@@ -115,7 +116,7 @@ trainer:
   save_best_weights: True
   save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
 loss:
-  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/latitude_weights_placeholder.nc'
+  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/latitude_weights_placeholder.nc'
   use_latitude_weights: False
   use_variable_weights: False
   training_loss: 'mse'
@@ -124,13 +125,13 @@ loss:
     QVAPOR: 1.0
     U: 1.0
     V: 1.0
-    W: 1.0
+    W: 1.25
     GEOPOT: 1.0
     T2: 1.5
     Q2: 1.5
     COMPOSITE_REFL_10CM: 2.0
     RAIN_AMOUNT: 2.0  
-  use_spectral_loss: True
+  use_spectral_loss: False
   spectral_lambda_reg: 0.1
   spectral_wavenum_init: 25
 

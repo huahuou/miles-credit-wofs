@@ -1,35 +1,28 @@
-import copy
-import hashlib
-import json
 import logging
 import os
 import re
 import shutil
 import sys
-import time
 import warnings
 from argparse import ArgumentParser
 from glob import glob
 from pathlib import Path
-from typing import Any, cast
 
 import optuna
 import torch
-import torch.distributed as dist
-import xarray as xr
 import yaml
 from echo.src.base_objective import BaseObjective
 from torch.utils.data.distributed import DistributedSampler
 
-from train_wrf_multi import load_model_states_and_optimizer
+from train_wrf import load_model_states_and_optimizer
 from credit.datasets.wrf_wofs_multistep import WoFSMultiStep
-from credit.data import get_forward_data
 from credit.distributed import distributed_model_wrapper, get_rank_info, setup
 from credit.losses.weighted_loss import VariableTotalLoss2D
 from credit.metrics import LatWeightedMetrics
 from credit.models import load_model
 from credit.parser import credit_main_parser
 from credit.pbs import launch_script, launch_script_mpi
+from credit.scheduler import annealed_probability
 from credit.seed import seed_everything
 from credit.trainers import load_trainer
 from credit.transforms import load_transforms
@@ -88,18 +81,16 @@ def _select_files(
 
 
 def load_dataset_and_sampler(conf, param_interior, param_outside, world_size, rank, is_train=True):
-    t_start = time.perf_counter()
     seed = conf["seed"]
     transforms = load_transforms(conf)
-    t_after_transforms = time.perf_counter()
 
     dataset = WoFSMultiStep(
         param_interior,
         param_outside,
         transform=transforms,
+        seed=seed,
         rank=rank,
         world_size=world_size,
-        seed=seed,
     )
 
     sampler = DistributedSampler(
@@ -110,145 +101,9 @@ def load_dataset_and_sampler(conf, param_interior, param_outside, world_size, ra
         shuffle=is_train,
         drop_last=True,
     )
-    t_after_sampler = time.perf_counter()
 
-    logging.info(
-        "Loaded WoFS multi-step dataset and distributed sampler on rank %s (%s): transforms=%.2fs total=%.2fs",
-        rank,
-        "train" if is_train else "valid",
-        t_after_transforms - t_start,
-        t_after_sampler - t_start,
-    )
+    logging.info("Loaded WoFS multi-step dataset and distributed sampler")
     return dataset, sampler
-
-
-def _compute_index_metadata(param_interior: dict, split_name: str, rank: int) -> dict:
-    t0 = time.perf_counter()
-    filenames = sorted(param_interior["filenames"])
-    history_len = int(param_interior["history_len"])
-    forecast_len = int(param_interior["forecast_len"])
-    target_start_step = int(param_interior.get("target_start_step", 1))
-    start_index_offset = max(0, target_start_step - history_len)
-
-    wrf_file_indices = {}
-    file_time_lengths = {}
-    running_start = 0
-
-    for ind_file, filename in enumerate(filenames):
-        if filename.endswith((".nc", ".nc4")):
-            ds = xr.open_dataset(filename, decode_times=False)
-        else:
-            ds = xr.open_zarr(filename, decode_times=False)
-        try:
-            n_time = int(ds.sizes["time"])
-            file_time_lengths[str(ind_file)] = n_time
-
-            available = n_time - (history_len + forecast_len + 1) + 1
-            available -= start_index_offset
-            if available > 0:
-                wrf_file_indices[str(ind_file)] = [available, running_start, running_start + available - 1]
-                running_start += available
-        finally:
-            try:
-                ds.close()
-            except Exception:
-                pass
-
-        if (ind_file + 1) % 50 == 0:
-            logging.info(
-                "Rank %s index precompute progress (%s): %s/%s files in %.1fs",
-                rank,
-                split_name,
-                ind_file + 1,
-                len(filenames),
-                time.perf_counter() - t0,
-            )
-
-    out = {
-        "WRF_file_indices": wrf_file_indices,
-        "file_time_lengths": file_time_lengths,
-        "total_length": int(running_start),
-    }
-    logging.info(
-        "Rank %s index precompute done (%s): files=%s total_length=%s elapsed=%.2fs",
-        rank,
-        split_name,
-        len(filenames),
-        out["total_length"],
-        time.perf_counter() - t0,
-    )
-    return out
-
-
-def _metadata_cache_path(param_interior: dict, split_name: str) -> str:
-    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "credit", "wofs_index")
-    os.makedirs(cache_dir, exist_ok=True)
-
-    payload = {
-        "split": split_name,
-        "history_len": int(param_interior["history_len"]),
-        "forecast_len": int(param_interior["forecast_len"]),
-        "target_start_step": int(param_interior.get("target_start_step", 1)),
-        "files": sorted(param_interior["filenames"]),
-    }
-    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-    return os.path.join(cache_dir, f"{digest}.json")
-
-
-def _load_cached_metadata(param_interior: dict, split_name: str) -> dict | None:
-    cache_path = _metadata_cache_path(param_interior, split_name)
-    if not os.path.exists(cache_path):
-        return None
-
-    try:
-        with open(cache_path) as f:
-            metadata = json.load(f)
-        logging.info("Loaded cached index metadata (%s) from %s", split_name, cache_path)
-        return metadata
-    except Exception as e:
-        logging.warning("Failed to read cache %s (%s), recomputing", cache_path, e)
-        return None
-
-
-def _save_cached_metadata(param_interior: dict, split_name: str, metadata: dict) -> None:
-    cache_path = _metadata_cache_path(param_interior, split_name)
-    tmp_path = f"{cache_path}.tmp"
-    try:
-        with open(tmp_path, "w") as f:
-            json.dump(metadata, f)
-        os.replace(tmp_path, cache_path)
-        logging.info("Saved index metadata cache (%s) to %s", split_name, cache_path)
-    except Exception as e:
-        logging.warning("Failed to write cache %s: %s", cache_path, e)
-
-
-def _get_or_broadcast_index_metadata(param_interior: dict, split_name: str, rank: int, world_size: int, distributed_mode: bool) -> dict:
-    if not distributed_mode or world_size <= 1:
-        cached = _load_cached_metadata(param_interior=param_interior, split_name=split_name)
-        if cached is not None:
-            return cached
-        computed = _compute_index_metadata(param_interior, split_name, rank)
-        _save_cached_metadata(param_interior=param_interior, split_name=split_name, metadata=computed)
-        return computed
-
-    object_list: list[Any] = [None]
-    if rank == 0:
-        cached = _load_cached_metadata(param_interior=param_interior, split_name=split_name)
-        if cached is not None:
-            object_list[0] = cached
-        else:
-            object_list[0] = _compute_index_metadata(param_interior, split_name, rank)
-            _save_cached_metadata(param_interior=param_interior, split_name=split_name, metadata=object_list[0])
-
-    t0 = time.perf_counter()
-    dist.broadcast_object_list(object_list, src=0)
-    logging.info(
-        "Rank %s received index metadata (%s) in %.2fs",
-        rank,
-        split_name,
-        time.perf_counter() - t0,
-    )
-    return cast(dict, object_list[0])
 
 
 def _build_params(conf, split: str):
@@ -278,7 +133,6 @@ def _build_params(conf, split: str):
         else None,
         "history_len": conf["data"][history_key],
         "forecast_len": conf["data"][forecast_key],
-        "target_start_step": conf["data"].get("target_start_step", 1),
     }
 
     param_outside = {
@@ -292,7 +146,6 @@ def _build_params(conf, split: str):
 
 
 def main(rank, world_size, conf, backend, trial=False):
-    t_main = time.perf_counter()
     conf["save_loc"] = os.path.expandvars(conf["save_loc"])
 
     if conf["trainer"]["mode"] in ["fsdp", "ddp"]:
@@ -308,52 +161,17 @@ def main(rank, world_size, conf, backend, trial=False):
 
     train_batch_size = conf["trainer"]["train_batch_size"]
     valid_batch_size = conf["trainer"]["valid_batch_size"]
-    thread_workers = conf["trainer"].get("thread_workers", 1)
+    thread_workers = conf["trainer"].get("thread_workers", 0)
     valid_thread_workers = conf["trainer"].get("valid_thread_workers", thread_workers)
-    skip_validation = conf["trainer"].get("skip_validation", False)
+    train_prefetch_factor = conf["trainer"].get("prefetch_factor", 4)
+    valid_prefetch_factor = conf["trainer"].get("valid_prefetch_factor", train_prefetch_factor)
 
     if conf["data"]["scaler_type"] != "std-wrf":
         raise ValueError("WoFS multi-step training app currently supports scaler_type='std-wrf' only")
 
-    t_params = time.perf_counter()
     param_interior_train, param_outside_train = _build_params(conf, "train")
-    param_interior_valid, param_outside_valid = (None, None)
-    if not skip_validation:
-        param_interior_valid, param_outside_valid = _build_params(conf, "valid")
-    logging.info(
-        "Rank %s built file params: train_files=%s valid_files=%s elapsed=%.2fs",
-        rank,
-        len(param_interior_train["filenames"]),
-        len(param_interior_valid["filenames"]) if param_interior_valid else 0,
-        time.perf_counter() - t_params,
-    )
+    param_interior_valid, param_outside_valid = _build_params(conf, "valid")
 
-    distributed_mode = conf["trainer"]["mode"] in ["ddp", "fsdp"]
-
-    train_index_metadata = _get_or_broadcast_index_metadata(
-        param_interior_train,
-        split_name="train",
-        rank=rank,
-        world_size=world_size,
-        distributed_mode=distributed_mode,
-    )
-    valid_index_metadata = None
-    if not skip_validation:
-        assert param_interior_valid is not None
-        valid_index_metadata = _get_or_broadcast_index_metadata(
-            param_interior_valid,
-            split_name="valid",
-            rank=rank,
-            world_size=world_size,
-            distributed_mode=distributed_mode,
-        )
-
-    param_interior_train["precomputed_index_metadata"] = train_index_metadata
-    if not skip_validation:
-        assert param_interior_valid is not None
-        param_interior_valid["precomputed_index_metadata"] = valid_index_metadata
-
-    t_ds = time.perf_counter()
     train_dataset, train_sampler = load_dataset_and_sampler(
         conf,
         param_interior_train,
@@ -363,19 +181,14 @@ def main(rank, world_size, conf, backend, trial=False):
         is_train=True,
     )
 
-    valid_dataset, valid_sampler = None, None
-    if not skip_validation:
-        assert param_interior_valid is not None
-        assert param_outside_valid is not None
-        valid_dataset, valid_sampler = load_dataset_and_sampler(
-            conf,
-            param_interior_valid,
-            param_outside_valid,
-            world_size,
-            rank,
-            is_train=False,
-        )
-    logging.info("Rank %s datasets+samplers ready in %.2fs", rank, time.perf_counter() - t_ds)
+    valid_dataset, valid_sampler = load_dataset_and_sampler(
+        conf,
+        param_interior_valid,
+        param_outside_valid,
+        world_size,
+        rank,
+        is_train=False,
+    )
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -386,24 +199,22 @@ def main(rank, world_size, conf, backend, trial=False):
         persistent_workers=True if thread_workers > 0 else False,
         num_workers=thread_workers,
         drop_last=True,
-        prefetch_factor=(2 if distributed_mode else 4) if thread_workers > 0 else None,
-        worker_init_fn=None,
+        prefetch_factor=train_prefetch_factor if thread_workers > 0 else None,
+        worker_init_fn=_worker_init_fn,
     )
 
-    valid_loader = None
-    if not skip_validation:
-        valid_loader = torch.utils.data.DataLoader(
-            valid_dataset,
-            batch_size=valid_batch_size,
-            shuffle=False,
-            sampler=valid_sampler,
-            pin_memory=False,
-            persistent_workers=True if valid_thread_workers > 0 else False,
-            num_workers=valid_thread_workers,
-            drop_last=True,
-            prefetch_factor=(2 if distributed_mode else 4) if valid_thread_workers > 0 else None,
-            worker_init_fn=None,
-        )
+    valid_loader = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=valid_batch_size,
+        shuffle=False,
+        sampler=valid_sampler,
+        pin_memory=True,
+        persistent_workers=True if valid_thread_workers > 0 else False,
+        num_workers=valid_thread_workers,
+        drop_last=True,
+        prefetch_factor=valid_prefetch_factor if valid_thread_workers > 0 else None,
+        worker_init_fn=_worker_init_fn,
+    )
 
     m = load_model(conf)
     m.to(device)
@@ -425,8 +236,6 @@ def main(rank, world_size, conf, backend, trial=False):
     trainer_cls = load_trainer(conf)
     trainer = trainer_cls(model, rank)
 
-    logging.info("Rank %s startup finished in %.2fs before trainer.fit", rank, time.perf_counter() - t_main)
-
     return trainer.fit(
         conf,
         train_loader=train_loader,
@@ -437,6 +246,7 @@ def main(rank, world_size, conf, backend, trial=False):
         scaler=scaler,
         scheduler=scheduler,
         metrics=metrics,
+        rollout_scheduler=annealed_probability,
         trial=trial,
     )
 

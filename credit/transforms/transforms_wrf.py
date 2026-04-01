@@ -16,6 +16,26 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+_CONC_EPS = 1e-4
+_CONC_MAX = 2.5
+_LOG_EPS = float(np.log(_CONC_EPS))
+_NEG_LOG_EPS = float(-np.log(_CONC_EPS))
+
+CONCENTRATION_VARS = {
+    "QRAIN",
+    "QNRAIN",
+    "QSNOW",
+    "QNSNOW",
+    "QGRAUP",
+    "QNGRAUPEL",
+    "QVGRAUPEL",
+    "QHAIL",
+    "QNHAIL",
+    "QVHAIL",
+    "QICE",
+    "QNICE",
+}
+
 
 class NormalizeWRF:
     def __init__(self, conf):
@@ -141,6 +161,80 @@ class NormalizeWRF:
             self.varname_surface_outside = conf["data"]["boundary"]["surface_variables"]
             self.num_surface_outside = len(self.varname_surface_outside)
 
+    @staticmethod
+    def _forward_concentration_numpy(x: np.ndarray) -> np.ndarray:
+        x64 = np.asarray(x, dtype=np.float64)
+        transformed = 0.5 * np.minimum(x64, 2.5) + 0.5 * (
+            np.log(np.maximum(x64, _CONC_EPS)) - _LOG_EPS
+        ) / _NEG_LOG_EPS
+        return transformed.astype(x.dtype, copy=False)
+
+    @staticmethod
+    def _reshape_stats_for_data(
+        stat_values: np.ndarray,
+        stat_dims: tuple[object, ...],
+        data_values: np.ndarray,
+        data_dims: tuple[object, ...],
+    ) -> np.ndarray:
+        if stat_values.ndim == 0 or stat_values.shape == data_values.shape:
+            return stat_values
+
+        reshape = [1] * data_values.ndim
+        for dim_name, dim_size in zip(stat_dims, stat_values.shape):
+            if dim_name not in data_dims:
+                return stat_values
+            axis = data_dims.index(dim_name)
+            reshape[axis] = dim_size
+        return stat_values.reshape(reshape)
+
+    def _normalize_numpy_array(
+        self,
+        var_values: np.ndarray,
+        var_dims: tuple[object, ...],
+        mean_da: xr.DataArray,
+        std_da: xr.DataArray,
+    ) -> np.ndarray:
+        mean_values = self._reshape_stats_for_data(mean_da.values, mean_da.dims, var_values, var_dims)
+        std_values = self._reshape_stats_for_data(std_da.values, std_da.dims, var_values, var_dims)
+        return (var_values - mean_values) / std_values
+
+    @staticmethod
+    def _forward_concentration_torch(x: torch.Tensor) -> torch.Tensor:
+        return 0.5 * torch.clamp(x, max=_CONC_MAX) + 0.5 * (
+            torch.log(torch.clamp(x, min=_CONC_EPS)) - _LOG_EPS
+        ) / _NEG_LOG_EPS
+
+    @staticmethod
+    def _inverse_concentration_torch(x: torch.Tensor) -> torch.Tensor:
+        y = x
+        y_low = 0.5 * _CONC_EPS
+        y_high = 0.5 * _CONC_MAX + 0.5 * (np.log(_CONC_MAX) - _LOG_EPS) / _NEG_LOG_EPS
+
+        out = torch.empty_like(y)
+
+        mask_low = y <= y_low
+        if torch.any(mask_low):
+            out[mask_low] = 2.0 * y[mask_low]
+
+        mask_high = y >= y_high
+        if torch.any(mask_high):
+            out[mask_high] = _CONC_EPS * torch.exp(2.0 * _NEG_LOG_EPS * (y[mask_high] - 0.5 * _CONC_MAX))
+
+        mask_mid = (~mask_low) & (~mask_high)
+        if torch.any(mask_mid):
+            target = y[mask_mid]
+            lo = torch.full_like(target, _CONC_EPS)
+            hi = torch.full_like(target, _CONC_MAX)
+            for _ in range(32):
+                mid = 0.5 * (lo + hi)
+                f_mid = 0.5 * mid + 0.5 * (torch.log(mid) - _LOG_EPS) / _NEG_LOG_EPS
+                go_right = f_mid < target
+                lo = torch.where(go_right, mid, lo)
+                hi = torch.where(go_right, hi, mid)
+            out[mask_mid] = 0.5 * (lo + hi)
+
+        return out
+
     def __call__(self, sample, inverse: bool = False):
         if inverse:
             # Inverse transformation
@@ -182,7 +276,10 @@ class NormalizeWRF:
             for level in range(self.levels):
                 var_mean = mean_tensor[level]
                 var_std = std_tensor[level]
-                transformed_upper_air[:, k] = (tensor_upper_air[:, k] - var_mean) / var_std
+                upper_air_level = tensor_upper_air[:, k]
+                if name in CONCENTRATION_VARS:
+                    upper_air_level = self._forward_concentration_torch(upper_air_level)
+                transformed_upper_air[:, k] = (upper_air_level - var_mean) / var_std
                 k += 1
 
         # Standardize surface variables
@@ -190,14 +287,20 @@ class NormalizeWRF:
             for k, name in enumerate(self.varname_surface):
                 var_mean = self.mean_tensors[name].to(device)
                 var_std = self.std_tensors[name].to(device)
-                transformed_surface[:, k] = (tensor_surface[:, k] - var_mean) / var_std
+                surface_slice = tensor_surface[:, k]
+                if name in CONCENTRATION_VARS:
+                    surface_slice = self._forward_concentration_torch(surface_slice)
+                transformed_surface[:, k] = (surface_slice - var_mean) / var_std
 
         # Standardize diagnostic variables
         if self.flag_diagnostic:
             for k, name in enumerate(self.varname_diagnostic):
                 var_mean = self.mean_tensors[name].to(device)
                 var_std = self.std_tensors[name].to(device)
-                transformed_diagnostic[:, k] = (transformed_diagnostic[:, k] - var_mean) / var_std
+                diagnostic_slice = transformed_diagnostic[:, k]
+                if name in CONCENTRATION_VARS:
+                    diagnostic_slice = self._forward_concentration_torch(diagnostic_slice)
+                transformed_diagnostic[:, k] = (diagnostic_slice - var_mean) / var_std
 
         # Concatenate everything
         if self.flag_surface:
@@ -223,52 +326,111 @@ class NormalizeWRF:
 
     def transform(self, sample: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
-        This function transforms training batches
-            - forcing & static don't need to be transformed; users should transform them and save them to the file
-            - other variables need to be transformed
+        This function transforms training batches using .values array arithmetic to avoid xarray slowdowns.
+        Boundary inputs are skipped if they were pre-normalized by the dataset (flagged via
+        ``sample.get('_boundary_pre_normalized', False)``).
         """
         normalized_sample = {}
+        # Check whether boundary anchors have already been normalized by the dataset
+        boundary_already_normalized = sample.pop("_boundary_pre_normalized", False)
+
         if self.has_forcing_static:
             for key, value in sample.items():
-                # key: 'historical_ERA5_images', 'target_ERA5_images'
-                # value: the xarray datasets
                 if isinstance(value, xr.Dataset):
-                    # training input
                     if key == "WRF_input":
-                        # get all the input vars
                         varname_inputs = value.keys()
-
-                        # loop through dataset variables, handle forcing and static differently
-                        for varname in varname_inputs:
-                            # if forcing and static skip it, otherwise do z-score
+                        for varname_raw in varname_inputs:
+                            varname = str(varname_raw)
                             if (varname in self.varname_forcing_static) is False:
-                                value[varname] = (value[varname] - self.mean_ds[varname]) / self.std_ds[varname]
-
-                        # put transformed xr.Dataset to the output dictionary
+                                var_da = value.data_vars[varname]
+                                var_values = var_da.values
+                                if varname in CONCENTRATION_VARS:
+                                    var_values = self._forward_concentration_numpy(var_values)
+                                normalized_values = self._normalize_numpy_array(
+                                    var_values,
+                                    var_da.dims,
+                                    self.mean_ds[varname],
+                                    self.std_ds[varname],
+                                )
+                                value[varname] = xr.DataArray(
+                                    normalized_values, dims=var_da.dims, coords=var_da.coords
+                                )
                         normalized_sample[key] = value
-
-                    # WRF target fields
                     elif key == "WRF_target":
-                        normalized_sample[key] = (value - self.mean_ds) / self.std_ds
-
-                    # boundary inputs
+                        for varname_raw in value.keys():
+                            varname = str(varname_raw)
+                            var_da = value.data_vars[varname]
+                            var_values = var_da.values
+                            if varname in CONCENTRATION_VARS:
+                                var_values = self._forward_concentration_numpy(var_values)
+                            normalized_values = self._normalize_numpy_array(
+                                var_values,
+                                var_da.dims,
+                                self.mean_ds[varname],
+                                self.std_ds[varname],
+                            )
+                            value[varname] = xr.DataArray(
+                                normalized_values, dims=var_da.dims, coords=var_da.coords
+                            )
+                        normalized_sample[key] = value
                     elif key == "boundary_input":
-                        normalized_sample[key] = (value - self.mean_ds_outside) / self.std_ds_outside
+                        if not boundary_already_normalized:
+                            for varname_raw in value.keys():
+                                varname = str(varname_raw)
+                                var_da = value.data_vars[varname]
+                                var_values = var_da.values
+                                if varname in CONCENTRATION_VARS:
+                                    var_values = self._forward_concentration_numpy(var_values)
+                                normalized_values = self._normalize_numpy_array(
+                                    var_values,
+                                    var_da.dims,
+                                    self.mean_ds_outside[varname],
+                                    self.std_ds_outside[varname],
+                                )
+                                value[varname] = xr.DataArray(
+                                    normalized_values, dims=var_da.dims, coords=var_da.coords
+                                )
+                        normalized_sample[key] = value
                 elif key == "time_encode":
                     normalized_sample[key] = value
-
-        # if there's no forcing / static
         else:
             for key, value in sample.items():
                 if isinstance(value, xr.Dataset):
-                    # WRF domain
                     if key == "WRF_input" or key == "WRF_target":
-                        normalized_sample[key] = (value - self.mean_ds) / self.std_ds
-
-                    # boundary inputs
+                        for varname_raw in value.keys():
+                            varname = str(varname_raw)
+                            var_da = value.data_vars[varname]
+                            var_values = var_da.values
+                            if varname in CONCENTRATION_VARS:
+                                var_values = self._forward_concentration_numpy(var_values)
+                            normalized_values = self._normalize_numpy_array(
+                                var_values,
+                                var_da.dims,
+                                self.mean_ds[varname],
+                                self.std_ds[varname],
+                            )
+                            value[varname] = xr.DataArray(
+                                normalized_values, dims=var_da.dims, coords=var_da.coords
+                            )
+                        normalized_sample[key] = value
                     elif key == "boundary_input":
-                        normalized_sample[key] = (value - self.mean_ds_outside) / self.std_ds_outside
-
+                        if not boundary_already_normalized:
+                            for varname_raw in value.keys():
+                                varname = str(varname_raw)
+                                var_da = value.data_vars[varname]
+                                var_values = var_da.values
+                                if varname in CONCENTRATION_VARS:
+                                    var_values = self._forward_concentration_numpy(var_values)
+                                normalized_values = self._normalize_numpy_array(
+                                    var_values,
+                                    var_da.dims,
+                                    self.mean_ds_outside[varname],
+                                    self.std_ds_outside[varname],
+                                )
+                                value[varname] = xr.DataArray(
+                                    normalized_values, dims=var_da.dims, coords=var_da.coords
+                                )
+                        normalized_sample[key] = value
                 elif key == "time_encode":
                     normalized_sample[key] = value
 
@@ -303,7 +465,10 @@ class NormalizeWRF:
             for level in range(self.levels):
                 mean = mean_tensor[level]
                 std = std_tensor[level]
-                transformed_upper_air[:, k] = tensor_upper_air[:, k] * std + mean
+                upper_air_level = tensor_upper_air[:, k] * std + mean
+                if name in CONCENTRATION_VARS:
+                    upper_air_level = self._inverse_concentration_torch(upper_air_level)
+                transformed_upper_air[:, k] = upper_air_level
                 k += 1
 
         # Reverse surface variables
@@ -311,14 +476,20 @@ class NormalizeWRF:
             for k, name in enumerate(self.varname_surface):
                 mean = self.mean_tensors[name].to(device)
                 std = self.std_tensors[name].to(device)
-                transformed_surface[:, k] = tensor_surface[:, k] * std + mean
+                surface_slice = tensor_surface[:, k] * std + mean
+                if name in CONCENTRATION_VARS:
+                    surface_slice = self._inverse_concentration_torch(surface_slice)
+                transformed_surface[:, k] = surface_slice
 
         # Reverse diagnostic variables
         if self.flag_diagnostic:
             for k, name in enumerate(self.varname_diagnostic):
                 mean = self.mean_tensors[name].to(device)
                 std = self.std_tensors[name].to(device)
-                transformed_diagnostic[:, k] = transformed_diagnostic[:, k] * std + mean
+                diagnostic_slice = transformed_diagnostic[:, k] * std + mean
+                if name in CONCENTRATION_VARS:
+                    diagnostic_slice = self._inverse_concentration_torch(diagnostic_slice)
+                transformed_diagnostic[:, k] = diagnostic_slice
 
         # Concatenate everything
         if self.flag_surface:

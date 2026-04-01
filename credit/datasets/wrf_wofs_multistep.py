@@ -1,9 +1,6 @@
 import logging
 from collections import OrderedDict
 from functools import partial
-import re
-from pathlib import Path
-import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -45,125 +42,6 @@ def _stack_rollout_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return stacked
 
-
-def _expand_anchor_dataset(dataset: xr.Dataset, boundary_seq_len: int) -> xr.Dataset:
-    anchor = dataset.isel(time=slice(0, 1)).load()
-
-    if boundary_seq_len == 1:
-        return anchor
-
-    anchor_time = anchor["time"].values[0]
-    repeated = xr.concat([anchor] * boundary_seq_len, dim="time")
-    repeated = repeated.assign_coords(time=np.array([anchor_time] * boundary_seq_len))
-    return repeated
-
-
-def worker(
-    tuple_index: Tuple[int, int],
-    WRF_file_indices: Dict[str, List[int]],
-    list_upper_ds: List[Any],
-    list_surf_ds: Optional[List[Any]],
-    list_dyn_forcing_ds: Optional[List[Any]],
-    list_diag_ds: Optional[List[Any]],
-    xarray_forcing: Optional[Any],
-    xarray_static: Optional[Any],
-    history_len: int,
-    list_upper_ds_outside: List[Any],
-    list_surf_ds_outside: Optional[List[Any]],
-    boundary_seq_len: int,
-    start_index_offset: int,
-    transform: Optional[Callable],
-) -> Dict[str, Any]:
-    start_index, step_offset = tuple_index
-
-    try:
-        ind_file = find_key_for_number(start_index, WRF_file_indices)
-        if ind_file is None:
-            raise KeyError(f"No WoFS file mapping found for start index {start_index}")
-
-        file_range = WRF_file_indices[ind_file]
-
-        ind_start_in_file = (start_index - file_range[1]) + start_index_offset + step_offset
-
-        ind_end_in_file = ind_start_in_file + history_len
-
-        WRF_subset = list_upper_ds[int(ind_file)].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
-
-        if list_surf_ds:
-            surface_subset = list_surf_ds[int(ind_file)].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
-            WRF_subset = WRF_subset.merge(surface_subset)
-
-        datetime_as_number = WRF_subset.time.values.astype("datetime64[s]").astype(int)
-
-        WRF_input = WRF_subset.isel(time=slice(0, history_len, 1)).load()
-
-        if list_dyn_forcing_ds:
-            dyn_forcing_subset = list_dyn_forcing_ds[int(ind_file)].isel(
-                time=slice(ind_start_in_file, ind_end_in_file + 1)
-            )
-            dyn_forcing_subset = dyn_forcing_subset.isel(time=slice(0, history_len, 1)).load()
-            WRF_input = WRF_input.merge(dyn_forcing_subset)
-
-        if xarray_forcing:
-            month_day_forcing = extract_month_day_hour(np.array(xarray_forcing["time"]))
-            month_day_inputs = extract_month_day_hour(np.array(WRF_input["time"]))
-            ind_forcing, _ = find_common_indices(month_day_forcing, month_day_inputs)
-            forcing_subset_input = xarray_forcing.isel(time=ind_forcing)
-            forcing_subset_input["time"] = WRF_input["time"]
-            WRF_input = WRF_input.merge(forcing_subset_input)
-
-        if xarray_static:
-            N_time_dims = len(WRF_subset["time"])
-            static_subset_input = xarray_static.expand_dims(dim={"time": N_time_dims})
-            static_subset_input = static_subset_input.assign_coords({"time": WRF_subset["time"]})
-            static_subset_input = static_subset_input.isel(time=slice(0, history_len, 1))
-            static_subset_input["time"] = WRF_input["time"]
-            WRF_input = WRF_input.merge(static_subset_input)
-
-        WRF_target = WRF_subset.isel(time=slice(history_len, history_len + 1, 1)).load()
-
-        if list_diag_ds:
-            diagnostic_subset = list_diag_ds[int(ind_file)].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
-            diagnostic_subset = diagnostic_subset.isel(time=slice(history_len, history_len + 1, 1)).load()
-            WRF_target = WRF_target.merge(diagnostic_subset)
-
-        ds_upper_outside = _expand_anchor_dataset(list_upper_ds_outside[int(ind_file)], boundary_seq_len)
-
-        if list_surf_ds_outside:
-            ds_surf_outside = _expand_anchor_dataset(list_surf_ds_outside[int(ind_file)], boundary_seq_len)
-            ds_outside = xr.merge([ds_upper_outside, ds_surf_outside])
-        else:
-            ds_outside = ds_upper_outside
-
-        t0 = WRF_input["time"].values
-        t1 = WRF_target["time"].values
-        t2 = ds_outside["time"].values
-        time_encode = encode_datetime64(np.concatenate([t0, t1, t2]))
-
-        sample = Sample_WRF(
-            WRF_input=WRF_input,
-            WRF_target=WRF_target,
-            boundary_input=ds_outside,
-            time_encode=time_encode,
-            datetime_index=datetime_as_number,
-        )
-
-        if transform:
-            sample = transform(sample)
-
-        sample["index"] = start_index
-        sample["datetime"] = [
-            int(WRF_input.time.values[0].astype("datetime64[s]").astype(int)),
-            int(WRF_target.time.values[0].astype("datetime64[s]").astype(int)),
-        ]
-
-    except Exception as e:
-        logger.error(f"Error processing index {tuple_index}: {e}")
-        raise
-
-    return sample
-
-
 class WoFSMultiStep(torch.utils.data.Dataset):
     """
     WoFS multi-step dataset with same-file `t=0` conditioning.
@@ -193,11 +71,7 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         self.varname_forcing = param_interior["varname_forcing"]
         self.varname_static = param_interior["varname_static"]
         self.varname_diagnostic = param_interior["varname_diagnostic"]
-        # Only include files of the form: wofs_YYYYMMDD_HHMM_memNN.zarr
-        pattern = re.compile(r"wofs_\d{8}_\d{4}_mem\d+\.zarr$")
-        self.filenames = sorted(
-            f for f in param_interior["filenames"] if pattern.search(Path(f).name)
-        )
+        self.filenames = sorted(param_interior["filenames"])
         self.filename_surface = param_interior["filename_surface"]
         self.filename_dyn_forcing = param_interior["filename_dyn_forcing"]
         self.filename_forcing = param_interior["filename_forcing"]
@@ -239,108 +113,55 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         self.list_surf_ds_outside = None
         self.WRF_file_indices = None
         self.total_length = None
-        self.file_time_lengths = None
-        self._case_cache: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
-        self.max_open_files_per_worker = int(param_interior.get("max_open_files_per_worker", 4))
-        precomputed_index_metadata = param_interior.get("precomputed_index_metadata")
-        if precomputed_index_metadata:
-            self.WRF_file_indices = dict(precomputed_index_metadata.get("WRF_file_indices", {}))
-            self.file_time_lengths = dict(precomputed_index_metadata.get("file_time_lengths", {}))
-            self.total_length = int(precomputed_index_metadata.get("total_length", 0))
         self.worker = None
         self.current_epoch = None
+        self.cached_outside_anchors = OrderedDict()
+        self.max_cached_outside_anchors = len(self.filenames)
 
-    def _build_index_mapping(self):
-        if self.WRF_file_indices is not None and self.total_length is not None:
-            return
+    def _get_boundary_anchor(self, file_index: int) -> xr.Dataset:
+        """Get pre-normalized boundary anchor with bounded in-worker cache."""
+        cached = self.cached_outside_anchors.get(file_index)
+        if cached is not None:
+            self.cached_outside_anchors.move_to_end(file_index)
+            return cached
 
-        t0 = time.perf_counter()
-        logger.info("Rank %s WoFSMultiStep building index mapping for %s files", self.rank, len(self.filenames))
+        anchor_upper = self.list_upper_ds_outside[file_index].isel(time=slice(0, 1)).load()
+        if self.boundary_seq_len > 1:
+            anchor_time = anchor_upper["time"].values[0]
+            anchor_upper = xr.concat([anchor_upper] * self.boundary_seq_len, dim="time")
+            anchor_upper = anchor_upper.assign_coords(time=np.array([anchor_time] * self.boundary_seq_len))
 
-        ind_start = 0
-        self.WRF_file_indices = {}
-        self.file_time_lengths = {}
+        if self.list_surf_ds_outside:
+            anchor_surf = self.list_surf_ds_outside[file_index].isel(time=slice(0, 1)).load()
+            if self.boundary_seq_len > 1:
+                anchor_time = anchor_surf["time"].values[0]
+                anchor_surf = xr.concat([anchor_surf] * self.boundary_seq_len, dim="time")
+                anchor_surf = anchor_surf.assign_coords(time=np.array([anchor_time] * self.boundary_seq_len))
+            anchor = xr.merge([anchor_upper, anchor_surf])
+        else:
+            anchor = anchor_upper
 
-        for ind_file, filename in enumerate(self.filenames):
-            if filename.endswith((".nc", ".nc4")):
-                ds = xr.open_dataset(filename, decode_times=False)
-            else:
-                ds = xr.open_zarr(filename, decode_times=False)
-            try:
-                n_time = int(ds.sizes["time"])
-                self.file_time_lengths[str(ind_file)] = n_time
+        if self.transform is not None:
+            _normalizer = None
+            if hasattr(self.transform, "transforms"):
+                for t in self.transform.transforms:
+                    if hasattr(t, "mean_ds_outside") and hasattr(t, "std_ds_outside"):
+                        _normalizer = t
+                        break
+            elif hasattr(self.transform, "mean_ds_outside"):
+                _normalizer = self.transform
 
-                available = n_time - (self.history_len + self.forecast_len + 1) + 1
-                available -= self.start_index_offset
-                if available <= 0:
-                    continue
+            if _normalizer is not None:
+                for varname in anchor.keys():
+                    anchor[varname] = (
+                        anchor[varname]
+                        - _normalizer.mean_ds_outside[varname]
+                    ) / _normalizer.std_ds_outside[varname]
 
-                self.WRF_file_indices[str(ind_file)] = [available, ind_start, ind_start + available - 1]
-                ind_start += available
-            finally:
-                try:
-                    ds.close()
-                except Exception:
-                    pass
-
-            if (ind_file + 1) % 50 == 0:
-                logger.info(
-                    "Rank %s WoFSMultiStep index progress: %s/%s files in %.1fs",
-                    self.rank,
-                    ind_file + 1,
-                    len(self.filenames),
-                    time.perf_counter() - t0,
-                )
-
-        self.total_length = int(ind_start)
-        logger.info(
-            "Rank %s WoFSMultiStep index mapping done: total_length=%s elapsed=%.2fs",
-            self.rank,
-            self.total_length,
-            time.perf_counter() - t0,
-        )
-
-    def _load_shared_aux_datasets(self):
-        if self.filename_forcing is not None and self.xarray_forcing is False:
-            ds = get_forward_data(self.filename_forcing)
-            self.xarray_forcing = drop_var_from_dataset(ds, self.varname_forcing).load()
-        elif self.filename_forcing is None:
-            self.xarray_forcing = False
-
-        if self.filename_static is not None and self.xarray_static is False:
-            ds = get_forward_data(self.filename_static)
-            self.xarray_static = drop_var_from_dataset(ds, self.varname_static).load()
-        elif self.filename_static is None:
-            self.xarray_static = False
-
-    def _get_case_views(self, ind_file: str) -> Dict[str, Any]:
-        key = int(ind_file)
-        if key in self._case_cache:
-            self._case_cache.move_to_end(key)
-            return self._case_cache[key]
-
-        ds = get_forward_data(self.filenames[key])
-        views = {
-            "ds": ds,
-            "upper": filter_ds(ds, self.varname_upper_air),
-            "surface": filter_ds(ds, self.varname_surface) if self.filename_surface else False,
-            "dyn": filter_ds(ds, self.varname_dyn_forcing) if self.filename_dyn_forcing else False,
-            "diag": filter_ds(ds, self.varname_diagnostic) if self.filename_diagnostic else False,
-            "upper_out": filter_ds(ds, self.varname_upper_air_outside),
-            "surf_out": filter_ds(ds, self.varname_surface_outside) if self.varname_surface_outside else False,
-        }
-
-        self._case_cache[key] = views
-        self._case_cache.move_to_end(key)
-
-        while len(self._case_cache) > self.max_open_files_per_worker:
-            _, old_views = self._case_cache.popitem(last=False)
-            try:
-                old_views["ds"].close()
-            except Exception:
-                pass
-
-        return views
+        self.cached_outside_anchors[file_index] = anchor
+        if len(self.cached_outside_anchors) > self.max_cached_outside_anchors:
+            self.cached_outside_anchors.popitem(last=False)
+        return anchor
 
     def _open_datasets(self):
         """
@@ -351,84 +172,204 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         if getattr(self, "_opened", False):
             return
 
-        self._build_index_mapping()
-        self._load_shared_aux_datasets()
+        filenames = self.filenames
+        # Open forward data for each file
+        all_ds = [get_forward_data(fn) for fn in filenames]
+
+        # interior sets
+        self.list_upper_ds = [filter_ds(ds, self.varname_upper_air) for ds in all_ds]
+
+        if self.filename_surface:
+            self.list_surf_ds = [filter_ds(ds, self.varname_surface) for ds in all_ds]
+        else:
+            self.list_surf_ds = False
+
+        if self.filename_dyn_forcing:
+            self.list_dyn_forcing_ds = [filter_ds(ds, self.varname_dyn_forcing) for ds in all_ds]
+        else:
+            self.list_dyn_forcing_ds = False
+
+        if self.filename_diagnostic:
+            self.list_diag_ds = [filter_ds(ds, self.varname_diagnostic) for ds in all_ds]
+        else:
+            self.list_diag_ds = False
+
+        # compute indices mapping (available indices per file)
+        ind_start = 0
+        self.WRF_file_indices = {}
+        for ind_file, WRF_file_xarray in enumerate(self.list_upper_ds):
+            available = len(WRF_file_xarray["time"]) - (self.history_len + self.forecast_len + 1) + 1
+            available -= self.start_index_offset
+            if available <= 0:
+                continue
+            self.WRF_file_indices[str(ind_file)] = [available, ind_start, ind_start + available - 1]
+            ind_start += available
+        self.total_length = ind_start
+
+        # forcing and static (load once)
+        if self.filename_forcing is not None:
+            ds = get_forward_data(self.filename_forcing)
+            self.xarray_forcing = drop_var_from_dataset(ds, self.varname_forcing).load()
+        else:
+            self.xarray_forcing = False
+
+        if self.filename_static is not None:
+            ds = get_forward_data(self.filename_static)
+            self.xarray_static = drop_var_from_dataset(ds, self.varname_static).load()
+        else:
+            self.xarray_static = False
+
+        # outside branch data
+        self.list_upper_ds_outside = [filter_ds(ds, self.varname_upper_air_outside) for ds in all_ds]
+        if self.varname_surface_outside:
+            self.list_surf_ds_outside = [filter_ds(ds, self.varname_surface_outside) for ds in all_ds]
+        else:
+            self.list_surf_ds_outside = False
+
+        # Boundary anchors are loaded/normalized lazily in _get_boundary_anchor()
+        # to avoid high startup latency and per-worker memory spikes.
+
+        # Flag so the transform can skip boundary normalization
+        self._boundary_pre_normalized = True
 
         self._opened = True
 
     def __len__(self):
-        self._build_index_mapping()
-        return self.total_length
+        # Return cached value if available.
+        if getattr(self, "total_length", None) is not None:
+            return self.total_length
 
+        # Compute total length by reading only zarr metadata (time dim size).
+        # Uses open_zarr with no data loading to minimise main-process overhead.
+        total = 0
+        for fn in self.filenames:
+            try:
+                # Try fast metadata-only path for zarr files
+                if fn.endswith('.zarr'):
+                    import zarr
+                    z = zarr.open(fn, mode='r')
+                    # Read time size from the first upper-air variable's shape
+                    first_var = self.varname_upper_air[0]
+                    if first_var in z:
+                        n_time = z[first_var].shape[0]
+                    else:
+                        # Fallback: open with xarray
+                        ds = get_forward_data(fn)
+                        n_time = int(ds["time"].size)
+                        ds.close()
+                        del ds
+                else:
+                    ds = get_forward_data(fn)
+                    n_time = int(ds["time"].size)
+                    ds.close()
+                    del ds
+            except Exception:
+                # Fallback to full xarray open
+                ds = get_forward_data(fn)
+                try:
+                    n_time = int(filter_ds(ds, self.varname_upper_air)["time"].size)
+                finally:
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                    del ds
+
+            available = n_time - (self.history_len + self.forecast_len + 1) + 1
+            available -= self.start_index_offset
+            if available > 0:
+                total += available
+
+        self.total_length = int(total)
+        return self.total_length
     def set_epoch(self, epoch):
         self.current_epoch = epoch
 
     def __getitem__(self, index):
-        # ensure per-worker opens have happened
         if not self._opened:
             self._open_datasets()
 
+        ind_file = find_key_for_number(index, self.WRF_file_indices)
+        if ind_file is None:
+            raise KeyError(f"No WoFS file mapping found for start index {index}")
+
+        file_range = self.WRF_file_indices[ind_file]
+        base_start = (index - file_range[1]) + self.start_index_offset
+        total_len = self.forecast_len + self.history_len + 1
+
+        # ------------------------------------------------------------------ #
+        # 1. Single contiguous disk read for the entire rollout window
+        # ------------------------------------------------------------------ #
+        upper_chunk = self.list_upper_ds[int(ind_file)].isel(
+            time=slice(base_start, base_start + total_len)
+        ).load()
+        if self.list_surf_ds:
+            surf_chunk = self.list_surf_ds[int(ind_file)].isel(
+                time=slice(base_start, base_start + total_len)
+            ).load()
+            base_chunk = xr.merge([upper_chunk, surf_chunk])
+        else:
+            base_chunk = upper_chunk
+
+        diag_chunk = None
+        if self.list_diag_ds:
+            diag_chunk = self.list_diag_ds[int(ind_file)].isel(
+                time=slice(base_start, base_start + total_len)
+            ).load()
+
+        # ------------------------------------------------------------------ #
+        # 2. Merge auxiliary variables into base_chunk ONCE (not per step)
+        # ------------------------------------------------------------------ #
+        full_input_chunk = base_chunk
+        if self.list_dyn_forcing_ds:
+            dyn_chunk = self.list_dyn_forcing_ds[int(ind_file)].isel(
+                time=slice(base_start, base_start + total_len)
+            ).load()
+            full_input_chunk = xr.merge([full_input_chunk, dyn_chunk])
+
+        if self.xarray_forcing:
+            month_day_forcing = extract_month_day_hour(np.array(self.xarray_forcing["time"]))
+            month_day_inputs = extract_month_day_hour(np.array(base_chunk["time"]))
+            ind_forcing, _ = find_common_indices(month_day_forcing, month_day_inputs)
+            forcing_chunk = self.xarray_forcing.isel(time=ind_forcing).copy()
+            forcing_chunk["time"] = base_chunk["time"]
+            full_input_chunk = xr.merge([full_input_chunk, forcing_chunk])
+
+        if self.xarray_static:
+            N_time_dims = len(base_chunk["time"])
+            static_chunk = self.xarray_static.expand_dims(dim={"time": N_time_dims}).copy()
+            static_chunk = static_chunk.assign_coords({"time": base_chunk["time"]})
+            full_input_chunk = xr.merge([full_input_chunk, static_chunk])
+
+        # Pre-normalized, cached boundary anchor
+        ds_outside = self._get_boundary_anchor(int(ind_file))
+
+        # ------------------------------------------------------------------ #
+        # 3. Rollout loop — only cheap in-memory isel, no merges
+        # ------------------------------------------------------------------ #
         rollout_samples: List[Dict[str, Any]] = []
 
         for step_offset in range(self.forecast_len + 1):
-            ind_file = find_key_for_number(index, self.WRF_file_indices)
-            if ind_file is None:
-                raise KeyError(f"No WoFS file mapping found for start index {index}")
+            rel_start = step_offset
+            rel_end = step_offset + self.history_len
 
-            file_range = self.WRF_file_indices[ind_file]
-            ind_start_in_file = (index - file_range[1]) + self.start_index_offset + step_offset
-            ind_end_in_file = ind_start_in_file + self.history_len
+            # Input: slice from the pre-merged full_input_chunk
+            WRF_input = full_input_chunk.isel(time=slice(rel_start, rel_end))
 
-            case = self._get_case_views(ind_file)
-
-            WRF_subset = case["upper"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
-
-            if case["surface"]:
-                surface_subset = case["surface"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
-                WRF_subset = WRF_subset.merge(surface_subset)
-
-            datetime_as_number = WRF_subset.time.values.astype("datetime64[s]").astype(int)
-            WRF_input = WRF_subset.isel(time=slice(0, self.history_len, 1)).load()
-
-            if case["dyn"]:
-                dyn_forcing_subset = case["dyn"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
-                dyn_forcing_subset = dyn_forcing_subset.isel(time=slice(0, self.history_len, 1)).load()
-                WRF_input = WRF_input.merge(dyn_forcing_subset)
-
-            if self.xarray_forcing:
-                month_day_forcing = extract_month_day_hour(np.array(self.xarray_forcing["time"]))
-                month_day_inputs = extract_month_day_hour(np.array(WRF_input["time"]))
-                ind_forcing, _ = find_common_indices(month_day_forcing, month_day_inputs)
-                forcing_subset_input = self.xarray_forcing.isel(time=ind_forcing)
-                forcing_subset_input["time"] = WRF_input["time"]
-                WRF_input = WRF_input.merge(forcing_subset_input)
-
-            if self.xarray_static:
-                n_time_dims = len(WRF_subset["time"])
-                static_subset_input = self.xarray_static.expand_dims(dim={"time": n_time_dims})
-                static_subset_input = static_subset_input.assign_coords({"time": WRF_subset["time"]})
-                static_subset_input = static_subset_input.isel(time=slice(0, self.history_len, 1))
-                static_subset_input["time"] = WRF_input["time"]
-                WRF_input = WRF_input.merge(static_subset_input)
-
-            WRF_target = WRF_subset.isel(time=slice(self.history_len, self.history_len + 1, 1)).load()
-
-            if case["diag"]:
-                diagnostic_subset = case["diag"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
-                diagnostic_subset = diagnostic_subset.isel(time=slice(self.history_len, self.history_len + 1, 1)).load()
-                WRF_target = WRF_target.merge(diagnostic_subset)
-
-            ds_upper_outside = _expand_anchor_dataset(case["upper_out"], self.boundary_seq_len)
-            if case["surf_out"]:
-                ds_surf_outside = _expand_anchor_dataset(case["surf_out"], self.boundary_seq_len)
-                ds_outside = xr.merge([ds_upper_outside, ds_surf_outside])
-            else:
-                ds_outside = ds_upper_outside
+            # Target: slice from base_chunk (upper + surface only)
+            WRF_target = base_chunk.isel(time=slice(rel_end, rel_end + 1))
+            if diag_chunk is not None:
+                step_diag = diag_chunk.isel(time=slice(rel_end, rel_end + 1))
+                WRF_target = xr.merge([WRF_target, step_diag])
 
             t0 = WRF_input["time"].values
             t1 = WRF_target["time"].values
             t2 = ds_outside["time"].values
             time_encode = encode_datetime64(np.concatenate([t0, t1, t2]))
+
+            datetime_as_number = base_chunk.isel(
+                time=slice(rel_start, rel_end + 1)
+            ).time.values.astype("datetime64[s]").astype(int)
 
             sample = Sample_WRF(
                 WRF_input=WRF_input,
@@ -439,15 +380,20 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             )
 
             if self.transform:
+                # Tell the transform that boundary data is already normalized
+                sample["_boundary_pre_normalized"] = getattr(
+                    self, "_boundary_pre_normalized", False
+                )
                 sample = self.transform(sample)
 
-            sample["forecast_step"] = step_offset + 1
             sample["index"] = index
             sample["datetime"] = [
-                int(WRF_input.time.values[0].astype("datetime64[s]").astype(int)),
-                int(WRF_target.time.values[0].astype("datetime64[s]").astype(int)),
+                int(t0[0].astype("datetime64[s]").astype(int)),
+                int(t1[0].astype("datetime64[s]").astype(int)),
             ]
+            sample["forecast_step"] = step_offset + 1
             sample["stop_forecast"] = step_offset == self.forecast_len
+
             rollout_samples.append(sample)
 
         return _stack_rollout_samples(rollout_samples)

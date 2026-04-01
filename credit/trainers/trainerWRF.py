@@ -36,6 +36,8 @@ class Trainer(BaseTrainer):
         forecast_len = conf["data"]["forecast_len"]
         amp = conf["trainer"]["amp"]
         distributed = True if conf["trainer"]["mode"] in ["fsdp", "ddp"] else False
+        residual_prediction = conf["trainer"].get("residual_prediction", False)
+        varnum_diag = len(conf["data"]["diagnostic_variables"])
 
         # forecast step
         if "total_time_steps" in conf["data"]:
@@ -122,6 +124,20 @@ class Trainer(BaseTrainer):
 
                 # single step predict
                 y_pred = self.model(x, x_boundary, x_time_encode)
+
+                # Residual prediction: model outputs a delta, add last input state back
+                if residual_prediction:
+                    num_prog = y_pred.shape[1] - varnum_diag
+                    residual = x[:, :num_prog, -1:, ...]
+                    if varnum_diag > 0:
+                        y_pred = torch.cat(
+                            [y_pred[:, :num_prog, ...] + residual,
+                             y_pred[:, num_prog:, ...]],
+                            dim=1,
+                        )
+                    else:
+                        y_pred = y_pred + residual
+
                 y = y.to(device=self.device, dtype=y_pred.dtype)
 
                 # loss compute
@@ -145,8 +161,8 @@ class Trainer(BaseTrainer):
 
             accum_log(logs, {"loss": loss.item() / grad_accum_every})
 
-            if distributed:
-                torch.distributed.barrier()
+
+            # Note: DDP synchronizes gradients during backward(); no explicit barrier needed.
 
             if grad_max_norm is not None:
                 scaler.unscale_(optimizer)
@@ -221,6 +237,8 @@ class Trainer(BaseTrainer):
 
         forecast_len = conf["data"]["valid_forecast_len"]
         distributed = True if conf["trainer"]["mode"] in ["fsdp", "ddp"] else False
+        residual_prediction = conf["trainer"].get("residual_prediction", False)
+        varnum_diag = len(conf["data"]["diagnostic_variables"])
 
         total_time_steps = conf["data"]["total_time_steps"] if "total_time_steps" in conf["data"] else forecast_len
 
@@ -295,6 +313,19 @@ class Trainer(BaseTrainer):
                 x_time_encode = batch["x_time_encode"].to(self.device)
 
                 y_pred = self.model(x, x_boundary, x_time_encode)
+
+                # Residual prediction: model outputs a delta, add last input state back
+                if residual_prediction:
+                    num_prog = y_pred.shape[1] - varnum_diag
+                    residual = x[:, :num_prog, -1:, ...]
+                    if varnum_diag > 0:
+                        y_pred = torch.cat(
+                            [y_pred[:, :num_prog, ...] + residual,
+                             y_pred[:, num_prog:, ...]],
+                            dim=1,
+                        )
+                    else:
+                        y_pred = y_pred + residual
 
                 loss = criterion(y.to(y_pred.dtype), y_pred)
 
