@@ -1,4 +1,4 @@
-save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0330'
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0331'
 seed: 1000
 
 data:
@@ -11,19 +11,19 @@ data:
   forcing_variables: []
   static_variables: []
 
-  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
-  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
-  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
-  save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
+  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
+  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
+  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
+  save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
 
-  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/mean.nc'
-  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/std.nc'
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/std.nc'
 
   train_years: [2019]
-  valid_years: [2019]
+  valid_years: [2022]
 
-  train_date_range: ['20190401', '20190701']
-  valid_date_range: ['20190702', '20191030']
+  train_date_range: ['20190101', '20191231']
+  valid_date_range: ['20220402', '20220415']
 
   history_len: 1
   valid_history_len: 1
@@ -57,8 +57,8 @@ model:
     surface_channels: 4
     input_only_channels: 10
     output_only_channels: 6
-    patch_height: 4
-    patch_width: 4
+    patch_height: 2
+    patch_width: 2
     frame_patch_size: 1
     dim: 192
   param_outside:
@@ -68,54 +68,54 @@ model:
     levels: 17
     channels: 6
     surface_channels: 4
-    patch_height: 4
-    patch_width: 4
+    patch_height: 2
+    patch_width: 2
     frame_patch_size: 1
     dim: 192
-  depth: 24
+  depth: 32
   num_heads: 8
-  window_size: 7
+  window_size: 9
   use_spectral_norm: True
 
 trainer:
   type: 'multi-step-wrf'
   mode: 'none'
   train_batch_size: 4
-  valid_batch_size: 4
+  valid_batch_size: 2
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
   thread_workers: 16
   valid_thread_workers: 16
-  prefetch_factor: 8
+  # prefetch_factor: 4
   update_learning_rate: False
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   amp: False
-  epochs: 30
+  # epochs: 70
   start_epoch: 0
   load_weights: False
   load_optimizer: False
   load_scheduler: False
   load_scaler: False
-  skip_validation: False
+  skip_validation: True
   use_scheduler: True
   reload_epoch: True
-  epochs: &epochs 30
+  epochs: &epochs 100
   scheduler:
     scheduler_type: cosine-annealing-restarts
     first_cycle_steps: 250
-    cycle_mult: 6.0
+    cycle_mult: 2.0
     max_lr: 1.0e-03
-    min_lr: 1.0e-06
+    min_lr: 1.0e-05
     warmup_steps: 249
-    gamma: 0.7
+    gamma: 0.8
   grad_max_norm: 1.0
-  # grad_accum_every: 4
+  grad_accum_every: 2
   save_backup_weights: True
   save_best_weights: True
   save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
 loss:
-  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/latitude_weights_placeholder.nc'
+  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/latitude_weights_placeholder.nc'
   use_latitude_weights: False
   use_variable_weights: False
   training_loss: 'mse'
@@ -126,11 +126,18 @@ loss:
     V: 1.0
     W: 1.0
     GEOPOT: 1.0
+    T2: 1.5
+    Q2: 1.5
+    COMPOSITE_REFL_10CM: 2.0
+    RAIN_AMOUNT: 2.0  
+  use_spectral_loss: True
+  spectral_lambda_reg: 0.1
+  spectral_wavenum_init: 25
 
 predict:
   mode: 'none'
   save_forecast: '/tmp/credit_wofs_rollout_example'
-  save_vars: ['T2', 'Q2', 'U10', 'V10', 'T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  save_vars: ['T2', 'Q2', 'U10', 'V10', 'T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
   metadata: False
   custom_date_range: ['20190702', '20191030']
-  max_cases: 3
+  max_cases: 20

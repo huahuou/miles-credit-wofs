@@ -1,5 +1,9 @@
+import logging
+from collections import OrderedDict
 import numpy as np
 import xarray as xr
+import re
+from pathlib import Path
 
 import torch
 import torch.utils.data
@@ -39,7 +43,11 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         self.varname_forcing = param_interior["varname_forcing"]
         self.varname_static = param_interior["varname_static"]
         self.varname_diagnostic = param_interior["varname_diagnostic"]
-        self.filenames = sorted(param_interior["filenames"])
+        # Only include files of the form: wofs_YYYYMMDD_HHMM_memNN.zarr
+        pattern = re.compile(r"wofs_\d{8}_\d{4}_mem\d+\.zarr$")
+        self.filenames = sorted(
+            f for f in param_interior["filenames"] if pattern.search(Path(f).name)
+        )
         self.filename_surface = param_interior["filename_surface"]
         self.filename_dyn_forcing = param_interior["filename_dyn_forcing"]
         self.filename_forcing = param_interior["filename_forcing"]
@@ -73,6 +81,91 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         self.list_upper_ds_outside = None
         self.list_surf_ds_outside = None
         self.WRF_file_indices = None
+        self.total_length = None
+        self.file_time_lengths = None
+        self._case_cache: "OrderedDict[int, dict]" = OrderedDict()
+        self.max_open_files_per_worker = int(param_interior.get("max_open_files_per_worker", 4))
+
+        precomputed_index_metadata = param_interior.get("precomputed_index_metadata")
+        if precomputed_index_metadata:
+            self.WRF_file_indices = dict(precomputed_index_metadata.get("WRF_file_indices", {}))
+            self.file_time_lengths = dict(precomputed_index_metadata.get("file_time_lengths", {}))
+            self.total_length = int(precomputed_index_metadata.get("total_length", 0))
+
+        self.logger = logging.getLogger(__name__)
+
+    def _build_index_mapping(self):
+        if self.WRF_file_indices is not None and self.total_length is not None:
+            return
+
+        ind_start = 0
+        self.WRF_file_indices = {}
+        self.file_time_lengths = {}
+
+        for ind_file, filename in enumerate(self.filenames):
+            if filename.endswith((".nc", ".nc4")):
+                ds = xr.open_dataset(filename, decode_times=False)
+            else:
+                ds = xr.open_zarr(filename, decode_times=False)
+            try:
+                n_time = int(ds.sizes["time"])
+                self.file_time_lengths[str(ind_file)] = n_time
+
+                available = n_time - self.total_seq_len + 1
+                if available <= 0:
+                    continue
+
+                self.WRF_file_indices[str(ind_file)] = [available, ind_start, ind_start + available - 1]
+                ind_start += available
+            finally:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+
+        self.total_length = int(ind_start)
+
+    def _load_shared_aux_datasets(self):
+        if self.filename_forcing is not None and self.xarray_forcing is False:
+            ds = get_forward_data(self.filename_forcing)
+            self.xarray_forcing = drop_var_from_dataset(ds, self.varname_forcing).load()
+        elif self.filename_forcing is None:
+            self.xarray_forcing = False
+
+        if self.filename_static is not None and self.xarray_static is False:
+            ds = get_forward_data(self.filename_static)
+            self.xarray_static = drop_var_from_dataset(ds, self.varname_static).load()
+        elif self.filename_static is None:
+            self.xarray_static = False
+
+    def _get_case_views(self, ind_file: str) -> dict:
+        key = int(ind_file)
+        if key in self._case_cache:
+            self._case_cache.move_to_end(key)
+            return self._case_cache[key]
+
+        ds = get_forward_data(self.filenames[key])
+        views = {
+            "ds": ds,
+            "upper": filter_ds(ds, self.varname_upper_air),
+            "surface": filter_ds(ds, self.varname_surface) if self.filename_surface else False,
+            "dyn": filter_ds(ds, self.varname_dyn_forcing) if self.filename_dyn_forcing else False,
+            "diag": filter_ds(ds, self.varname_diagnostic) if self.filename_diagnostic else False,
+            "upper_out": filter_ds(ds, self.varname_upper_air_outside),
+            "surf_out": filter_ds(ds, self.varname_surface_outside) if self.varname_surface_outside else False,
+        }
+
+        self._case_cache[key] = views
+        self._case_cache.move_to_end(key)
+
+        while len(self._case_cache) > self.max_open_files_per_worker:
+            _, old_views = self._case_cache.popitem(last=False)
+            try:
+                old_views["ds"].close()
+            except Exception:
+                pass
+
+        return views
 
     def _open_datasets(self):
         """
@@ -82,92 +175,13 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         if getattr(self, "_opened", False):
             return
 
-        all_ds = [get_forward_data(fn) for fn in self.filenames]
-
-        # upper-air
-        self.list_upper_ds = [filter_ds(ds, self.varname_upper_air) for ds in all_ds]
-
-        # surface
-        if self.filename_surface:
-            self.list_surf_ds = [filter_ds(ds, self.varname_surface) for ds in all_ds]
-        else:
-            self.list_surf_ds = False
-
-        # dyn forcing
-        if self.filename_dyn_forcing:
-            self.list_dyn_forcing_ds = [filter_ds(ds, self.varname_dyn_forcing) for ds in all_ds]
-        else:
-            self.list_dyn_forcing_ds = False
-
-        # diagnostics
-        if self.filename_diagnostic:
-            self.list_diag_ds = [filter_ds(ds, self.varname_diagnostic) for ds in all_ds]
-        else:
-            self.list_diag_ds = False
-
-        # compute indices mapping
-        ind_start = 0
-        self.WRF_file_indices = {}
-        for ind_file, WRF_file_xarray in enumerate(self.list_upper_ds):
-            self.WRF_file_indices[str(ind_file)] = [
-                len(WRF_file_xarray["time"]),
-                ind_start,
-                ind_start + len(WRF_file_xarray["time"]),
-            ]
-            ind_start += len(WRF_file_xarray["time"]) + 1
-
-        # forcing
-        if self.filename_forcing is not None:
-            ds = get_forward_data(self.filename_forcing)
-            self.xarray_forcing = drop_var_from_dataset(ds, self.varname_forcing).load()
-        else:
-            self.xarray_forcing = False
-
-        # static
-        if self.filename_static is not None:
-            ds = get_forward_data(self.filename_static)
-            self.xarray_static = drop_var_from_dataset(ds, self.varname_static).load()
-        else:
-            self.xarray_static = False
-
-        # outside branch
-        self.list_upper_ds_outside = [filter_ds(ds, self.varname_upper_air_outside) for ds in all_ds]
-        if self.varname_surface_outside:
-            self.list_surf_ds_outside = [filter_ds(ds, self.varname_surface_outside) for ds in all_ds]
-        else:
-            self.list_surf_ds_outside = False
+        self._build_index_mapping()
+        self._load_shared_aux_datasets()
 
         self._opened = True
 
     def __len__(self):
-        # # ensure opened so we can compute length reliably
-        # if not self._opened:
-        #     self._open_datasets()
-        # total_len = 0
-        # for WRF_file_xarray in self.list_upper_ds:
-        #     total_len += len(WRF_file_xarray["time"]) - self.total_seq_len + 1
-        # return total_len
-        # Compute total length without opening/storing heavy xarray objects in the main process.
-        if getattr(self, "total_length", None) is not None:
-            return self.total_length
-
-        total_len = 0
-        for fn in self.filenames:
-            ds = get_forward_data(fn)
-            try:
-                ds_upper = filter_ds(ds, self.varname_upper_air)
-                n_time = int(ds_upper["time"].size)
-                available = n_time - self.total_seq_len + 1
-                if available > 0:
-                    total_len += available
-            finally:
-                try:
-                    ds.close()
-                except Exception:
-                    pass
-                del ds
-
-        self.total_length = int(total_len)
+        self._build_index_mapping()
         return self.total_length
 
     def _expand_anchor_dataset(self, dataset: xr.Dataset) -> xr.Dataset:
@@ -181,11 +195,11 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         repeated = repeated.assign_coords(time=np.array([anchor_time] * self.boundary_seq_len))
         return repeated
 
-    def _build_boundary_input(self, ind_file: str) -> xr.Dataset:
-        ds_upper_outside = self._expand_anchor_dataset(self.list_upper_ds_outside[int(ind_file)])
+    def _build_boundary_input(self, case: dict) -> xr.Dataset:
+        ds_upper_outside = self._expand_anchor_dataset(case["upper_out"])
 
-        if self.list_surf_ds_outside:
-            ds_surf_outside = self._expand_anchor_dataset(self.list_surf_ds_outside[int(ind_file)])
+        if case["surf_out"]:
+            ds_surf_outside = self._expand_anchor_dataset(case["surf_out"])
             return xr.merge([ds_upper_outside, ds_surf_outside])
 
         return ds_upper_outside
@@ -196,20 +210,24 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
             self._open_datasets()
 
         ind_file = find_key_for_number(index, self.WRF_file_indices)
+        if ind_file is None:
+            raise KeyError(f"No WoFS file mapping found for start index {index}")
 
-        ind_start = self.WRF_file_indices[ind_file][1]
-        ind_start_in_file = index - ind_start
+        file_range = self.WRF_file_indices[ind_file]
+        ind_start_in_file = index - file_range[1]
 
-        ind_largest = len(self.list_upper_ds[int(ind_file)]["time"]) - (self.history_len + self.forecast_len + 1)
+        case = self._get_case_views(ind_file)
+
+        ind_largest = int(case["upper"].sizes["time"]) - (self.history_len + self.forecast_len + 1)
         if ind_start_in_file > ind_largest:
             ind_start_in_file = ind_largest
 
         ind_end_in_file = ind_start_in_file + self.history_len + self.forecast_len
 
-        WRF_subset = self.list_upper_ds[int(ind_file)].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
+        WRF_subset = case["upper"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
 
-        if self.list_surf_ds:
-            surface_subset = self.list_surf_ds[int(ind_file)].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
+        if case["surface"]:
+            surface_subset = case["surface"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
             WRF_subset = WRF_subset.merge(surface_subset)
 
         ind_end_time = len(WRF_subset["time"])
@@ -217,10 +235,8 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
 
         WRF_input = WRF_subset.isel(time=slice(0, self.history_len, 1)).load()
 
-        if self.list_dyn_forcing_ds:
-            dyn_forcing_subset = self.list_dyn_forcing_ds[int(ind_file)].isel(
-                time=slice(ind_start_in_file, ind_end_in_file + 1)
-            )
+        if case["dyn"]:
+            dyn_forcing_subset = case["dyn"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
             dyn_forcing_subset = dyn_forcing_subset.isel(time=slice(0, self.history_len, 1)).load()
             WRF_input = WRF_input.merge(dyn_forcing_subset)
 
@@ -242,12 +258,12 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
 
         WRF_target = WRF_subset.isel(time=slice(self.history_len, ind_end_time, 1)).load()
 
-        if self.list_diag_ds:
-            diagnostic_subset = self.list_diag_ds[int(ind_file)].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
+        if case["diag"]:
+            diagnostic_subset = case["diag"].isel(time=slice(ind_start_in_file, ind_end_in_file + 1))
             diagnostic_subset = diagnostic_subset.isel(time=slice(self.history_len, ind_end_time, 1)).load()
             WRF_target = WRF_target.merge(diagnostic_subset)
 
-        ds_outside = self._build_boundary_input(ind_file)
+        ds_outside = self._build_boundary_input(case)
 
         t0 = WRF_input["time"].values
         t1 = WRF_target["time"].values

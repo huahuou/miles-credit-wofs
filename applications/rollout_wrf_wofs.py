@@ -229,7 +229,7 @@ def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: tor
         y_true_denorm = state_transformer.inverse_transform(y_true.cpu())
 
         metrics_dict = metrics(y_pred_denorm, y_true_denorm, forecast_datetime=step + 1)
-        result_row = {"case": case_name, "forecast_hour": step + 1}
+        result_row = {"case": case_name, "forecast_step": step + 1}
         result_row.update({k: float(v) for k, v in metrics_dict.items()})
         case_results.append(result_row)
 
