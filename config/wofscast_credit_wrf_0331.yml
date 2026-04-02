@@ -80,12 +80,12 @@ model:
 trainer:
   type: 'multi-step-wrf'
   mode: 'none'
-  train_batch_size: 8
-  valid_batch_size: 8
+  train_batch_size: 6
+  valid_batch_size: 6
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 9
-  valid_thread_workers: 9
+  thread_workers: 6
+  valid_thread_workers: 6
   prefetch_factor: 1
   residual_prediction: True
   update_learning_rate: False

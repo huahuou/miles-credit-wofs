@@ -116,7 +116,8 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         self.worker = None
         self.current_epoch = None
         self.cached_outside_anchors = OrderedDict()
-        self.max_cached_outside_anchors = len(self.filenames)
+        self.max_cached_outside_anchors = 64
+        # self.max_cached_outside_anchors = len(self.filenames)
 
     def _get_boundary_anchor(self, file_index: int) -> xr.Dataset:
         """Get pre-normalized boundary anchor with bounded in-worker cache."""

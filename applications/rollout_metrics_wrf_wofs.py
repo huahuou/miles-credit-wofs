@@ -163,6 +163,22 @@ def _target_tensor(sample: dict, device: torch.device) -> torch.Tensor:
     return y
 
 
+def _apply_residual_prediction(
+    y_pred: torch.Tensor,
+    x_model: torch.Tensor,
+    residual_prediction: bool,
+    varnum_diag: int,
+) -> torch.Tensor:
+    if not residual_prediction:
+        return y_pred
+
+    num_prog = y_pred.shape[1] - varnum_diag
+    residual = x_model[:, :num_prog, -1:, ...]
+    if varnum_diag > 0:
+        return torch.cat([y_pred[:, :num_prog, ...] + residual, y_pred[:, num_prog:, ...]], dim=1)
+    return y_pred + residual
+
+
 def _case_name(case_path: str) -> str:
     return Path(case_path).stem
 
@@ -174,8 +190,9 @@ def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, dev
     metrics = LatWeightedMetrics(conf)
 
     history_len = conf["data"]["history_len"]
-    max_steps = max(0, len(dataset) - 1)
+    max_steps = len(dataset)
     varnum_diag = len(conf["data"]["diagnostic_variables"])
+    residual_prediction = conf["trainer"].get("residual_prediction", False)
     static_dim_size = (
         len(conf["data"]["dynamic_forcing_variables"])
         + len(conf["data"]["forcing_variables"])
@@ -203,6 +220,7 @@ def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, dev
 
         with torch.no_grad():
             y_pred = model(x_model.float(), x_boundary.float(), x_time_encode.float())
+            y_pred = _apply_residual_prediction(y_pred, x_model, residual_prediction, varnum_diag)
 
         y_pred_denorm = state_transformer.inverse_transform(y_pred.cpu())
         y_true_denorm = state_transformer.inverse_transform(y_true.cpu())
