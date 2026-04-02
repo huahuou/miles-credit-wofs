@@ -1,0 +1,142 @@
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_da_increment_experiment'
+seed: 1000
+
+data:
+  scaler_type: 'std-wrf'
+
+  # Prognostic variables: these are predicted (input + output, 3D with levels)
+  variables: ['QRAIN', 'QNRAIN']
+
+  # Context upper-air variables: 3D atmospheric state context (input-only)
+  # Flattened to var*level channels and passed as input_only_channels
+  context_upper_air_variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'REFL_10CM']
+
+  # Observation variable: used to construct the innovation (obs - analysis proxy)
+  observation_variables: ['REFL_10CM']
+
+  surface_variables: []
+  dynamic_forcing_variables: ['cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation']
+  diagnostic_variables: []
+  forcing_variables: []
+  static_variables: []
+
+  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
+  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
+  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
+  save_loc_diagnostic: ''
+
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/std.nc'
+
+  train_years: [2019, 2020]
+  valid_years: [2022]
+
+  train_date_range: ['20190101', '20201231']
+  valid_date_range: ['20220402', '20220430']
+
+  history_len: 1
+  valid_history_len: 1
+  forecast_len: 0
+  valid_forecast_len: 0
+  target_start_step: 1
+  lead_time_periods: 1
+  levels: 17
+  static_first: False
+
+  boundary:
+    variables: ['REFL_10CM']
+    surface_variables: []
+    reuse_interior_stats: True
+    levels: 17
+    history_len: 1
+    forecast_len: 0
+    all_varnames: ['REFL_10CM']
+
+  # all_varnames covers only the prognostic variables (used by loss/metrics)
+  all_varnames: ['QRAIN', 'QNRAIN']
+
+model:
+  type: 'wrf'
+  levels: 17
+  param_interior:
+    frames: 1
+    image_height: 300
+    image_width: 300
+    levels: 17
+    channels: 2            # QRAIN, QNRAIN (prognostic, with level expansion)
+    surface_channels: 0
+    input_only_channels: 129  # 7 context vars * 17 levels + 10 dynamic forcing
+    output_only_channels: 0   # no diagnostics
+    patch_height: 4
+    patch_width: 4
+    frame_patch_size: 1
+    dim: 192
+  param_outside:
+    frames: 1
+    image_height: 300
+    image_width: 300
+    levels: 17
+    channels: 1            # REFL_10CM innovation only
+    surface_channels: 0
+    patch_height: 4
+    patch_width: 4
+    frame_patch_size: 1
+    dim: 192
+  depth: 24
+  num_heads: 8
+  window_size: 7
+  use_spectral_norm: True
+
+trainer:
+  type: 'standard-wrf'
+  mode: 'none'
+  train_batch_size: 7
+  valid_batch_size: 7
+  batches_per_epoch: 0
+  valid_batches_per_epoch: 0
+  thread_workers: 8
+  valid_thread_workers: 8
+  prefetch_factor: 1
+  update_learning_rate: False
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  amp: False
+  residual_prediction: False   # output IS the increment — no residual skip needed
+  epochs: &epochs 100
+  start_epoch: 0
+  load_weights: False
+  load_optimizer: False
+  load_scheduler: False
+  load_scaler: False
+  skip_validation: True
+  use_scheduler: True
+  reload_epoch: True
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 250
+    cycle_mult: 2.0
+    max_lr: 1.0e-03
+    min_lr: 1.0e-06
+    warmup_steps: 249
+    gamma: 0.7
+  grad_max_norm: 1.0
+  save_backup_weights: True
+  save_best_weights: True
+  save_metric_vars: ['QRAIN', 'QNRAIN']
+
+loss:
+  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/latitude_weights_placeholder.nc'
+  use_latitude_weights: False
+  use_variable_weights: False
+  training_loss: 'mse'
+  variable_weights:
+    QRAIN: 1.0
+    QNRAIN: 1.0
+
+predict:
+  mode: 'none'
+  save_forecast: '/tmp/credit_wofs_da_increment_example'
+  save_vars: ['QRAIN', 'QNRAIN']
+  metadata: False
+  custom_date_range: ['20190702', '20191030']
+  max_cases: 3

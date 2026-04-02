@@ -133,6 +133,7 @@ def _build_params(conf, split: str):
         else None,
         "history_len": conf["data"][history_key],
         "forecast_len": conf["data"][forecast_key],
+        "zarr_time_chunk": conf["data"].get("zarr_time_chunk", 0),
     }
 
     param_outside = {

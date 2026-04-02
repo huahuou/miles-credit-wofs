@@ -168,12 +168,18 @@ def reshape_only(x1):
     return x1.permute(0, 2, 1, 3, 4)
 
 
-def get_forward_data(filename) -> xr.Dataset:
-    """Check nc vs. zarr files and open file as xr.Dataset."""
+def get_forward_data(filename, zarr_chunks=None) -> xr.Dataset:
+    """Check nc vs. zarr files and open file as xr.Dataset.
+
+    Args:
+        filename: Input dataset path (.nc/.nc4 or .zarr).
+        zarr_chunks: Chunk spec passed to ``xr.open_zarr(..., chunks=...)``.
+            Defaults to ``None`` to preserve legacy behavior.
+    """
     if filename[-3:] == ".nc" or filename[-4:] == ".nc4":
         dataset = xr.open_dataset(filename)
     else:
-        dataset = xr.open_zarr(filename, chunks=None)
+        dataset = xr.open_zarr(filename, chunks=zarr_chunks)
     return dataset
 
 

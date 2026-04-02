@@ -134,6 +134,7 @@ def _build_params(conf, split: str):
         "history_len": conf["data"][history_key],
         "forecast_len": conf["data"][forecast_key],
         "target_start_step": conf["data"].get("target_start_step", 1),
+        "zarr_time_chunk": conf["data"].get("zarr_time_chunk", 0),
     }
 
     param_outside = {

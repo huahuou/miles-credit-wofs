@@ -89,6 +89,10 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         if self.target_start_step < 1:
             raise ValueError("target_start_step must be >= 1")
         self.start_index_offset = max(0, self.target_start_step - self.history_len)
+        self.zarr_time_chunk = int(param_interior.get("zarr_time_chunk", 0))
+        if self.zarr_time_chunk <= 0:
+            self.zarr_time_chunk = self._recommended_zarr_time_chunk(self.forecast_len)
+        self.zarr_chunks = {"time": self.zarr_time_chunk} if self.zarr_time_chunk > 0 else None
 
         # outside branch parameters (store them, will be used in _open_datasets)
         self.varname_upper_air_outside = param_outside["varname_upper_air"]
@@ -118,6 +122,21 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         self.cached_outside_anchors = OrderedDict()
         self.max_cached_outside_anchors = 64
         # self.max_cached_outside_anchors = len(self.filenames)
+
+    @staticmethod
+    def _recommended_zarr_time_chunk(forecast_len: int) -> int:
+        """Heuristic tuned for WoFS multi-step contiguous rollout reads.
+
+        Empirically:
+        - very short rollouts (forecast_len <= 1): smaller chunk around 3
+        - short/medium rollouts (<= 4): larger chunk around 8
+        - longer rollouts (> 4): moderate chunk around 6
+        """
+        if forecast_len <= 1:
+            return 3
+        if forecast_len <= 4:
+            return 8
+        return 6
 
     def _get_boundary_anchor(self, file_index: int) -> xr.Dataset:
         """Get pre-normalized boundary anchor with bounded in-worker cache."""
@@ -175,7 +194,7 @@ class WoFSMultiStep(torch.utils.data.Dataset):
 
         filenames = self.filenames
         # Open forward data for each file
-        all_ds = [get_forward_data(fn) for fn in filenames]
+        all_ds = [get_forward_data(fn, zarr_chunks=self.zarr_chunks) for fn in filenames]
 
         # interior sets
         self.list_upper_ds = [filter_ds(ds, self.varname_upper_air) for ds in all_ds]
@@ -209,13 +228,13 @@ class WoFSMultiStep(torch.utils.data.Dataset):
 
         # forcing and static (load once)
         if self.filename_forcing is not None:
-            ds = get_forward_data(self.filename_forcing)
+            ds = get_forward_data(self.filename_forcing, zarr_chunks=self.zarr_chunks)
             self.xarray_forcing = drop_var_from_dataset(ds, self.varname_forcing).load()
         else:
             self.xarray_forcing = False
 
         if self.filename_static is not None:
-            ds = get_forward_data(self.filename_static)
+            ds = get_forward_data(self.filename_static, zarr_chunks=self.zarr_chunks)
             self.xarray_static = drop_var_from_dataset(ds, self.varname_static).load()
         else:
             self.xarray_static = False
@@ -255,18 +274,18 @@ class WoFSMultiStep(torch.utils.data.Dataset):
                         n_time = z[first_var].shape[0]
                     else:
                         # Fallback: open with xarray
-                        ds = get_forward_data(fn)
+                        ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
                         n_time = int(ds["time"].size)
                         ds.close()
                         del ds
                 else:
-                    ds = get_forward_data(fn)
+                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
                     n_time = int(ds["time"].size)
                     ds.close()
                     del ds
             except Exception:
                 # Fallback to full xarray open
-                ds = get_forward_data(fn)
+                ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
                 try:
                     n_time = int(filter_ds(ds, self.varname_upper_air)["time"].size)
                 finally:
