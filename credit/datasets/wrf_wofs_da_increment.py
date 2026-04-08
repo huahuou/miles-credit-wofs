@@ -22,9 +22,12 @@ Tensor dict keys returned
   x_time_encode    : (time_encode_dim,)                       — temporal encoding
   index            : int                                       — sample index
 """
-
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 import logging
 from collections import OrderedDict
+import json
 import numpy as np
 import xarray as xr
 
@@ -39,10 +42,14 @@ from credit.data import (
 
 logger = logging.getLogger(__name__)
 
-_CONC_EPS = 1e-4
-_CONC_MAX = 2.5
-_LOG_EPS = float(np.log(_CONC_EPS))
-_NEG_LOG_EPS = float(-np.log(_CONC_EPS))
+_DEFAULT_CONCENTRATION_PARAMS = {
+    "c1": 0.5,
+    "c2": 0.5,
+    "conc_eps": 1e-4,
+    "conc_max": 2.5,
+    "value_clip_min": None,
+    "value_clip_max": None,
+}
 
 CONCENTRATION_VARS = {
     "QRAIN",
@@ -93,6 +100,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         # -- normalization paths -------------------------------------------
         self.mean_path = conf["data"]["mean_path"]
         self.std_path = conf["data"]["std_path"]
+        self.concentration_params_json_path = conf["data"].get("concentration_params_json")
 
         self.levels = conf["data"]["levels"]
         self.rng = np.random.default_rng(seed=seed)
@@ -109,55 +117,102 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.cumulative_samples = None
         self.upper_ds_cache = OrderedDict()
         self.dyn_ds_cache = OrderedDict()
+        self._concentration_params = {var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in CONCENTRATION_VARS}
 
     @staticmethod
-    def _forward_concentration_numpy(x: np.ndarray) -> np.ndarray:
+    def _coerce_concentration_params(params: dict | None) -> dict[str, float]:
+        merged = dict(_DEFAULT_CONCENTRATION_PARAMS)
+        if isinstance(params, dict):
+            for key in ("c1", "c2", "conc_eps", "conc_max"):
+                if key in params:
+                    merged[key] = float(params[key])
+            if "value_clip_min" in params:
+                merged["value_clip_min"] = None if params["value_clip_min"] is None else float(params["value_clip_min"])
+            if "value_clip_max" in params:
+                merged["value_clip_max"] = None if params["value_clip_max"] is None else float(params["value_clip_max"])
+        if merged["conc_eps"] <= 0.0:
+            merged["conc_eps"] = _DEFAULT_CONCENTRATION_PARAMS["conc_eps"]
+        if merged["conc_max"] <= merged["conc_eps"]:
+            merged["conc_max"] = max(_DEFAULT_CONCENTRATION_PARAMS["conc_max"], merged["conc_eps"] * 10.0)
+        clip_min = merged.get("value_clip_min")
+        clip_max = merged.get("value_clip_max")
+        if clip_min is not None and clip_max is not None and clip_min >= clip_max:
+            merged["value_clip_min"] = None
+            merged["value_clip_max"] = None
+        return merged
+
+    def _get_concentration_params(self, var_name: str) -> dict[str, float]:
+        params = self._concentration_params.get(var_name, _DEFAULT_CONCENTRATION_PARAMS)
+        return self._coerce_concentration_params(params)
+
+    @staticmethod
+    def _forward_concentration_numpy(x: np.ndarray, params: dict[str, float]) -> np.ndarray:
         x64 = np.asarray(x, dtype=np.float64)
-        transformed = 0.5 * np.minimum(x64, _CONC_MAX) + 0.5 * (
-            np.log(np.maximum(x64, _CONC_EPS)) - _LOG_EPS
-        ) / _NEG_LOG_EPS
+        c1 = float(params["c1"])
+        c2 = float(params["c2"])
+        conc_eps = float(params["conc_eps"])
+        conc_max = float(params["conc_max"])
+        clip_min = params.get("value_clip_min")
+        clip_max = params.get("value_clip_max")
+        if clip_min is not None:
+            x64 = np.maximum(x64, float(clip_min))
+        if clip_max is not None:
+            x64 = np.minimum(x64, float(clip_max))
+        log_eps = float(np.log(conc_eps))
+        neg_log_eps = float(-log_eps)
+        transformed = c1 * np.minimum(x64, conc_max) + c2 * (np.log(np.maximum(x64, conc_eps)) - log_eps) / neg_log_eps
         return transformed.astype(x.dtype, copy=False)
 
     @staticmethod
-    def _inverse_concentration_numpy(x: np.ndarray) -> np.ndarray:
-        y = np.asarray(x, dtype=np.float64)
+    def _inverse_concentration_numpy(x: np.ndarray, params: dict[str, float]) -> np.ndarray:
+        target = np.asarray(x, dtype=np.float64)
+        target = np.maximum(target, 0.0)
 
-        y_low = 0.5 * _CONC_EPS
-        y_high = 0.5 * _CONC_MAX + 0.5 * (np.log(_CONC_MAX) - _LOG_EPS) / _NEG_LOG_EPS
+        c1 = float(params["c1"])
+        c2 = float(params["c2"])
+        conc_eps = float(params["conc_eps"])
+        conc_max = float(params["conc_max"])
+        clip_min = params.get("value_clip_min")
+        clip_max = params.get("value_clip_max")
+        log_eps = float(np.log(conc_eps))
+        neg_log_eps = float(-log_eps)
 
-        out = np.empty_like(y)
+        def forward(v: np.ndarray) -> np.ndarray:
+            return c1 * np.minimum(v, conc_max) + c2 * (np.log(np.maximum(v, conc_eps)) - log_eps) / neg_log_eps
 
-        mask_low = y <= y_low
-        if np.any(mask_low):
-            out[mask_low] = 2.0 * y[mask_low]
+        lo = np.zeros_like(target)
+        hi = np.full_like(target, max(conc_max * 2.0, conc_eps * 2.0))
+        hi_val = forward(hi)
 
-        mask_high = y >= y_high
-        if np.any(mask_high):
-            out[mask_high] = _CONC_EPS * np.exp(2.0 * _NEG_LOG_EPS * (y[mask_high] - 0.5 * _CONC_MAX))
+        for _ in range(40):
+            need_expand = hi_val < target
+            if not np.any(need_expand):
+                break
+            hi = np.where(need_expand, hi * 2.0, hi)
+            hi_val = forward(hi)
 
-        mask_mid = (~mask_low) & (~mask_high)
-        if np.any(mask_mid):
-            target = y[mask_mid]
-            lo = np.full_like(target, _CONC_EPS)
-            hi = np.full_like(target, _CONC_MAX)
-            for _ in range(32):
-                mid = 0.5 * (lo + hi)
-                f_mid = 0.5 * mid + 0.5 * (np.log(mid) - _LOG_EPS) / _NEG_LOG_EPS
-                go_right = f_mid < target
-                lo = np.where(go_right, mid, lo)
-                hi = np.where(go_right, hi, mid)
-            out[mask_mid] = 0.5 * (lo + hi)
+        for _ in range(48):
+            mid = 0.5 * (lo + hi)
+            f_mid = forward(mid)
+            go_right = f_mid < target
+            lo = np.where(go_right, mid, lo)
+            hi = np.where(go_right, hi, mid)
 
+        out = 0.5 * (lo + hi)
+        if clip_min is not None:
+            out = np.maximum(out, float(clip_min))
+        if clip_max is not None:
+            out = np.minimum(out, float(clip_max))
         return out.astype(x.dtype, copy=False)
 
     def _forward_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
-            return self._forward_concentration_numpy(var_values)
+            return self._forward_concentration_numpy(var_values, self._get_concentration_params(var_name))
         return var_values
 
     def _inverse_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
-            return self._inverse_concentration_numpy(var_values)
+            return self._inverse_concentration_numpy(var_values, self._get_concentration_params(var_name))
         return var_values
 
     def denormalize_increment(self, normalized_increment: np.ndarray, base_state_t0: np.ndarray, var_name: str) -> np.ndarray:
@@ -270,6 +325,69 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.mean_ds = xr.open_dataset(self.mean_path).load()
         self.std_ds = xr.open_dataset(self.std_path).load()
 
+        if self.concentration_params_json_path:
+            try:
+                with open(self.concentration_params_json_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                params_dict = payload.get("variables", payload) if isinstance(payload, dict) else {}
+                if isinstance(params_dict, dict):
+                    for var, info in params_dict.items():
+                        if var not in CONCENTRATION_VARS or not isinstance(info, dict):
+                            continue
+                        if "recommended" in info and isinstance(info["recommended"], dict):
+                            self._concentration_params[var] = self._coerce_concentration_params(info["recommended"])
+                        else:
+                            self._concentration_params[var] = self._coerce_concentration_params(info)
+                logger.info("Loaded concentration params from JSON: %s", self.concentration_params_json_path)
+            except Exception as exc:
+                logger.warning("Failed to load concentration params JSON %s: %s", self.concentration_params_json_path, exc)
+
+        attr_payload = self.mean_ds.attrs.get("concentration_transform_params_json")
+        if isinstance(attr_payload, str) and attr_payload.strip():
+            try:
+                payload = json.loads(attr_payload)
+                params_dict = payload.get("parameters", {}) if isinstance(payload, dict) else {}
+                if isinstance(params_dict, dict):
+                    for var, params in params_dict.items():
+                        if var in CONCENTRATION_VARS and isinstance(params, dict):
+                            self._concentration_params[var] = self._coerce_concentration_params(params)
+                logger.info("Loaded concentration params from mean/std NetCDF attrs")
+            except Exception as exc:
+                logger.warning("Failed to parse concentration params from stats attrs: %s", exc)
+
+        for var in CONCENTRATION_VARS:
+            if var in self.mean_ds:
+                var_attrs = self.mean_ds[var].attrs
+                if any(
+                    key in var_attrs
+                    for key in (
+                        "concentration_transform_c1",
+                        "concentration_transform_c2",
+                        "concentration_transform_conc_eps",
+                        "concentration_transform_conc_max",
+                        "concentration_transform_clip_min",
+                        "concentration_transform_clip_max",
+                    )
+                ):
+                    self._concentration_params[var] = self._coerce_concentration_params(
+                        {
+                            "c1": var_attrs.get("concentration_transform_c1", self._concentration_params[var]["c1"]),
+                            "c2": var_attrs.get("concentration_transform_c2", self._concentration_params[var]["c2"]),
+                            "conc_eps": var_attrs.get(
+                                "concentration_transform_conc_eps", self._concentration_params[var]["conc_eps"]
+                            ),
+                            "conc_max": var_attrs.get(
+                                "concentration_transform_conc_max", self._concentration_params[var]["conc_max"]
+                            ),
+                            "value_clip_min": var_attrs.get(
+                                "concentration_transform_clip_min", self._concentration_params[var]["value_clip_min"]
+                            ),
+                            "value_clip_max": var_attrs.get(
+                                "concentration_transform_clip_max", self._concentration_params[var]["value_clip_max"]
+                            ),
+                        }
+                    )
+
         # All upper-air variable names we need from each zarr file
         # (deduplicated, order-preserving)
         seen = set()
@@ -286,8 +404,16 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
                     f"Variable '{var}' is missing from mean/std stats files required for DA increment dataset"
                 )
 
-        self._mean_values = {var: self.mean_ds[var].values for var in all_upper_vars}
-        self._std_values = {var: self.std_ds[var].values for var in all_upper_vars}
+        self._mean_values = {}
+        self._std_values = {}
+        for var in all_upper_vars:
+            mean_values = self.mean_ds[var].values
+            std_values = self.std_ds[var].values
+            if var in CONCENTRATION_VARS:
+                mean_values = np.where(np.isnan(mean_values), 0.05, mean_values)
+                std_values = np.where(np.isnan(std_values), 0.005, std_values)
+            self._mean_values[var] = mean_values
+            self._std_values[var] = std_values
 
         # Dynamic forcing path checks
         if self.varname_dyn_forcing and self.filename_dyn_forcing:

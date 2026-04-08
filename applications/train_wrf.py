@@ -115,6 +115,7 @@ def load_model_states_and_optimizer(conf, model, device):
     load_optimizer_conf = False if "load_optimizer" not in conf["trainer"] else conf["trainer"]["load_optimizer"]
     load_scaler_conf = False if "load_scaler" not in conf["trainer"] else conf["trainer"]["load_scaler"]
     load_scheduler_conf = False if "load_scheduler" not in conf["trainer"] else conf["trainer"]["load_scheduler"]
+    reload_epoch_conf = False if "reload_epoch" not in conf["trainer"] else conf["trainer"]["reload_epoch"]
 
     #  Load an optimizer, gradient scaler, and learning rate scheduler, the optimizer must come after wrapping model using FSDP
     if not load_weights:  # Loaded after loading model weights when reloading
@@ -174,12 +175,20 @@ def load_model_states_and_optimizer(conf, model, device):
     else:
         ckpt = os.path.join(save_loc, "checkpoint.pt")
         checkpoint = torch.load(ckpt, map_location=device)
+        checkpoint_states = []
+        if load_weights:
+            checkpoint_states.append("model")
+        if load_optimizer_conf:
+            checkpoint_states.append("optimizer")
+        if load_scaler_conf:
+            checkpoint_states.append("grad scaler")
+        if load_scheduler_conf:
+            checkpoint_states.append("learning rate scheduler")
+        checkpoint_states_msg = ", ".join(checkpoint_states) if checkpoint_states else "no checkpoint states"
 
         # FSDP checkpoint settings
         if conf["trainer"]["mode"] == "fsdp":
-            logging.info(
-                f"Loading FSDP model, optimizer, grad scaler, and learning rate scheduler states from {save_loc}"
-            )
+            logging.info(f"Loading FSDP {checkpoint_states_msg} from {save_loc}")
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=learning_rate,
@@ -188,44 +197,44 @@ def load_model_states_and_optimizer(conf, model, device):
             )
             optimizer = FSDPOptimizerWrapper(optimizer, model)
             checkpoint_io = TorchFSDPCheckpointIO()
-            checkpoint_io.load_unsharded_model(model, os.path.join(save_loc, "model_checkpoint.pt"))
-            if "load_optimizer" in conf["trainer"] and conf["trainer"]["load_optimizer"]:
+            if load_weights:
+                checkpoint_io.load_unsharded_model(model, os.path.join(save_loc, "model_checkpoint.pt"))
+            if load_optimizer_conf:
                 checkpoint_io.load_unsharded_optimizer(optimizer, os.path.join(save_loc, "optimizer_checkpoint.pt"))
         else:
             # DDP settings
             if conf["trainer"]["mode"] == "ddp":
-                logging.info(
-                    f"Loading DDP model, optimizer, grad scaler, and learning rate scheduler states from {save_loc}"
-                )
-                model.module.load_state_dict(checkpoint["model_state_dict"])
+                logging.info(f"Loading DDP {checkpoint_states_msg} from {save_loc}")
+                if load_weights:
+                    model.module.load_state_dict(checkpoint["model_state_dict"])
             else:
-                logging.info(
-                    f"Loading model, optimizer, grad scaler, and learning rate scheduler states from {save_loc}"
-                )
-                model.load_state_dict(checkpoint["model_state_dict"])
+                logging.info(f"Loading single-GPU {checkpoint_states_msg} from {save_loc}")
+                if load_weights:
+                    model.load_state_dict(checkpoint["model_state_dict"])
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=learning_rate,
                 weight_decay=weight_decay,
                 betas=(0.9, 0.95),
             )
-            if "load_optimizer" in conf["trainer"] and conf["trainer"]["load_optimizer"]:
+            if load_optimizer_conf:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         scheduler = load_scheduler(optimizer, conf)
         scaler = ShardedGradScaler(enabled=amp) if conf["trainer"]["mode"] == "fsdp" else GradScaler(enabled=amp)
 
         # Update the config file to the current epoch
-        if "reload_epoch" in conf["trainer"] and conf["trainer"]["reload_epoch"]:
+        if reload_epoch_conf and checkpoint_states:
             conf["trainer"]["start_epoch"] = checkpoint["epoch"] + 1
 
         if conf["trainer"]["start_epoch"] > 0:
             # Only reload the scheduler state if not starting over from epoch 0
-            if scheduler is not None:
+            if load_scheduler_conf and scheduler is not None and "scheduler_state_dict" in checkpoint:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
             # reload the AMP gradient scaler
-            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            if load_scaler_conf and "scaler_state_dict" in checkpoint:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     # Enable updating the lr if not using a policy
     if conf["trainer"]["update_learning_rate"] if "update_learning_rate" in conf["trainer"] else False:

@@ -1,4 +1,4 @@
-save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_da_increment_experiment'
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_da_increment_experiment_0408'
 seed: 1000
 
 data:
@@ -25,14 +25,15 @@ data:
   save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
   save_loc_diagnostic: ''
 
-  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/mean.nc'
-  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/std.nc'
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/std.nc'
+  concentration_params_json: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/concentration_tuning.json'
 
   train_years: [2019, 2020]
-  valid_years: [2022]
+  valid_years: [2021]
 
   train_date_range: ['20190101', '20201231']
-  valid_date_range: ['20220402', '20220430']
+  valid_date_range: ['20210405', '20210407']
 
   history_len: 1
   valid_history_len: 1
@@ -89,18 +90,18 @@ model:
 
 trainer:
   type: 'standard-wrf'
-  mode: 'none'
-  train_batch_size: 7
-  valid_batch_size: 7
+  mode: 'ddp'
+  train_batch_size: 6
+  valid_batch_size: 6
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 8
-  valid_thread_workers: 8
-  prefetch_factor: 1
+  thread_workers: 6
+  valid_thread_workers: 6
+  prefetch_factor: 2
   update_learning_rate: False
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
-  amp: False
+  amp: True
   residual_prediction: False   # output IS the increment — no residual skip needed
   epochs: &epochs 100
   start_epoch: 0
@@ -110,16 +111,17 @@ trainer:
   load_scaler: False
   skip_validation: True
   use_scheduler: True
-  reload_epoch: True
+  reload_epoch: False
   scheduler:
     scheduler_type: cosine-annealing-restarts
-    first_cycle_steps: 250
+    first_cycle_steps: 2500
     cycle_mult: 2.0
     max_lr: 1.0e-03
-    min_lr: 1.0e-06
-    warmup_steps: 249
-    gamma: 0.7
+    min_lr: 5.0e-05
+    warmup_steps: 2490
+    gamma: 0.8
   grad_max_norm: 1.0
+  # grad_accum_every: 2
   save_backup_weights: True
   save_best_weights: True
   save_metric_vars: ['QRAIN', 'QNRAIN']
@@ -135,8 +137,13 @@ loss:
 
 predict:
   mode: 'none'
-  save_forecast: '/tmp/credit_wofs_da_increment_example'
-  save_vars: ['QRAIN', 'QNRAIN']
+  task: 'da-validation-eval'
+  eval_split: 'valid'
+  save_forecast: '/work2/zhanxianghua/da_test/wofs_da_increment_experiment_0406/eval_valid'
+  output_metrics_name: 'rollout_da_metrics.csv'
+  compute_psnr_ssim: True
+  save_netcdf: True
+  save_vars: ['QRAIN', 'QNRAIN', 'pred_delta_qrain', 'pred_delta_qnrain', 'true_delta_qrain', 'true_delta_qnrain', 'pred_state_qrain', 'pred_state_qnrain', 'true_state_qrain', 'true_state_qnrain']
   metadata: False
-  custom_date_range: ['20190702', '20191030']
-  max_cases: 3
+  custom_date_range: ['20210405', '20210407']
+  max_cases: 20
