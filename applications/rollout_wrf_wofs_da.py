@@ -30,6 +30,33 @@ warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
 
+def _sync_prognostic_levels(conf: dict) -> int:
+    model_levels = int(conf["model"]["param_interior"]["levels"])
+    data_levels = int(conf["data"].get("prognostic_levels", model_levels))
+
+    level_candidates = []
+    level_ops = conf["data"].get("concentration_level_ops", {})
+    if isinstance(level_ops, dict):
+        for var_name in conf["data"].get("variables", []):
+            var_cfg = level_ops.get(var_name)
+            if isinstance(var_cfg, dict) and "ceiling_level" in var_cfg:
+                level_candidates.append(int(var_cfg["ceiling_level"]))
+
+    if len(level_candidates) > 0:
+        unique_levels = sorted(set(level_candidates))
+        if len(unique_levels) > 1:
+            raise ValueError(
+                "All prognostic concentration variables must share one ceiling_level for reduced-level rollout. "
+                f"Got: {unique_levels}"
+            )
+        data_levels = int(unique_levels[0])
+
+    data_levels = max(1, int(data_levels))
+    conf["data"]["prognostic_levels"] = data_levels
+    conf["model"]["param_interior"]["levels"] = data_levels
+    return data_levels
+
+
 def _extract_case_date(file_path: str) -> str | None:
     match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr$", Path(file_path).name)
     return match.group(1) if match else None
@@ -217,7 +244,7 @@ def rollout_case_da(case_path: str, conf: dict, model: torch.nn.Module, device: 
     metrics = LatWeightedMetrics(conf)
 
     varnames = conf["data"]["variables"]
-    num_levels = int(conf["data"]["levels"])
+    num_levels = int(conf["model"]["param_interior"]["levels"])
     varnum_diag = len(conf["data"]["diagnostic_variables"])
     residual_prediction = conf["trainer"].get("residual_prediction", False)
     compute_psnr_ssim = bool(conf.get("predict", {}).get("compute_psnr_ssim", True))
@@ -259,14 +286,19 @@ def rollout_case_da(case_path: str, conf: dict, model: torch.nn.Module, device: 
 
         if level_coords is None:
             level_dim, y_dim, x_dim = first_t0.dims
-            level_coords = first_t0[level_dim].values
+            level_coords = first_t0[level_dim].values[:num_levels]
             y_coords = first_t0[y_dim].values
             x_coords = first_t0[x_dim].values
 
         time_values.append(chunk["time"].values[1])
 
         if corrected_prev_state is None:
-            corrected_prev_state = {var: chunk[var].isel(time=0).values.astype(np.float32) for var in varnames}
+            corrected_prev_state = {
+                var: dataset.reduce_levels_for_var(chunk[var].isel(time=0).values, var, is_prognostic=True).astype(
+                    np.float32
+                )
+                for var in varnames
+            }
 
         pred_delta_list = []
         true_delta_list = []
@@ -278,11 +310,23 @@ def rollout_case_da(case_path: str, conf: dict, model: torch.nn.Module, device: 
             end_idx = start_idx + num_levels
 
             pred_delta_norm = y_pred_norm_np[0, start_idx:end_idx, 0, :, :]
-            base_state_true_t0 = chunk[var_name].isel(time=0).values
+            base_state_true_t0 = dataset.reduce_levels_for_var(
+                chunk[var_name].isel(time=0).values,
+                var_name,
+                is_prognostic=True,
+            )
             pred_delta_phys = dataset.denormalize_increment(pred_delta_norm, base_state_true_t0, var_name).astype(np.float32)
 
-            true_t0 = chunk[var_name].isel(time=0).values.astype(np.float32)
-            true_t1 = chunk[var_name].isel(time=1).values.astype(np.float32)
+            true_t0 = dataset.reduce_levels_for_var(
+                chunk[var_name].isel(time=0).values,
+                var_name,
+                is_prognostic=True,
+            ).astype(np.float32)
+            true_t1 = dataset.reduce_levels_for_var(
+                chunk[var_name].isel(time=1).values,
+                var_name,
+                is_prognostic=True,
+            ).astype(np.float32)
             true_delta_phys = (true_t1 - true_t0).astype(np.float32)
 
             corrected_curr = (corrected_prev_state[var_name] + pred_delta_phys).astype(np.float32)
@@ -405,6 +449,8 @@ def main() -> None:
         conf = yaml.safe_load(f)
 
     conf = credit_main_parser(conf, parse_training=False, parse_predict=False, print_summary=False)
+    prog_levels = _sync_prognostic_levels(conf)
+    logger.info("Using prognostic vertical levels for rollout: %s", prog_levels)
     conf.setdefault("predict", {})
 
     if args.mode is not None:

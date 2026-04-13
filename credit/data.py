@@ -28,6 +28,7 @@ Deprecated
 
 # system tools
 from typing import TypedDict, Union, List, Sequence
+from pathlib import Path
 
 # data utils
 import datetime
@@ -177,10 +178,47 @@ def get_forward_data(filename, zarr_chunks=None) -> xr.Dataset:
             Defaults to ``None`` to preserve legacy behavior.
     """
     if filename[-3:] == ".nc" or filename[-4:] == ".nc4":
-        dataset = xr.open_dataset(filename)
-    else:
-        dataset = xr.open_zarr(filename, chunks=zarr_chunks)
-    return dataset
+        return xr.open_dataset(filename)
+
+    if filename.endswith(".zarr.zip") or filename.endswith(".zarr.zip/"):
+        zip_file = str(filename).rstrip("/")
+        zip_basename = Path(zip_file).stem
+        zip_roots = [f"zip://{zip_basename}::{zip_file}", f"zip://{zip_basename}/::{zip_file}"]
+
+        last_exc = None
+        for uri in zip_roots:
+            try:
+                return xr.open_zarr(
+                    uri,
+                    chunks=zarr_chunks,
+                    consolidated=True,
+                    zarr_format=2,
+                    decode_coords=False,
+                )
+            except Exception as exc:
+                last_exc = exc
+
+        # for uri in zip_roots:
+        #     try:
+        #         return xr.open_zarr(
+        #             uri,
+        #             chunks=zarr_chunks,
+        #             consolidated=False,
+        #             zarr_format=2,
+        #             decode_coords=False,
+        #         )
+        #     except Exception as exc:
+        #         last_exc = exc
+
+        raise last_exc
+
+    return xr.open_zarr(
+        filename,
+        chunks=zarr_chunks,
+        consolidated=True,
+        zarr_format=2,
+        decode_coords=False,
+    )
 
 
 def flatten_list(list_of_lists):

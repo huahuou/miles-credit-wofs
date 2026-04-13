@@ -272,16 +272,17 @@ class WoFSMultiStep(torch.utils.data.Dataset):
                 if fn.endswith('.zarr'):
                     import zarr
                     z = zarr.open(fn, mode='r')
-                    # Read time size from the first upper-air variable's shape
                     first_var = self.varname_upper_air[0]
                     if first_var in z:
                         n_time = z[first_var].shape[0]
                     else:
-                        # Fallback: open with xarray
                         ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
                         n_time = int(ds["time"].size)
                         ds.close()
-                        del ds
+                elif fn.endswith('.zarr.zip') or fn.endswith('.zarr.zip/'):
+                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
+                    n_time = int(ds["time"].size)
+                    ds.close()
                 else:
                     ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
                     n_time = int(ds["time"].size)

@@ -53,8 +53,35 @@ def _worker_init_fn(worker_id):
 
 
 def _extract_case_date(file_path: str) -> str | None:
-    match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr$", Path(file_path).name)
+    match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr(?:\.zip)?$", Path(file_path).name)
     return match.group(1) if match else None
+
+
+def _resolve_loader_runtime(conf: dict, training_type: str) -> tuple[int, int, bool, bool, int]:
+    trainer_conf = conf["trainer"]
+    is_train = training_type == "train"
+    workers = int(trainer_conf.get("thread_workers", 0) if is_train else trainer_conf.get("valid_thread_workers", trainer_conf.get("thread_workers", 0)))
+    prefetch = int(
+        trainer_conf.get("prefetch_factor", 4)
+        if is_train
+        else trainer_conf.get("valid_prefetch_factor", trainer_conf.get("prefetch_factor", 4))
+    )
+    pin_memory = bool(trainer_conf.get("pin_memory", True))
+    persistent_workers = bool(trainer_conf.get("persistent_workers", workers > 0))
+    timeout_s = int(trainer_conf.get("dataloader_timeout_s", 0))
+
+    if bool(trainer_conf.get("no_hang_debug", False)):
+        workers = int(trainer_conf.get("no_hang_thread_workers", 1) if is_train else trainer_conf.get("no_hang_valid_thread_workers", 1))
+        prefetch = int(trainer_conf.get("no_hang_prefetch_factor", 1) if is_train else trainer_conf.get("no_hang_valid_prefetch_factor", 1))
+        pin_memory = bool(trainer_conf.get("no_hang_pin_memory", False))
+        persistent_workers = bool(trainer_conf.get("no_hang_persistent_workers", workers > 0))
+        timeout_s = int(trainer_conf.get("no_hang_timeout_s", 180))
+
+    if workers <= 0:
+        prefetch = 0
+        persistent_workers = False
+
+    return workers, prefetch, pin_memory, persistent_workers, timeout_s
 
 
 def _select_files(
@@ -162,10 +189,12 @@ def main(rank, world_size, conf, backend, trial=False):
 
     train_batch_size = conf["trainer"]["train_batch_size"]
     valid_batch_size = conf["trainer"]["valid_batch_size"]
-    thread_workers = conf["trainer"].get("thread_workers", 0)
-    valid_thread_workers = conf["trainer"].get("valid_thread_workers", thread_workers)
-    train_prefetch_factor = conf["trainer"].get("prefetch_factor", 4)
-    valid_prefetch_factor = conf["trainer"].get("valid_prefetch_factor", train_prefetch_factor)
+    thread_workers, train_prefetch_factor, train_pin_memory, train_persistent_workers, train_timeout_s = _resolve_loader_runtime(
+        conf, "train"
+    )
+    valid_thread_workers, valid_prefetch_factor, valid_pin_memory, valid_persistent_workers, valid_timeout_s = _resolve_loader_runtime(
+        conf, "valid"
+    )
 
     if conf["data"]["scaler_type"] != "std-wrf":
         raise ValueError("WoFS multi-step training app currently supports scaler_type='std-wrf' only")
@@ -196,12 +225,13 @@ def main(rank, world_size, conf, backend, trial=False):
         batch_size=train_batch_size,
         shuffle=False,
         sampler=train_sampler,
-        pin_memory=True,
-        persistent_workers=True if thread_workers > 0 else False,
+        pin_memory=train_pin_memory,
+        persistent_workers=train_persistent_workers,
         num_workers=thread_workers,
         drop_last=True,
         prefetch_factor=train_prefetch_factor if thread_workers > 0 else None,
         worker_init_fn=_worker_init_fn,
+        timeout=train_timeout_s,
     )
 
     valid_loader = torch.utils.data.DataLoader(
@@ -209,12 +239,13 @@ def main(rank, world_size, conf, backend, trial=False):
         batch_size=valid_batch_size,
         shuffle=False,
         sampler=valid_sampler,
-        pin_memory=True,
-        persistent_workers=True if valid_thread_workers > 0 else False,
+        pin_memory=valid_pin_memory,
+        persistent_workers=valid_persistent_workers,
         num_workers=valid_thread_workers,
         drop_last=True,
         prefetch_factor=valid_prefetch_factor if valid_thread_workers > 0 else None,
         worker_init_fn=_worker_init_fn,
+        timeout=valid_timeout_s,
     )
 
     m = load_model(conf)

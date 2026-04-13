@@ -212,7 +212,10 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
                         ds = get_forward_data(fn)
                         n_time = int(ds["time"].size)
                         ds.close()
-                        del ds
+                elif fn.endswith('.zarr.zip') or fn.endswith('.zarr.zip/'):
+                    ds = get_forward_data(fn)
+                    n_time = int(ds["time"].size)
+                    ds.close()
                 else:
                     ds = get_forward_data(fn)
                     n_time = int(ds["time"].size)

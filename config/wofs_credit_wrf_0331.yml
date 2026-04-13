@@ -11,10 +11,10 @@ data:
   forcing_variables: []
   static_variables: []
 
-  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
-  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
-  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
-  save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr'
+  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr.zip'
+  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr.zip'
+  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr.zip'
+  save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit/cases/wofs_*.zarr.zip'
 
   mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/mean.nc'
   std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/std.nc'
@@ -80,6 +80,14 @@ model:
 trainer:
   type: 'multi-step-wrf'
   mode: 'ddp'
+  no_hang_debug: True
+  no_hang_thread_workers: 1
+  no_hang_valid_thread_workers: 1
+  no_hang_prefetch_factor: 1
+  no_hang_valid_prefetch_factor: 1
+  no_hang_pin_memory: False
+  no_hang_persistent_workers: True
+  no_hang_timeout_s: 180
   train_batch_size: 4
   valid_batch_size: 4
   batches_per_epoch: 0

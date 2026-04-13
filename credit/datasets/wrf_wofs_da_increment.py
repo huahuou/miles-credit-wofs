@@ -22,9 +22,7 @@ Tensor dict keys returned
   x_time_encode    : (time_encode_dim,)                       — temporal encoding
   index            : int                                       — sample index
 """
-import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+
 import logging
 from collections import OrderedDict
 import json
@@ -118,6 +116,37 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.upper_ds_cache = OrderedDict()
         self.dyn_ds_cache = OrderedDict()
         self._concentration_params = {var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in CONCENTRATION_VARS}
+        self._concentration_level_ops = conf["data"].get("concentration_level_ops", {})
+        default_prog_levels = int(
+            conf["data"].get(
+                "prognostic_levels",
+                conf.get("model", {}).get("param_interior", {}).get("levels", self.levels),
+            )
+        )
+        self._prognostic_levels = self._infer_common_prognostic_ceiling_level(default_prog_levels)
+
+    def _infer_common_prognostic_ceiling_level(self, fallback_levels: int) -> int:
+        level_candidates = []
+        if isinstance(self._concentration_level_ops, dict):
+            for var_name in self.varname_prognostic:
+                cfg = self._concentration_level_ops.get(var_name)
+                if not isinstance(cfg, dict) or "ceiling_level" not in cfg:
+                    continue
+                try:
+                    level_candidates.append(int(cfg["ceiling_level"]))
+                except Exception:
+                    continue
+
+        if len(level_candidates) == 0:
+            return max(1, int(fallback_levels))
+
+        unique_levels = sorted(set(level_candidates))
+        if len(unique_levels) > 1:
+            raise ValueError(
+                "All prognostic concentration variables must share the same ceiling_level "
+                f"for reduced-level training. Got: {unique_levels}"
+            )
+        return max(1, int(unique_levels[0]))
 
     @staticmethod
     def _coerce_concentration_params(params: dict | None) -> dict[str, float]:
@@ -144,6 +173,117 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
     def _get_concentration_params(self, var_name: str) -> dict[str, float]:
         params = self._concentration_params.get(var_name, _DEFAULT_CONCENTRATION_PARAMS)
         return self._coerce_concentration_params(params)
+
+    def _get_concentration_level_op(self, var_name: str, n_levels: int) -> dict | None:
+        if var_name not in CONCENTRATION_VARS or not isinstance(self._concentration_level_ops, dict):
+            return None
+
+        raw = self._concentration_level_ops.get(var_name)
+        if not isinstance(raw, dict):
+            return None
+
+        if "ceiling_level" not in raw:
+            return None
+
+        try:
+            ceiling_level = int(raw["ceiling_level"])
+        except Exception:
+            return None
+
+        mode = str(raw.get("mode", "cutoff")).lower().strip()
+        if mode not in {"cutoff", "sum", "mean"}:
+            mode = "cutoff"
+
+        if n_levels <= 0:
+            return None
+        ceiling_level = max(1, min(ceiling_level, n_levels))
+
+        return {
+            "ceiling_level": ceiling_level,
+            "ceiling_index": ceiling_level - 1,
+            "mode": mode,
+        }
+
+    @staticmethod
+    def _pick_axis_by_size(values_arr: np.ndarray, target_size: int) -> int | None:
+        matching_axes = [axis for axis, size in enumerate(values_arr.shape) if size == target_size]
+        if not matching_axes:
+            return None
+        return 1 if len(matching_axes) > 1 and 1 in matching_axes else matching_axes[0]
+
+    def _find_level_axis(self, values: np.ndarray, var_name: str) -> int | None:
+        stats = np.asarray(self._mean_values[var_name])
+        if stats.ndim != 1:
+            return None
+        level_count = stats.shape[0]
+        return self._pick_axis_by_size(np.asarray(values), level_count)
+
+    def reduce_levels_for_var(self, var_values: np.ndarray, var_name: str, is_prognostic: bool = True) -> np.ndarray:
+        values_arr = np.asarray(var_values)
+        if (not is_prognostic) or (var_name not in CONCENTRATION_VARS):
+            return values_arr
+
+        level_axis = self._find_level_axis(values_arr, var_name)
+        if level_axis is None:
+            return values_arr
+
+        level_first = np.moveaxis(values_arr, level_axis, 0).copy()
+        n_levels = level_first.shape[0]
+        if self._prognostic_levels >= n_levels:
+            return values_arr
+
+        op = self._get_concentration_level_op(var_name, n_levels)
+        mode = op["mode"] if op is not None else "cutoff"
+        ceiling_idx = self._prognostic_levels - 1
+
+        if mode in {"sum", "mean"} and ceiling_idx + 1 < n_levels:
+            upper = level_first[ceiling_idx + 1 :]
+            if upper.shape[0] > 0:
+                if mode == "sum":
+                    level_first[ceiling_idx] = np.sum(upper, axis=0)
+                else:
+                    level_first[ceiling_idx] = np.mean(upper, axis=0)
+
+        level_first = level_first[: self._prognostic_levels]
+        return np.moveaxis(level_first, 0, level_axis)
+
+    def _apply_concentration_level_op_to_normalized(
+        self,
+        normalized_values: np.ndarray,
+        raw_values: np.ndarray,
+        var_name: str,
+    ) -> np.ndarray:
+        level_axis = self._find_level_axis(normalized_values, var_name)
+        if level_axis is None:
+            return normalized_values
+
+        n_levels = normalized_values.shape[level_axis]
+        op = self._get_concentration_level_op(var_name, n_levels)
+        if op is None:
+            return normalized_values
+
+        ceiling_idx = op["ceiling_index"]
+        mode = op["mode"]
+
+        norm_level_first = np.moveaxis(normalized_values, level_axis, 0).copy()
+        raw_level_first = np.moveaxis(raw_values, level_axis, 0)
+
+        if mode in {"sum", "mean"}:
+            upper = raw_level_first[ceiling_idx + 1 :]
+            if upper.shape[0] > 0:
+                if mode == "sum":
+                    agg_raw = np.sum(upper, axis=0)
+                else:
+                    agg_raw = np.mean(upper, axis=0)
+                agg_trans = self._forward_var_transform(agg_raw, var_name)
+                mean_level = np.asarray(self._mean_values[var_name])[ceiling_idx]
+                std_level = np.asarray(self._std_values[var_name])[ceiling_idx]
+                norm_level_first[ceiling_idx] = (agg_trans - mean_level) / std_level
+
+        if ceiling_idx + 1 < norm_level_first.shape[0]:
+            norm_level_first[ceiling_idx + 1 :] = 0.0
+
+        return np.moveaxis(norm_level_first, 0, level_axis)
 
     @staticmethod
     def _forward_concentration_numpy(x: np.ndarray, params: dict[str, float]) -> np.ndarray:
@@ -226,8 +366,8 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         Returns:
             Physical increment in original variable units.
         """
-        std = self._broadcast_stats_like(self._std_values[var_name], normalized_increment)
-        mean = self._broadcast_stats_like(self._mean_values[var_name], normalized_increment)
+        std = self._broadcast_stats_for_var(self._std_values[var_name], normalized_increment, var_name)
+        mean = self._broadcast_stats_for_var(self._mean_values[var_name], normalized_increment, var_name)
         z0 = self._normalize_array(base_state_t0, var_name)
         z1 = z0 + normalized_increment
         transformed_1 = z1 * std + mean
@@ -241,7 +381,6 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
                 try:
                     if fn.endswith(".zarr"):
                         import zarr
-
                         z = zarr.open(fn, mode="r")
                         first_var = self.varname_prognostic[0]
                         n_time = z[first_var].shape[0] if first_var in z else 0
@@ -251,6 +390,12 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
                                 n_time = int(ds["time"].size)
                             finally:
                                 ds.close()
+                    elif fn.endswith(".zarr.zip"):
+                        ds = get_forward_data(fn)
+                        try:
+                            n_time = int(ds["time"].size)
+                        finally:
+                            ds.close()
                     else:
                         ds = get_forward_data(fn)
                         try:
@@ -305,10 +450,35 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         reshape_dims[axis] = stat_len
         return stats_arr.reshape(reshape_dims)
 
+    def _broadcast_stats_for_var(self, stats: np.ndarray, values: np.ndarray, var_name: str) -> np.ndarray:
+        stats_arr = np.asarray(stats)
+        values_arr = np.asarray(values)
+
+        if stats_arr.ndim != 1 or values_arr.ndim == 0:
+            return stats_arr
+
+        stat_len = stats_arr.shape[0]
+        axis = self._pick_axis_by_size(values_arr, stat_len)
+        stats_used = stats_arr
+
+        if axis is None and var_name in CONCENTRATION_VARS and var_name in self.varname_prognostic:
+            reduced_len = int(self._prognostic_levels)
+            if reduced_len <= stat_len:
+                axis = self._pick_axis_by_size(values_arr, reduced_len)
+                if axis is not None:
+                    stats_used = stats_arr[:reduced_len]
+
+        if axis is None:
+            return stats_used
+
+        reshape_dims = [1] * values_arr.ndim
+        reshape_dims[axis] = stats_used.shape[0]
+        return stats_used.reshape(reshape_dims)
+
     def _normalize_array(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         transformed_values = self._forward_var_transform(var_values, var_name)
-        mean = self._broadcast_stats_like(self._mean_values[var_name], transformed_values)
-        std = self._broadcast_stats_like(self._std_values[var_name], transformed_values)
+        mean = self._broadcast_stats_for_var(self._mean_values[var_name], transformed_values, var_name)
+        std = self._broadcast_stats_for_var(self._std_values[var_name], transformed_values, var_name)
         return (transformed_values - mean) / std
 
     # ------------------------------------------------------------------ #
@@ -410,8 +580,8 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             mean_values = self.mean_ds[var].values
             std_values = self.std_ds[var].values
             if var in CONCENTRATION_VARS:
-                mean_values = np.where(np.isnan(mean_values), 0.05, mean_values)
-                std_values = np.where(np.isnan(std_values), 0.005, std_values)
+                mean_values = np.where(np.isnan(mean_values), 0.0, mean_values)
+                std_values = np.where(np.isnan(std_values), 1.0, std_values)
             self._mean_values[var] = mean_values
             self._std_values[var] = std_values
 
@@ -524,8 +694,12 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         x_prog_list = []
         y_incr_list = []
         for var in self.varname_prognostic:
-            norm_t0 = self._normalize(chunk[var].isel(time=0), var)
-            norm_t1 = self._normalize(chunk[var].isel(time=1), var)
+            raw_t0 = chunk[var].isel(time=0).values
+            raw_t1 = chunk[var].isel(time=1).values
+            reduced_t0 = self.reduce_levels_for_var(raw_t0, var_name=var, is_prognostic=True)
+            reduced_t1 = self.reduce_levels_for_var(raw_t1, var_name=var, is_prognostic=True)
+            norm_t0 = self._normalize_array(reduced_t0, var)
+            norm_t1 = self._normalize_array(reduced_t1, var)
             x_prog_list.append(norm_t0)          # (level, H, W)
             y_incr_list.append(norm_t1 - norm_t0)  # increment in normalized space
 
