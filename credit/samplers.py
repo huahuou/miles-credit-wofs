@@ -1,5 +1,6 @@
 from typing import Optional
 import itertools
+import random
 from torch.utils.data import Dataset, Sampler, DistributedSampler
 import logging
 
@@ -92,3 +93,35 @@ class DistributedMultiStepBatchSampler(DistributedSampler):
     def __len__(self) -> int:
         # self.num_samples is computed by super().__init__
         return (self.num_samples + self.batch_size - 1) // self.batch_size
+
+
+class DistributedFileLocalitySampler(DistributedSampler):
+    """Distributed sampler that groups per-rank indices by backing file id.
+
+    Preserves all index partitioning behavior from DistributedSampler, then
+    reorders only within each rank so samples from the same file are adjacent.
+    """
+
+    def __iter__(self):
+        indices = list(super().__iter__())
+
+        if not hasattr(self.dataset, "file_index_for_global_index"):
+            return iter(indices)
+
+        grouped = {}
+        for idx in indices:
+            file_idx = self.dataset.file_index_for_global_index(int(idx))
+            grouped.setdefault(file_idx, []).append(int(idx))
+
+        file_ids = list(grouped.keys())
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(file_ids)
+        else:
+            file_ids = sorted(file_ids)
+
+        ordered_indices = []
+        for file_idx in file_ids:
+            ordered_indices.extend(grouped[file_idx])
+
+        return iter(ordered_indices)

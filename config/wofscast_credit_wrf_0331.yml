@@ -16,8 +16,8 @@ data:
   save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
   save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
 
-  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/mean.nc'
-  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/std.nc'
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats/std.nc'
 
   train_years: [2019, 2020]
   valid_years: [2022]
@@ -117,7 +117,7 @@ trainer:
   save_best_weights: True
   save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
 loss:
-  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327_v2/stats/latitude_weights_placeholder.nc'
+  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats/latitude_weights_placeholder.nc'
   use_latitude_weights: False
   use_variable_weights: False
   training_loss: 'mse'

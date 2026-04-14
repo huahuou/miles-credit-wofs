@@ -24,6 +24,7 @@ from credit.parser import credit_main_parser
 from credit.pbs import launch_script, launch_script_mpi
 from credit.scheduler import annealed_probability
 from credit.seed import seed_everything
+from credit.samplers import DistributedFileLocalitySampler
 from credit.trainers import load_trainer
 from credit.transforms import load_transforms
 
@@ -120,14 +121,25 @@ def load_dataset_and_sampler(conf, param_interior, param_outside, world_size, ra
         world_size=world_size,
     )
 
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        seed=seed,
-        shuffle=is_train,
-        drop_last=True,
-    )
+    use_file_locality_sampler = bool(conf["trainer"].get("use_file_locality_sampler", False)) and is_train
+    if use_file_locality_sampler:
+        sampler = DistributedFileLocalitySampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            seed=seed,
+            shuffle=True,
+            drop_last=True,
+        )
+    else:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            seed=seed,
+            shuffle=is_train,
+            drop_last=True,
+        )
 
     logging.info("Loaded WoFS multi-step dataset and distributed sampler")
     return dataset, sampler
@@ -161,6 +173,7 @@ def _build_params(conf, split: str):
         "history_len": conf["data"][history_key],
         "forecast_len": conf["data"][forecast_key],
         "zarr_time_chunk": conf["data"].get("zarr_time_chunk", 0),
+        "max_open_files_per_worker": conf["data"].get("max_open_files_per_worker", 8),
     }
 
     param_outside = {

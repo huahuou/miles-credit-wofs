@@ -4,7 +4,7 @@ source /home/zhanxiang.hua/miniconda3/etc/profile.d/conda.sh
 conda activate credit
 cd /home/zhanxiang.hua/miles-credit-wofs
 
-OMP_NUM_THREADS=1 python -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node=2 applications/train_wrf_wofs_multi.py -c /home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0401/model.yml
+OMP_NUM_THREADS=1 python -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node=1 applications/train_wrf_wofs_multi.py -c /home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0401/model.yml
 
 
 # export CUDA_VISIBLE_DEVICES=1

@@ -432,6 +432,22 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         ind_in_file = index - prev_cum
         return file_idx, int(ind_in_file)
 
+    def file_index_for_global_index(self, index: int) -> int:
+        if self.cumulative_samples is None:
+            self._build_index_map()
+
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(f"Index {index} out of bounds for dataset of size {len(self)}")
+
+        cumulative_samples = self.cumulative_samples
+        if cumulative_samples is None:
+            raise RuntimeError("Dataset index map is not initialized")
+
+        return int(np.searchsorted(cumulative_samples, index, side="right"))
+
     @staticmethod
     def _broadcast_stats_like(stats: np.ndarray, values: np.ndarray) -> np.ndarray:
         stats_arr = np.asarray(stats)

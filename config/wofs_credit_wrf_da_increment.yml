@@ -25,9 +25,9 @@ data:
   save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/cases/wofs_*.zarr.zip'
   save_loc_diagnostic: ''
 
-  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/mean.nc'
-  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/std.nc'
-  concentration_params_json: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/stats/concentration_tuning.json'
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats_da/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats_da/std.nc'
+  concentration_params_json: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats_da/concentration_tuning.json'
 
   concentration_level_ops:
     QRAIN:
@@ -49,7 +49,7 @@ data:
   valid_forecast_len: 0
   target_start_step: 1
   zarr_time_chunk: 0
-  max_open_files_per_worker: 2
+  max_open_files_per_worker: 4
   lead_time_periods: 1
   levels: 17
   prognostic_levels: 7  # effective model levels for concentration prognostic variables
@@ -102,6 +102,8 @@ model:
 trainer:
   type: 'standard-wrf'
   mode: 'ddp'
+  use_file_locality_sampler: True
+  sync_batch_barrier: False
   no_hang_debug: False
   no_hang_thread_workers: 1
   no_hang_valid_thread_workers: 1
@@ -110,12 +112,12 @@ trainer:
   no_hang_pin_memory: False
   no_hang_persistent_workers: True
   no_hang_timeout_s: 180
-  train_batch_size: 3
-  valid_batch_size: 3
+  train_batch_size: 2
+  valid_batch_size: 2
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 6
-  valid_thread_workers: 6
+  thread_workers: 4
+  valid_thread_workers: 4
   prefetch_factor: 2
   dataloader_timeout_s: 180
   update_learning_rate: False
@@ -141,13 +143,13 @@ trainer:
     warmup_steps: 2490
     gamma: 0.8
   grad_max_norm: 1.0
-  grad_accum_every: 2
+  grad_accum_every: 3
   save_backup_weights: True
   save_best_weights: True
   save_metric_vars: ['QRAIN', 'QNRAIN']
 
 loss:
-  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit/stats/latitude_weights_placeholder.nc'
+  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats_da/latitude_weights_placeholder.nc'
   use_latitude_weights: False
   use_variable_weights: False
   training_loss: 'mse'

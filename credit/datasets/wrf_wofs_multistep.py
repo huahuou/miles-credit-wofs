@@ -4,7 +4,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 import logging
 from collections import OrderedDict
-from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -17,7 +16,6 @@ from credit.data import (
     encode_datetime64,
     extract_month_day_hour,
     filter_ds,
-    find_common_indices,
     find_key_for_number,
     get_forward_data,
 )
@@ -97,6 +95,7 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         if self.zarr_time_chunk <= 0:
             self.zarr_time_chunk = self._recommended_zarr_time_chunk(self.forecast_len)
         self.zarr_chunks = {"time": self.zarr_time_chunk} if self.zarr_time_chunk > 0 else None
+        self.max_open_files = int(param_interior.get("max_open_files_per_worker", 8))
 
         # outside branch parameters (store them, will be used in _open_datasets)
         self.varname_upper_air_outside = param_outside["varname_upper_air"]
@@ -108,24 +107,160 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         # transforms & rng
         self.transform = transform
         self.rng = np.random.default_rng(seed=seed)
+        self.has_surface = bool(self.filename_surface) and len(self.varname_surface) > 0
+        self.has_dyn_forcing = bool(self.filename_dyn_forcing) and len(self.varname_dyn_forcing) > 0
+        self.has_diagnostic = bool(self.filename_diagnostic) and len(self.varname_diagnostic) > 0
 
         # internal state: we'll open datasets per-worker via _open_datasets()
         self._opened = False
-        self.list_upper_ds = None
-        self.list_surf_ds = None
-        self.list_dyn_forcing_ds = None
-        self.list_diag_ds = None
+        self.case_ds_cache = OrderedDict()
         self.xarray_forcing = False
         self.xarray_static = False
-        self.list_upper_ds_outside = None
-        self.list_surf_ds_outside = None
         self.WRF_file_indices = None
         self.total_length = None
+        self.file_n_time = None
+        self.samples_per_file = None
+        self.cumulative_samples = None
+        self._all_case_vars = None
+        self._forcing_lookup = None
+        self._forcing_time_index_cache = {}
         self.worker = None
         self.current_epoch = None
         self.cached_outside_anchors = OrderedDict()
         self.max_cached_outside_anchors = 64
         # self.max_cached_outside_anchors = len(self.filenames)
+
+    def _build_all_case_vars(self) -> List[str]:
+        seen = set()
+        ordered: List[str] = []
+        groups = [
+            self.varname_upper_air,
+            self.varname_surface if self.has_surface else [],
+            self.varname_dyn_forcing if self.has_dyn_forcing else [],
+            self.varname_diagnostic if self.has_diagnostic else [],
+            self.varname_upper_air_outside,
+            self.varname_surface_outside,
+        ]
+        for group in groups:
+            for var in group:
+                if var not in seen:
+                    ordered.append(var)
+                    seen.add(var)
+        return ordered
+
+    @staticmethod
+    def _safe_close_dataset(ds):
+        try:
+            ds.close()
+        except Exception:
+            pass
+
+    def _evict_if_needed(self):
+        while len(self.case_ds_cache) > self.max_open_files:
+            evicted_file_idx, ds = self.case_ds_cache.popitem(last=False)
+            self._safe_close_dataset(ds)
+            self.cached_outside_anchors.pop(evicted_file_idx, None)
+            self._forcing_time_index_cache.pop(evicted_file_idx, None)
+
+    def _get_case_ds(self, file_index: int) -> xr.Dataset:
+        cached = self.case_ds_cache.get(file_index)
+        if cached is not None:
+            self.case_ds_cache.move_to_end(file_index)
+            return cached
+
+        ds = get_forward_data(self.filenames[file_index], zarr_chunks=self.zarr_chunks)
+        if self._all_case_vars is None:
+            self._all_case_vars = self._build_all_case_vars()
+        ds = filter_ds(ds, self._all_case_vars)
+        self.case_ds_cache[file_index] = ds
+        self._evict_if_needed()
+        return ds
+
+    def _ensure_file_time_sizes(self):
+        if self.file_n_time is not None:
+            return
+
+        self.file_n_time = []
+        for fn in self.filenames:
+            try:
+                if fn.endswith('.zarr'):
+                    import zarr
+                    z = zarr.open(fn, mode='r')
+                    first_var = self.varname_upper_air[0]
+                    if first_var in z:
+                        n_time = z[first_var].shape[0]
+                    else:
+                        ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
+                        n_time = int(ds["time"].size)
+                        ds.close()
+                elif fn.endswith('.zarr.zip') or fn.endswith('.zarr.zip/'):
+                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
+                    n_time = int(ds["time"].size)
+                    ds.close()
+                else:
+                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
+                    n_time = int(ds["time"].size)
+                    ds.close()
+                    del ds
+            except Exception:
+                ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
+                try:
+                    n_time = int(filter_ds(ds, self.varname_upper_air)["time"].size)
+                finally:
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                    del ds
+
+            self.file_n_time.append(int(np.asarray(n_time).item()))
+
+    def _build_file_indices(self):
+        self._ensure_file_time_sizes()
+        self.samples_per_file = []
+        for n_time in self.file_n_time:
+            available = n_time - (self.history_len + self.forecast_len + 1) + 1
+            available -= self.start_index_offset
+            self.samples_per_file.append(max(0, int(available)))
+
+        self.cumulative_samples = np.cumsum(self.samples_per_file, dtype=np.int64)
+        self.total_length = int(self.cumulative_samples[-1]) if len(self.cumulative_samples) > 0 else 0
+
+        ind_start = 0
+        self.WRF_file_indices = {}
+        for ind_file, available in enumerate(self.samples_per_file):
+            if available <= 0:
+                continue
+            self.WRF_file_indices[str(ind_file)] = [available, ind_start, ind_start + available - 1]
+            ind_start += available
+
+    def file_index_for_global_index(self, index: int) -> int:
+        if self.cumulative_samples is None:
+            self._build_file_indices()
+
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(f"Index {index} out of bounds for dataset of size {len(self)}")
+        return int(np.searchsorted(self.cumulative_samples, index, side="right"))
+
+    def _build_forcing_time_index_for_file(self, file_index: int):
+        if not self.xarray_forcing or file_index in self._forcing_time_index_cache:
+            return
+
+        if self._forcing_lookup is None:
+            forcing_times = extract_month_day_hour(np.array(self.xarray_forcing["time"]))
+            self._forcing_lookup = {key: i for i, key in enumerate(forcing_times)}
+
+        case_ds = self._get_case_ds(file_index)
+        case_times = extract_month_day_hour(np.array(case_ds["time"].values))
+        forcing_indices = []
+        for key in case_times:
+            if key not in self._forcing_lookup:
+                raise KeyError(f"Missing forcing timestamp key {key} for file index {file_index}")
+            forcing_indices.append(self._forcing_lookup[key])
+        self._forcing_time_index_cache[file_index] = np.asarray(forcing_indices, dtype=np.int64)
 
     @staticmethod
     def _recommended_zarr_time_chunk(forecast_len: int) -> int:
@@ -149,14 +284,15 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             self.cached_outside_anchors.move_to_end(file_index)
             return cached
 
-        anchor_upper = self.list_upper_ds_outside[file_index].isel(time=slice(0, 1)).load()
+        case_ds = self._get_case_ds(file_index)
+        anchor_upper = filter_ds(case_ds, self.varname_upper_air_outside).isel(time=slice(0, 1)).load()
         if self.boundary_seq_len > 1:
             anchor_time = anchor_upper["time"].values[0]
             anchor_upper = xr.concat([anchor_upper] * self.boundary_seq_len, dim="time")
             anchor_upper = anchor_upper.assign_coords(time=np.array([anchor_time] * self.boundary_seq_len))
 
-        if self.list_surf_ds_outside:
-            anchor_surf = self.list_surf_ds_outside[file_index].isel(time=slice(0, 1)).load()
+        if self.varname_surface_outside:
+            anchor_surf = filter_ds(case_ds, self.varname_surface_outside).isel(time=slice(0, 1)).load()
             if self.boundary_seq_len > 1:
                 anchor_time = anchor_surf["time"].values[0]
                 anchor_surf = xr.concat([anchor_surf] * self.boundary_seq_len, dim="time")
@@ -196,39 +332,9 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         if getattr(self, "_opened", False):
             return
 
-        filenames = self.filenames
-        # Open forward data for each file
-        all_ds = [get_forward_data(fn, zarr_chunks=self.zarr_chunks) for fn in filenames]
-
-        # interior sets
-        self.list_upper_ds = [filter_ds(ds, self.varname_upper_air) for ds in all_ds]
-
-        if self.filename_surface:
-            self.list_surf_ds = [filter_ds(ds, self.varname_surface) for ds in all_ds]
-        else:
-            self.list_surf_ds = False
-
-        if self.filename_dyn_forcing:
-            self.list_dyn_forcing_ds = [filter_ds(ds, self.varname_dyn_forcing) for ds in all_ds]
-        else:
-            self.list_dyn_forcing_ds = False
-
-        if self.filename_diagnostic:
-            self.list_diag_ds = [filter_ds(ds, self.varname_diagnostic) for ds in all_ds]
-        else:
-            self.list_diag_ds = False
-
-        # compute indices mapping (available indices per file)
-        ind_start = 0
-        self.WRF_file_indices = {}
-        for ind_file, WRF_file_xarray in enumerate(self.list_upper_ds):
-            available = len(WRF_file_xarray["time"]) - (self.history_len + self.forecast_len + 1) + 1
-            available -= self.start_index_offset
-            if available <= 0:
-                continue
-            self.WRF_file_indices[str(ind_file)] = [available, ind_start, ind_start + available - 1]
-            ind_start += available
-        self.total_length = ind_start
+        if self._all_case_vars is None:
+            self._all_case_vars = self._build_all_case_vars()
+        self._build_file_indices()
 
         # forcing and static (load once)
         if self.filename_forcing is not None:
@@ -243,13 +349,6 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         else:
             self.xarray_static = False
 
-        # outside branch data
-        self.list_upper_ds_outside = [filter_ds(ds, self.varname_upper_air_outside) for ds in all_ds]
-        if self.varname_surface_outside:
-            self.list_surf_ds_outside = [filter_ds(ds, self.varname_surface_outside) for ds in all_ds]
-        else:
-            self.list_surf_ds_outside = False
-
         # Boundary anchors are loaded/normalized lazily in _get_boundary_anchor()
         # to avoid high startup latency and per-worker memory spikes.
 
@@ -258,54 +357,18 @@ class WoFSMultiStep(torch.utils.data.Dataset):
 
         self._opened = True
 
+    def __del__(self):
+        try:
+            for ds in self.case_ds_cache.values():
+                self._safe_close_dataset(ds)
+        except Exception:
+            pass
+
     def __len__(self):
-        # Return cached value if available.
         if getattr(self, "total_length", None) is not None:
             return self.total_length
 
-        # Compute total length by reading only zarr metadata (time dim size).
-        # Uses open_zarr with no data loading to minimise main-process overhead.
-        total = 0
-        for fn in self.filenames:
-            try:
-                # Try fast metadata-only path for zarr files
-                if fn.endswith('.zarr'):
-                    import zarr
-                    z = zarr.open(fn, mode='r')
-                    first_var = self.varname_upper_air[0]
-                    if first_var in z:
-                        n_time = z[first_var].shape[0]
-                    else:
-                        ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                        n_time = int(ds["time"].size)
-                        ds.close()
-                elif fn.endswith('.zarr.zip') or fn.endswith('.zarr.zip/'):
-                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                    n_time = int(ds["time"].size)
-                    ds.close()
-                else:
-                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                    n_time = int(ds["time"].size)
-                    ds.close()
-                    del ds
-            except Exception:
-                # Fallback to full xarray open
-                ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                try:
-                    n_time = int(filter_ds(ds, self.varname_upper_air)["time"].size)
-                finally:
-                    try:
-                        ds.close()
-                    except Exception:
-                        pass
-                    del ds
-
-            available = n_time - (self.history_len + self.forecast_len + 1) + 1
-            available -= self.start_index_offset
-            if available > 0:
-                total += available
-
-        self.total_length = int(total)
+        self._build_file_indices()
         return self.total_length
     def set_epoch(self, epoch):
         self.current_epoch = epoch
@@ -314,22 +377,24 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         if not self._opened:
             self._open_datasets()
 
-        ind_file = find_key_for_number(index, self.WRF_file_indices)
-        if ind_file is None:
+        file_key = find_key_for_number(index, self.WRF_file_indices)
+        if file_key is None:
             raise KeyError(f"No WoFS file mapping found for start index {index}")
 
-        file_range = self.WRF_file_indices[ind_file]
+        file_range = self.WRF_file_indices[file_key]
+        file_idx = int(file_key)
         base_start = (index - file_range[1]) + self.start_index_offset
         total_len = self.forecast_len + self.history_len + 1
+        case_ds = self._get_case_ds(file_idx)
 
         # ------------------------------------------------------------------ #
         # 1. Single contiguous disk read for the entire rollout window
         # ------------------------------------------------------------------ #
-        upper_chunk = self.list_upper_ds[int(ind_file)].isel(
+        upper_chunk = filter_ds(case_ds, self.varname_upper_air).isel(
             time=slice(base_start, base_start + total_len)
         ).load()
-        if self.list_surf_ds:
-            surf_chunk = self.list_surf_ds[int(ind_file)].isel(
+        if self.has_surface:
+            surf_chunk = filter_ds(case_ds, self.varname_surface).isel(
                 time=slice(base_start, base_start + total_len)
             ).load()
             base_chunk = xr.merge([upper_chunk, surf_chunk])
@@ -337,8 +402,8 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             base_chunk = upper_chunk
 
         diag_chunk = None
-        if self.list_diag_ds:
-            diag_chunk = self.list_diag_ds[int(ind_file)].isel(
+        if self.has_diagnostic:
+            diag_chunk = filter_ds(case_ds, self.varname_diagnostic).isel(
                 time=slice(base_start, base_start + total_len)
             ).load()
 
@@ -346,16 +411,16 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         # 2. Merge auxiliary variables into base_chunk ONCE (not per step)
         # ------------------------------------------------------------------ #
         full_input_chunk = base_chunk
-        if self.list_dyn_forcing_ds:
-            dyn_chunk = self.list_dyn_forcing_ds[int(ind_file)].isel(
+        if self.has_dyn_forcing:
+            dyn_chunk = filter_ds(case_ds, self.varname_dyn_forcing).isel(
                 time=slice(base_start, base_start + total_len)
             ).load()
             full_input_chunk = xr.merge([full_input_chunk, dyn_chunk])
 
         if self.xarray_forcing:
-            month_day_forcing = extract_month_day_hour(np.array(self.xarray_forcing["time"]))
-            month_day_inputs = extract_month_day_hour(np.array(base_chunk["time"]))
-            ind_forcing, _ = find_common_indices(month_day_forcing, month_day_inputs)
+            self._build_forcing_time_index_for_file(file_idx)
+            forcing_time_index = self._forcing_time_index_cache[file_idx]
+            ind_forcing = forcing_time_index[base_start : base_start + total_len]
             forcing_chunk = self.xarray_forcing.isel(time=ind_forcing).copy()
             forcing_chunk["time"] = base_chunk["time"]
             full_input_chunk = xr.merge([full_input_chunk, forcing_chunk])
@@ -367,7 +432,7 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             full_input_chunk = xr.merge([full_input_chunk, static_chunk])
 
         # Pre-normalized, cached boundary anchor
-        ds_outside = self._get_boundary_anchor(int(ind_file))
+        ds_outside = self._get_boundary_anchor(file_idx)
 
         # ------------------------------------------------------------------ #
         # 3. Rollout loop — only cheap in-memory isel, no merges

@@ -83,16 +83,16 @@ class Trainer(BaseTrainer):
                     # combine x and x_surf
                     # input: (batch_num, time, var, level, lat, lon), (batch_num, time, var, lat, lon)
                     # output: (batch_num, var, time, lat, lon), 'x' first and then 'x_surf'
-                    x = concat_and_reshape(batch["x"], batch["x_surf"]).to(self.device)
+                    x = concat_and_reshape(batch["x"], batch["x_surf"]).to(self.device, non_blocking=True)
                 else:
                     # no x_surf
-                    x = reshape_only(batch["x"]).to(self.device)
+                    x = reshape_only(batch["x"]).to(self.device, non_blocking=True)
 
                 # --------------------------------------------------------------------------------- #
                 # add forcing and static variables
                 if "x_forcing_static" in batch:
                     # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                    x_forcing_batch = batch["x_forcing_static"].to(self.device).permute(0, 2, 1, 3, 4)
+                    x_forcing_batch = batch["x_forcing_static"].to(self.device, non_blocking=True).permute(0, 2, 1, 3, 4)
 
                     # concat on var dimension
                     x = torch.cat((x, x_forcing_batch), dim=1)
@@ -100,13 +100,13 @@ class Trainer(BaseTrainer):
                 # --------------------------------------------------------------------------------- #
                 # combine y and y_surf
                 if "y_surf" in batch:
-                    y = concat_and_reshape(batch["y"], batch["y_surf"]).to(self.device)
+                    y = concat_and_reshape(batch["y"], batch["y_surf"]).to(self.device, non_blocking=True)
                 else:
-                    y = reshape_only(batch["y"]).to(self.device)
+                    y = reshape_only(batch["y"]).to(self.device, non_blocking=True)
 
                 if "y_diag" in batch:
                     # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                    y_diag_batch = batch["y_diag"].to(self.device).permute(0, 2, 1, 3, 4)
+                    y_diag_batch = batch["y_diag"].to(self.device, non_blocking=True).permute(0, 2, 1, 3, 4)
 
                     # concat on var dimension
                     y = torch.cat((y, y_diag_batch), dim=1)
@@ -114,13 +114,13 @@ class Trainer(BaseTrainer):
                 # --------------------------------------------------------------------------------- #
                 # boundary conditions
                 if "x_surf_boundary" in batch:
-                    x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device)
+                    x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device, non_blocking=True)
                 else:
-                    x_boundary = reshape_only(batch["x_boundary"]).to(self.device)
+                    x_boundary = reshape_only(batch["x_boundary"]).to(self.device, non_blocking=True)
 
                 # --------------------------------------------------------------------------------- #
                 # time encoding
-                x_time_encode = batch["x_time_encode"].to(self.device)
+                x_time_encode = batch["x_time_encode"].to(self.device, non_blocking=True)
 
                 # single step predict
                 y_pred = self.model(x, x_boundary, x_time_encode)
@@ -138,7 +138,7 @@ class Trainer(BaseTrainer):
                     else:
                         y_pred = y_pred + residual
 
-                y = y.to(device=self.device, dtype=y_pred.dtype)
+                y = y.to(device=self.device, dtype=y_pred.dtype, non_blocking=True)
 
                 # loss compute
                 loss = criterion(y, y_pred)
@@ -183,7 +183,7 @@ class Trainer(BaseTrainer):
             results_dict["train_loss"].append(batch_loss[0].item())
 
             if "forecast_hour" in batch:
-                forecast_hour_tensor = batch["forecast_hour"].to(self.device)
+                forecast_hour_tensor = batch["forecast_hour"].to(self.device, non_blocking=True)
                 if distributed:
                     dist.all_reduce(forecast_hour_tensor, dist.ReduceOp.AVG, async_op=False)
                     forecast_hour_avg = forecast_hour_tensor[-1].item()
@@ -273,16 +273,16 @@ class Trainer(BaseTrainer):
                     # combine x and x_surf
                     # input: (batch_num, time, var, level, lat, lon), (batch_num, time, var, lat, lon)
                     # output: (batch_num, var, time, lat, lon), 'x' first and then 'x_surf'
-                    x = concat_and_reshape(batch["x"], batch["x_surf"]).to(self.device)
+                    x = concat_and_reshape(batch["x"], batch["x_surf"]).to(self.device, non_blocking=True)
                 else:
                     # no x_surf
-                    x = reshape_only(batch["x"]).to(self.device)
+                    x = reshape_only(batch["x"]).to(self.device, non_blocking=True)
 
                 # --------------------------------------------------------------------------------- #
                 # add forcing and static variables
                 if "x_forcing_static" in batch:
                     # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                    x_forcing_batch = batch["x_forcing_static"].to(self.device).permute(0, 2, 1, 3, 4)
+                    x_forcing_batch = batch["x_forcing_static"].to(self.device, non_blocking=True).permute(0, 2, 1, 3, 4)
 
                     # concat on var dimension
                     x = torch.cat((x, x_forcing_batch), dim=1)
@@ -290,13 +290,13 @@ class Trainer(BaseTrainer):
                 # --------------------------------------------------------------------------------- #
                 # combine y and y_surf
                 if "y_surf" in batch:
-                    y = concat_and_reshape(batch["y"], batch["y_surf"]).to(self.device)
+                    y = concat_and_reshape(batch["y"], batch["y_surf"]).to(self.device, non_blocking=True)
                 else:
-                    y = reshape_only(batch["y"]).to(self.device)
+                    y = reshape_only(batch["y"]).to(self.device, non_blocking=True)
 
                 if "y_diag" in batch:
                     # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
-                    y_diag_batch = batch["y_diag"].to(self.device).permute(0, 2, 1, 3, 4)
+                    y_diag_batch = batch["y_diag"].to(self.device, non_blocking=True).permute(0, 2, 1, 3, 4)
 
                     # concat on var dimension
                     y = torch.cat((y, y_diag_batch), dim=1)
@@ -304,13 +304,13 @@ class Trainer(BaseTrainer):
                 # --------------------------------------------------------------------------------- #
                 # boundary conditions
                 if "x_surf_boundary" in batch:
-                    x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device)
+                    x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device, non_blocking=True)
                 else:
-                    x_boundary = reshape_only(batch["x_boundary"]).to(self.device)
+                    x_boundary = reshape_only(batch["x_boundary"]).to(self.device, non_blocking=True)
 
                 # --------------------------------------------------------------------------------- #
                 # time encoding
-                x_time_encode = batch["x_time_encode"].to(self.device)
+                x_time_encode = batch["x_time_encode"].to(self.device, non_blocking=True)
 
                 y_pred = self.model(x, x_boundary, x_time_encode)
 
