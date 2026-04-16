@@ -91,6 +91,7 @@ class Trainer(BaseTrainer):
         distributed = True if conf["trainer"]["mode"] in ["fsdp", "ddp"] else False
         sync_batch_barrier = bool(conf["trainer"].get("sync_batch_barrier", False))
         forecast_length = conf["data"]["forecast_len"]
+        retain_graph = conf["data"].get("retain_graph", False)
         residual_prediction = conf["trainer"].get("residual_prediction", False)
         logger.info("Use residual prediction: {}".format(residual_prediction))
         # number of diagnostic variables
@@ -225,7 +226,7 @@ class Trainer(BaseTrainer):
                     accum_log(logs, {"loss": loss.item()})
 
                     # compute gradients
-                    scaler.scale(loss).backward()
+                    scaler.scale(loss).backward(retain_graph=retain_graph)
 
 
                 # Note: DDP synchronizes gradients during backward(); no per-step barrier needed.
@@ -235,13 +236,16 @@ class Trainer(BaseTrainer):
                 if stop_forecast:
                     break
 
+                if not retain_graph:
+                    y_pred = y_pred.detach()
+
                 # step-in-step-out
                 if x.shape[2] == 1:
                     # cut diagnostic vars from y_pred, they are not inputs
                     if "y_diag" in step_batch:
-                        x = y_pred[:, :-varnum_diag, ...].detach()
+                        x = y_pred[:, :-varnum_diag, ...]
                     else:
-                        x = y_pred.detach()
+                        x = y_pred
 
                 # multi-step in
                 else:
@@ -254,9 +258,9 @@ class Trainer(BaseTrainer):
 
                     # cut diagnostic vars from y_pred, they are not inputs
                     if "y_diag" in step_batch:
-                        x = torch.cat([x_detach, y_pred[:, :-varnum_diag, ...].detach()], dim=2)
+                        x = torch.cat([x_detach, y_pred[:, :-varnum_diag, ...]], dim=2)
                     else:
-                        x = torch.cat([x_detach, y_pred.detach()], dim=2)
+                        x = torch.cat([x_detach, y_pred], dim=2)
 
             if distributed and sync_batch_barrier:
                 torch.distributed.barrier()

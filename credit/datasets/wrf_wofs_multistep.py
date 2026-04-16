@@ -168,13 +168,29 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             self.case_ds_cache.move_to_end(file_index)
             return cached
 
-        ds = get_forward_data(self.filenames[file_index], zarr_chunks=self.zarr_chunks)
+        file_path = self.filenames[file_index]
         if self._all_case_vars is None:
             self._all_case_vars = self._build_all_case_vars()
-        ds = filter_ds(ds, self._all_case_vars)
-        self.case_ds_cache[file_index] = ds
-        self._evict_if_needed()
-        return ds
+
+        last_exc = None
+        for attempt in range(2):
+            ds_raw = None
+            try:
+                ds_raw = get_forward_data(file_path, zarr_chunks=self.zarr_chunks)
+                ds = filter_ds(ds_raw, self._all_case_vars)
+                self.case_ds_cache[file_index] = ds
+                self._evict_if_needed()
+                return ds
+            except Exception as exc:
+                last_exc = exc
+                if ds_raw is not None:
+                    self._safe_close_dataset(ds_raw)
+                if attempt == 0:
+                    continue
+
+        raise RuntimeError(
+            f"Failed to open/filter WoFS case file after retry: {file_path}"
+        ) from last_exc
 
     def _ensure_file_time_sizes(self):
         if self.file_n_time is not None:

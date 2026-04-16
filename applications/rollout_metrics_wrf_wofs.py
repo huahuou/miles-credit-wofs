@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_case_date(file_path: str) -> str | None:
-    match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr$", Path(file_path).name)
+    match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr(?:\.zip)?$", Path(file_path).name)
     return match.group(1) if match else None
 
 

@@ -4,12 +4,12 @@ source /home/zhanxiang.hua/miniconda3/etc/profile.d/conda.sh
 conda activate credit
 cd /home/zhanxiang.hua/miles-credit-wofs
 
-OMP_NUM_THREADS=1 python -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node=1 applications/train_wrf_wofs_multi.py -c /home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0401/model.yml
+OMP_NUM_THREADS=1 python -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node=2 applications/train_wrf_wofs_multi.py -c /home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0401/model.yml
 
 
 # export CUDA_VISIBLE_DEVICES=1
 # python -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node=1 applications/train_wrf_wofs_multi.py -c /home/zhanxiang.hua/miles-credit-wofs/config/wofscast_credit_wrf_0331.yml
-# OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node=2 applications/train_wrf_wofs_da.py -c /home/zhanxiang.hua/miles-credit-wofs/config/wofs_credit_wrf_da_increment.yml
+# OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m torch.distributed.run --standalone --nnodes 1 --nproc_per_node=2 applications/train_wrf_wofs_da.py -c /home/zhanxiang.hua/scratch/credit_runs/wofs_da_increment_experiment_0413/model.yml
  
 
 # python scripts/check_nan_batch.py --config /home/zhanxiang.hua/miles-credit-wofs/config/wofscast_credit_wrf_0331.yml --indices 33178 24287 21088 25214

@@ -198,18 +198,6 @@ def get_forward_data(filename, zarr_chunks=None) -> xr.Dataset:
             except Exception as exc:
                 last_exc = exc
 
-        # for uri in zip_roots:
-        #     try:
-        #         return xr.open_zarr(
-        #             uri,
-        #             chunks=zarr_chunks,
-        #             consolidated=False,
-        #             zarr_format=2,
-        #             decode_coords=False,
-        #         )
-        #     except Exception as exc:
-        #         last_exc = exc
-
         raise last_exc
 
     return xr.open_zarr(

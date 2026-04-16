@@ -37,6 +37,7 @@ class Trainer(BaseTrainer):
         amp = conf["trainer"]["amp"]
         distributed = True if conf["trainer"]["mode"] in ["fsdp", "ddp"] else False
         residual_prediction = conf["trainer"].get("residual_prediction", False)
+        retain_graph = conf["data"].get("retain_graph", False)
         varnum_diag = len(conf["data"]["diagnostic_variables"])
 
         # forecast step
@@ -157,7 +158,7 @@ class Trainer(BaseTrainer):
                 # backpropagation
                 loss = loss.mean()
 
-                scaler.scale(loss / grad_accum_every).backward()
+                scaler.scale(loss / grad_accum_every).backward(retain_graph=retain_graph)
 
             accum_log(logs, {"loss": loss.item() / grad_accum_every})
 
