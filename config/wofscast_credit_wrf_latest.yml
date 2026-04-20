@@ -1,4 +1,4 @@
-save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0401'
+save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_wrf_experiment_multi_0417'
 seed: 1000
 
 data:
@@ -11,25 +11,25 @@ data:
   forcing_variables: []
   static_variables: []
 
-  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
-  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
-  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
-  save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit_0327/cases/wofs_*.zarr'
+  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_diagnostic: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
 
-  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats/mean.nc'
-  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats/std.nc'
+  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/stats/mean.nc'
+  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/stats/std.nc'
 
-  train_years: [2019, 2020]
+  train_years: [2019]
   valid_years: [2022]
 
-  train_date_range: ['20190101', '20201231']
-  valid_date_range: ['20220402', '20220415']
+  train_date_range: ['20190101', '20191231']
+  valid_date_range: ['20220402', '20220515']
 
   history_len: 1
   valid_history_len: 1
-  forecast_len: 1
+  forecast_len: 2
   valid_forecast_len: 1
-  target_start_step: 1
+  target_start_step: 0
   zarr_time_chunk: 3
   lead_time_periods: 1
   levels: 17
@@ -37,14 +37,14 @@ data:
 
   boundary:
     variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
-    surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
+    surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT','XLAND','HGT']
     reuse_interior_stats: True
     levels: 17
     history_len: 1
     forecast_len: 0
-    all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
+    all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT','XLAND','HGT']
 
-  all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+  all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT', 'XLAND', 'HGT']
 
 model:
   type: 'wrf'
@@ -68,7 +68,7 @@ model:
     image_width: 300
     levels: 17
     channels: 6
-    surface_channels: 6
+    surface_channels: 8
     patch_height: 2
     patch_width: 2
     frame_patch_size: 1
@@ -81,13 +81,13 @@ model:
 trainer:
   type: 'multi-step-wrf'
   mode: 'none'
-  train_batch_size: 7
-  valid_batch_size: 7
+  train_batch_size: 2
+  valid_batch_size: 2
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 7
-  valid_thread_workers: 7
-  prefetch_factor: 1
+  thread_workers: 4
+  valid_thread_workers: 4
+  prefetch_factor: 2
   residual_prediction: True
   update_learning_rate: False
   learning_rate: 1.0e-4
@@ -105,14 +105,14 @@ trainer:
   epochs: &epochs 100
   scheduler:
     scheduler_type: cosine-annealing-restarts
-    first_cycle_steps: 250
+    first_cycle_steps: 1000
     cycle_mult: 2.0
     max_lr: 1.0e-03
-    min_lr: 1.0e-05
-    warmup_steps: 249
+    min_lr: 1.0e-04
+    warmup_steps: 999
     gamma: 0.8
   grad_max_norm: 1.0
-  # grad_accum_every: 2
+  grad_accum_every: 3
   save_backup_weights: True
   save_best_weights: True
   save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
@@ -123,12 +123,12 @@ loss:
   training_loss: 'mse'
   variable_weights:
     T: 1.0
-    QVAPOR: 1.0
-    U: 1.0
+    QVAPOR: 1.25
+    U: 1.1
     V: 1.0
     W: 1.25
     GEOPOT: 1.0
-    T2: 1.5
+    T2: 1.2
     Q2: 1.5
     COMPOSITE_REFL_10CM: 2.0
     RAIN_AMOUNT: 2.0  
