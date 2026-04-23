@@ -1,4 +1,5 @@
 import logging
+import time
 from collections import OrderedDict
 import numpy as np
 import xarray as xr
@@ -60,6 +61,13 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         self.history_len_outside = param_outside["history_len"]
         self.forecast_len_outside = param_outside["forecast_len"]
         self.boundary_seq_len = max(1, self.history_len_outside + self.forecast_len_outside)
+        self.zarr_time_chunk = int(param_interior.get("zarr_time_chunk", 0))
+        self.zarr_chunks = {"time": self.zarr_time_chunk} if self.zarr_time_chunk > 0 else None
+        self.max_dataset_open_retries = int(param_interior.get("max_dataset_open_retries", 3))
+
+        self.has_surface = bool(self.filename_surface) and len(self.varname_surface) > 0
+        self.has_dyn_forcing = bool(self.filename_dyn_forcing) and len(self.varname_dyn_forcing) > 0
+        self.has_diagnostic = bool(self.filename_diagnostic) and len(self.varname_diagnostic) > 0
 
         self.transform = transform
         self.rng = np.random.default_rng(seed=seed)
@@ -79,7 +87,109 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         self.WRF_file_indices = None
         self.cached_outside_anchors = OrderedDict()
         self.max_cached_outside_anchors = 64
+        self.file_n_time = None
+        self._all_case_vars = None
         # self.max_cached_outside_anchors = len(self.filenames)
+
+    def _build_all_case_vars(self):
+        seen = set()
+        ordered = []
+        groups = [
+            self.varname_upper_air,
+            self.varname_surface if self.has_surface else [],
+            self.varname_dyn_forcing if self.has_dyn_forcing else [],
+            self.varname_diagnostic if self.has_diagnostic else [],
+            self.varname_upper_air_outside,
+            self.varname_surface_outside,
+        ]
+        for group in groups:
+            for var in group:
+                if var not in seen:
+                    ordered.append(var)
+                    seen.add(var)
+        return ordered
+
+    @staticmethod
+    def _safe_close_dataset(ds):
+        try:
+            ds.close()
+        except Exception:
+            pass
+
+    def _open_filtered_dataset(self, file_path: str, varnames_keep, max_retries: int | None = None):
+        attempts = max(1, int(max_retries or self.max_dataset_open_retries))
+        last_exc = None
+
+        for attempt in range(1, attempts + 1):
+            ds = None
+            try:
+                ds = get_forward_data(file_path, zarr_chunks=self.zarr_chunks)
+                ds = filter_ds(ds, varnames_keep)
+                return ds
+            except Exception as exc:
+                last_exc = exc
+                self._safe_close_dataset(ds)
+                if attempt < attempts:
+                    logger.warning(
+                        "Retrying dataset open/filter %d/%d for %s due to %s: %s",
+                        attempt,
+                        attempts,
+                        file_path,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    time.sleep(0.1 * attempt)
+
+        raise RuntimeError(
+            f"Failed to open/filter dataset after {attempts} attempt(s): {file_path}; "
+            f"required_vars={list(varnames_keep)}; last_error={last_exc}"
+        ) from last_exc
+
+    def _ensure_file_time_sizes(self):
+        if self.file_n_time is not None:
+            return
+
+        if self._all_case_vars is None:
+            self._all_case_vars = self._build_all_case_vars()
+
+        valid_filenames = []
+        file_n_time = []
+        skipped = []
+
+        for fn in self.filenames:
+            ds = None
+            try:
+                ds = self._open_filtered_dataset(fn, self._all_case_vars, self.max_dataset_open_retries)
+                n_time = int(ds["time"].size)
+                valid_filenames.append(fn)
+                file_n_time.append(int(np.asarray(n_time).item()))
+            except Exception as exc:
+                skipped.append((fn, exc))
+                logger.warning(
+                    "Skipping unreadable training file %s due to %s: %s",
+                    fn,
+                    type(exc).__name__,
+                    exc,
+                )
+            finally:
+                self._safe_close_dataset(ds)
+
+        if len(valid_filenames) == 0:
+            raise ValueError(
+                "No readable training files after filtering corrupted/unavailable datasets. "
+                "Check data path, filesystem stability, and zarr metadata."
+            )
+
+        if skipped:
+            logger.warning(
+                "Filtered %d unreadable training file(s); using %d file(s).",
+                len(skipped),
+                len(valid_filenames),
+            )
+
+        self.filenames = valid_filenames
+        self.file_n_time = file_n_time
+        self.cached_outside_anchors.clear()
 
     def _get_boundary_anchor(self, file_index: int) -> xr.Dataset:
         """Get pre-normalized boundary anchor with bounded in-worker cache."""
@@ -134,25 +244,32 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         if getattr(self, "_opened", False):
             return
 
-        all_ds = [get_forward_data(fn) for fn in self.filenames]
+        self._ensure_file_time_sizes()
+        if self._all_case_vars is None:
+            self._all_case_vars = self._build_all_case_vars()
+
+        all_ds = [
+            self._open_filtered_dataset(fn, self._all_case_vars, self.max_dataset_open_retries)
+            for fn in self.filenames
+        ]
 
         # upper-air
         self.list_upper_ds = [filter_ds(ds, self.varname_upper_air) for ds in all_ds]
 
         # surface
-        if self.filename_surface:
+        if self.has_surface:
             self.list_surf_ds = [filter_ds(ds, self.varname_surface) for ds in all_ds]
         else:
             self.list_surf_ds = False
 
         # dyn forcing
-        if self.filename_dyn_forcing:
+        if self.has_dyn_forcing:
             self.list_dyn_forcing_ds = [filter_ds(ds, self.varname_dyn_forcing) for ds in all_ds]
         else:
             self.list_dyn_forcing_ds = False
 
         # diagnostics
-        if self.filename_diagnostic:
+        if self.has_diagnostic:
             self.list_diag_ds = [filter_ds(ds, self.varname_diagnostic) for ds in all_ds]
         else:
             self.list_diag_ds = False
@@ -170,14 +287,14 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
 
         # forcing
         if self.filename_forcing is not None:
-            ds = get_forward_data(self.filename_forcing)
+            ds = get_forward_data(self.filename_forcing, zarr_chunks=self.zarr_chunks)
             self.xarray_forcing = drop_var_from_dataset(ds, self.varname_forcing).load()
         else:
             self.xarray_forcing = False
 
         # static
         if self.filename_static is not None:
-            ds = get_forward_data(self.filename_static)
+            ds = get_forward_data(self.filename_static, zarr_chunks=self.zarr_chunks)
             self.xarray_static = drop_var_from_dataset(ds, self.varname_static).load()
         else:
             self.xarray_static = False
@@ -199,39 +316,10 @@ class WoFSSingleStepDataset(torch.utils.data.Dataset):
         if getattr(self, "total_length", None) is not None:
             return self.total_length
 
-        total_len = 0
-        for fn in self.filenames:
-            try:
-                if fn.endswith('.zarr'):
-                    import zarr
-                    z = zarr.open(fn, mode='r')
-                    first_var = self.varname_upper_air[0]
-                    if first_var in z:
-                        n_time = z[first_var].shape[0]
-                    else:
-                        ds = get_forward_data(fn)
-                        n_time = int(ds["time"].size)
-                        ds.close()
-                elif fn.endswith('.zarr.zip') or fn.endswith('.zarr.zip/'):
-                    ds = get_forward_data(fn)
-                    n_time = int(ds["time"].size)
-                    ds.close()
-                else:
-                    ds = get_forward_data(fn)
-                    n_time = int(ds["time"].size)
-                    ds.close()
-                    del ds
-            except Exception:
-                ds = get_forward_data(fn)
-                try:
-                    n_time = int(filter_ds(ds, self.varname_upper_air)["time"].size)
-                finally:
-                    try:
-                        ds.close()
-                    except Exception:
-                        pass
-                    del ds
+        self._ensure_file_time_sizes()
 
+        total_len = 0
+        for n_time in self.file_n_time:
             available = n_time - self.total_seq_len + 1
             if available > 0:
                 total_len += available

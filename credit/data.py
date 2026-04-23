@@ -32,6 +32,7 @@ from pathlib import Path
 
 # data utils
 import datetime
+import time
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -180,6 +181,35 @@ def get_forward_data(filename, zarr_chunks=None) -> xr.Dataset:
     if filename[-3:] == ".nc" or filename[-4:] == ".nc4":
         return xr.open_dataset(filename)
 
+    def _open_zarr_with_fallback(uri_or_path: str) -> xr.Dataset:
+        # Try consolidated metadata first for performance, then fallback to
+        # non-consolidated metadata for stores missing .zmetadata.
+        last_exc = None
+        for consolidated in (True, False):
+            try:
+                return xr.open_zarr(
+                    uri_or_path,
+                    chunks=zarr_chunks,
+                    consolidated=consolidated,
+                    zarr_format=2,
+                    decode_coords=False,
+                    create_default_indexes=False,
+                )
+            except Exception as exc:
+                last_exc = exc
+        raise last_exc
+
+    def _open_with_retries(uri_or_path: str, max_attempts: int = 3) -> xr.Dataset:
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return _open_zarr_with_fallback(uri_or_path)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_attempts:
+                    time.sleep(0.25 * attempt)
+        raise last_exc
+
     if filename.endswith(".zarr.zip") or filename.endswith(".zarr.zip/"):
         zip_file = str(filename).rstrip("/")
         zip_basename = Path(zip_file).stem
@@ -188,25 +218,13 @@ def get_forward_data(filename, zarr_chunks=None) -> xr.Dataset:
         last_exc = None
         for uri in zip_roots:
             try:
-                return xr.open_zarr(
-                    uri,
-                    chunks=zarr_chunks,
-                    consolidated=True,
-                    zarr_format=2,
-                    decode_coords=False,
-                )
+                return _open_with_retries(uri)
             except Exception as exc:
                 last_exc = exc
 
         raise last_exc
 
-    return xr.open_zarr(
-        filename,
-        chunks=zarr_chunks,
-        consolidated=True,
-        zarr_format=2,
-        decode_coords=False,
-    )
+    return _open_with_retries(filename)
 
 
 def flatten_list(list_of_lists):

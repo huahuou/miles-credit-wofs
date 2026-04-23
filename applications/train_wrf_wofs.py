@@ -174,6 +174,7 @@ def _build_params(conf, split: str):
         "forecast_len": conf["data"][forecast_key],
         "target_start_step": conf["data"].get("target_start_step", 1),
         "zarr_time_chunk": conf["data"].get("zarr_time_chunk", 0),
+        "max_dataset_open_retries": conf["data"].get("max_dataset_open_retries", 3),
     }
 
     param_outside = {

@@ -26,6 +26,7 @@ Tensor dict keys returned
 import logging
 from collections import OrderedDict
 import json
+import time
 import numpy as np
 import xarray as xr
 
@@ -106,6 +107,20 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.max_open_files = int(conf["data"].get("max_open_files_per_worker", 8))
         self.zarr_time_chunk = int(conf["data"].get("zarr_time_chunk", 2))
         self.zarr_chunks = {"time": self.zarr_time_chunk} if self.zarr_time_chunk > 0 else None
+        self.max_dataset_open_retries = int(conf["data"].get("max_dataset_open_retries", 3))
+
+        # Keep required upper-air variables consistent across startup filtering
+        # and training-time sample reads.
+        seen = set()
+        all_upper_vars = []
+        for v in self.varname_prognostic + self.varname_context + self.varname_observation:
+            if v not in seen:
+                all_upper_vars.append(v)
+                seen.add(v)
+        self._all_upper_vars = all_upper_vars
+        self.has_dyn_forcing = bool(self.varname_dyn_forcing and self.filename_dyn_forcing)
+        self._shared_dyn_store = False
+        self._upper_open_vars = list(self._all_upper_vars)
 
         # -- internal state (lazy-opened in workers) -----------------------
         self._opened = False
@@ -124,6 +139,26 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             )
         )
         self._prognostic_levels = self._infer_common_prognostic_ceiling_level(default_prog_levels)
+        self._refresh_required_open_vars()
+
+    def _refresh_required_open_vars(self):
+        self._shared_dyn_store = bool(
+            self.has_dyn_forcing
+            and self.filename_dyn_forcing is not None
+            and len(self.filename_dyn_forcing) == len(self.filenames)
+            and all(upper_fn == dyn_fn for upper_fn, dyn_fn in zip(self.filenames, self.filename_dyn_forcing))
+        )
+
+        if self._shared_dyn_store:
+            seen = set()
+            merged = []
+            for var_name in self._all_upper_vars + self.varname_dyn_forcing:
+                if var_name not in seen:
+                    merged.append(var_name)
+                    seen.add(var_name)
+            self._upper_open_vars = merged
+        else:
+            self._upper_open_vars = list(self._all_upper_vars)
 
     def _infer_common_prognostic_ceiling_level(self, fallback_levels: int) -> int:
         level_candidates = []
@@ -376,43 +411,59 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
 
     def _build_index_map(self):
         if self.file_n_time is None:
-            self.file_n_time = []
-            for fn in self.filenames:
-                try:
-                    if fn.endswith(".zarr"):
-                        import zarr
-                        z = zarr.open(fn, mode="r")
-                        first_var = self.varname_prognostic[0]
-                        n_time = z[first_var].shape[0] if first_var in z else 0
-                        if n_time == 0:
-                            ds = get_forward_data(fn)
-                            try:
-                                n_time = int(ds["time"].size)
-                            finally:
-                                ds.close()
-                    elif fn.endswith(".zarr.zip"):
-                        ds = get_forward_data(fn)
-                        try:
-                            n_time = int(ds["time"].size)
-                        finally:
-                            ds.close()
-                    else:
-                        ds = get_forward_data(fn)
-                        try:
-                            n_time = int(ds["time"].size)
-                        finally:
-                            ds.close()
-                except Exception:
-                    ds = get_forward_data(fn)
-                    try:
-                        n_time = int(filter_ds(ds, self.varname_prognostic)["time"].size)
-                    finally:
-                        try:
-                            ds.close()
-                        except Exception:
-                            pass
+            has_dyn = bool(self.has_dyn_forcing and self.filename_dyn_forcing)
+            valid_filenames = []
+            valid_dyn_filenames = [] if has_dyn else None
+            file_n_time = []
+            skipped = []
 
-                self.file_n_time.append(int(np.asarray(n_time).item()))
+            for file_idx, fn in enumerate(self.filenames):
+                dyn_fn = self.filename_dyn_forcing[file_idx] if has_dyn else None
+                upper_ds = None
+                dyn_ds = None
+                try:
+                    upper_ds = self._open_filtered_dataset(fn, self._upper_open_vars, self.max_dataset_open_retries)
+                    n_time = int(upper_ds["time"].size)
+
+                    if dyn_fn is not None and not self._shared_dyn_store:
+                        dyn_ds = self._open_filtered_dataset(
+                            dyn_fn,
+                            self.varname_dyn_forcing,
+                            self.max_dataset_open_retries,
+                        )
+                        dyn_n_time = int(dyn_ds["time"].size)
+                        n_time = min(n_time, dyn_n_time)
+
+                    valid_filenames.append(fn)
+                    file_n_time.append(int(np.asarray(n_time).item()))
+                    if valid_dyn_filenames is not None and dyn_fn is not None:
+                        valid_dyn_filenames.append(dyn_fn)
+                except Exception as exc:
+                    skipped.append((fn, exc))
+                    logger.warning("Skipping unreadable training file %s due to %s: %s", fn, type(exc).__name__, exc)
+                finally:
+                    self._safe_close_dataset(upper_ds)
+                    self._safe_close_dataset(dyn_ds)
+
+            if len(valid_filenames) == 0:
+                raise ValueError(
+                    "No readable training files after filtering corrupted/unavailable datasets. "
+                    "Check data path, filesystem stability, and zarr metadata."
+                )
+
+            if skipped:
+                logger.warning(
+                    "Filtered %d unreadable training file(s); using %d file(s).",
+                    len(skipped),
+                    len(valid_filenames),
+                )
+
+            self.filenames = valid_filenames
+            if valid_dyn_filenames is not None:
+                self.filename_dyn_forcing = valid_dyn_filenames
+            self._refresh_required_open_vars()
+
+            self.file_n_time = file_n_time
 
         self.samples_per_file = [max(0, n_time - self.total_seq_len) for n_time in self.file_n_time]
         self.cumulative_samples = np.cumsum(self.samples_per_file, dtype=np.int64)
@@ -623,6 +674,35 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         except Exception:
             pass
 
+    def _open_filtered_dataset(self, file_path: str, varnames_keep, max_retries: int | None = None):
+        attempts = max(1, int(max_retries or self.max_dataset_open_retries))
+        last_exc = None
+
+        for attempt in range(1, attempts + 1):
+            ds = None
+            try:
+                ds = get_forward_data(file_path, zarr_chunks=self.zarr_chunks)
+                ds = filter_ds(ds, varnames_keep)
+                return ds
+            except Exception as exc:
+                last_exc = exc
+                self._safe_close_dataset(ds)
+                if attempt < attempts:
+                    logger.warning(
+                        "Retrying dataset open/filter %d/%d for %s due to %s: %s",
+                        attempt,
+                        attempts,
+                        file_path,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    time.sleep(0.1 * attempt)
+
+        raise RuntimeError(
+            f"Failed to open/filter dataset after {attempts} attempt(s): {file_path}; "
+            f"required_vars={list(varnames_keep)}; last_error={last_exc}"
+        ) from last_exc
+
     def _evict_if_needed(self, cache: OrderedDict):
         while len(cache) > self.max_open_files:
             _, ds = cache.popitem(last=False)
@@ -634,8 +714,11 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             self.upper_ds_cache.move_to_end(file_idx)
             return cached
 
-        ds = get_forward_data(self.filenames[file_idx], zarr_chunks=self.zarr_chunks)
-        ds = filter_ds(ds, self._all_upper_vars)
+        ds = self._open_filtered_dataset(
+            self.filenames[file_idx],
+            self._upper_open_vars,
+            self.max_dataset_open_retries,
+        )
         self.upper_ds_cache[file_idx] = ds
         self._evict_if_needed(self.upper_ds_cache)
         return ds
@@ -644,13 +727,19 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         if not self.has_dyn_forcing:
             return None
 
+        if self._shared_dyn_store:
+            return self._get_upper_ds(file_idx)
+
         cached = self.dyn_ds_cache.get(file_idx)
         if cached is not None:
             self.dyn_ds_cache.move_to_end(file_idx)
             return cached
 
-        ds = get_forward_data(self.filename_dyn_forcing[file_idx], zarr_chunks=self.zarr_chunks)
-        ds = filter_ds(ds, self.varname_dyn_forcing)
+        ds = self._open_filtered_dataset(
+            self.filename_dyn_forcing[file_idx],
+            self.varname_dyn_forcing,
+            self.max_dataset_open_retries,
+        )
         self.dyn_ds_cache[file_idx] = ds
         self._evict_if_needed(self.dyn_ds_cache)
         return ds
@@ -739,10 +828,13 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         # 3. Dynamic forcing (input-only, 2D)
         # ================================================================ #
         if self.has_dyn_forcing:
-            dyn_ds = self._get_dyn_ds(file_idx)
-            if dyn_ds is None:
-                raise RuntimeError("Dynamic forcing dataset is not available for this sample")
-            dyn_chunk = dyn_ds.isel(time=t0).load()
+            if self._shared_dyn_store:
+                dyn_chunk = chunk.isel(time=0)
+            else:
+                dyn_ds = self._get_dyn_ds(file_idx)
+                if dyn_ds is None:
+                    raise RuntimeError("Dynamic forcing dataset is not available for this sample")
+                dyn_chunk = dyn_ds.isel(time=t0).load()
             dyn_list = []
             for var in self.varname_dyn_forcing:
                 dyn_list.append(dyn_chunk[var].values)  # (H, W) each

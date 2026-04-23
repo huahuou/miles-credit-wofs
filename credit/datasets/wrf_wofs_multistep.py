@@ -3,6 +3,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 import logging
+import time
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -96,6 +97,7 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             self.zarr_time_chunk = self._recommended_zarr_time_chunk(self.forecast_len)
         self.zarr_chunks = {"time": self.zarr_time_chunk} if self.zarr_time_chunk > 0 else None
         self.max_open_files = int(param_interior.get("max_open_files_per_worker", 8))
+        self.max_dataset_open_retries = int(param_interior.get("max_dataset_open_retries", 3))
 
         # outside branch parameters (store them, will be used in _open_datasets)
         self.varname_upper_air_outside = param_outside["varname_upper_air"]
@@ -162,6 +164,35 @@ class WoFSMultiStep(torch.utils.data.Dataset):
             self.cached_outside_anchors.pop(evicted_file_idx, None)
             self._forcing_time_index_cache.pop(evicted_file_idx, None)
 
+    def _open_filtered_dataset(self, file_path: str, varnames_keep, max_retries: int | None = None):
+        attempts = max(1, int(max_retries or self.max_dataset_open_retries))
+        last_exc = None
+
+        for attempt in range(1, attempts + 1):
+            ds = None
+            try:
+                ds = get_forward_data(file_path, zarr_chunks=self.zarr_chunks)
+                ds = filter_ds(ds, varnames_keep)
+                return ds
+            except Exception as exc:
+                last_exc = exc
+                self._safe_close_dataset(ds)
+                if attempt < attempts:
+                    logger.warning(
+                        "Retrying dataset open/filter %d/%d for %s due to %s: %s",
+                        attempt,
+                        attempts,
+                        file_path,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    time.sleep(0.1 * attempt)
+
+        raise RuntimeError(
+            f"Failed to open/filter dataset after {attempts} attempt(s): {file_path}; "
+            f"required_vars={list(varnames_keep)}; last_error={last_exc}"
+        ) from last_exc
+
     def _get_case_ds(self, file_index: int) -> xr.Dataset:
         cached = self.case_ds_cache.get(file_index)
         if cached is not None:
@@ -172,64 +203,63 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         if self._all_case_vars is None:
             self._all_case_vars = self._build_all_case_vars()
 
-        last_exc = None
-        for attempt in range(2):
-            ds_raw = None
-            try:
-                ds_raw = get_forward_data(file_path, zarr_chunks=self.zarr_chunks)
-                ds = filter_ds(ds_raw, self._all_case_vars)
-                self.case_ds_cache[file_index] = ds
-                self._evict_if_needed()
-                return ds
-            except Exception as exc:
-                last_exc = exc
-                if ds_raw is not None:
-                    self._safe_close_dataset(ds_raw)
-                if attempt == 0:
-                    continue
-
-        raise RuntimeError(
-            f"Failed to open/filter WoFS case file after retry: {file_path}"
-        ) from last_exc
+        ds = self._open_filtered_dataset(
+            file_path,
+            self._all_case_vars,
+            self.max_dataset_open_retries,
+        )
+        self.case_ds_cache[file_index] = ds
+        self._evict_if_needed()
+        return ds
 
     def _ensure_file_time_sizes(self):
         if self.file_n_time is not None:
             return
 
-        self.file_n_time = []
-        for fn in self.filenames:
-            try:
-                if fn.endswith('.zarr'):
-                    import zarr
-                    z = zarr.open(fn, mode='r')
-                    first_var = self.varname_upper_air[0]
-                    if first_var in z:
-                        n_time = z[first_var].shape[0]
-                    else:
-                        ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                        n_time = int(ds["time"].size)
-                        ds.close()
-                elif fn.endswith('.zarr.zip') or fn.endswith('.zarr.zip/'):
-                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                    n_time = int(ds["time"].size)
-                    ds.close()
-                else:
-                    ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                    n_time = int(ds["time"].size)
-                    ds.close()
-                    del ds
-            except Exception:
-                ds = get_forward_data(fn, zarr_chunks=self.zarr_chunks)
-                try:
-                    n_time = int(filter_ds(ds, self.varname_upper_air)["time"].size)
-                finally:
-                    try:
-                        ds.close()
-                    except Exception:
-                        pass
-                    del ds
+        if self._all_case_vars is None:
+            self._all_case_vars = self._build_all_case_vars()
 
-            self.file_n_time.append(int(np.asarray(n_time).item()))
+        valid_filenames = []
+        file_n_time = []
+        skipped = []
+
+        for fn in self.filenames:
+            ds = None
+            try:
+                ds = self._open_filtered_dataset(fn, self._all_case_vars, self.max_dataset_open_retries)
+                n_time = int(ds["time"].size)
+                valid_filenames.append(fn)
+                file_n_time.append(int(np.asarray(n_time).item()))
+            except Exception as exc:
+                skipped.append((fn, exc))
+                logger.warning(
+                    "Skipping unreadable training file %s due to %s: %s",
+                    fn,
+                    type(exc).__name__,
+                    exc,
+                )
+            finally:
+                self._safe_close_dataset(ds)
+
+        if len(valid_filenames) == 0:
+            raise ValueError(
+                "No readable training files after filtering corrupted/unavailable datasets. "
+                "Check data path, filesystem stability, and zarr metadata."
+            )
+
+        if skipped:
+            logger.warning(
+                "Filtered %d unreadable training file(s); using %d file(s).",
+                len(skipped),
+                len(valid_filenames),
+            )
+
+        self.filenames = valid_filenames
+        self.file_n_time = file_n_time
+
+        self.case_ds_cache.clear()
+        self.cached_outside_anchors.clear()
+        self._forcing_time_index_cache.clear()
 
     def _build_file_indices(self):
         self._ensure_file_time_sizes()

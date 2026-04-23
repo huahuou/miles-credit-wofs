@@ -1,4 +1,4 @@
-save_loc: '/home/zhanxiang.hua/scratch/credit_runs/wofs_da_increment_experiment_0417'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0422'
 seed: 1000
 
 data:
@@ -20,14 +20,14 @@ data:
   forcing_variables: []
   static_variables: []
 
-  save_loc: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
-  save_loc_surface: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
-  save_loc_dynamic_forcing: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_surface: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_dynamic_forcing: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
   save_loc_diagnostic: ''
 
-  mean_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/stats/mean.nc'
-  std_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/stats/std.nc'
-  concentration_params_json: '/work2/zhanxianghua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
+  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
+  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
+  concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
 
   concentration_level_ops:
     QRAIN:
@@ -56,10 +56,10 @@ data:
       mode: 'cutoff'   # options: cutoff | sum | mean
     
 
-  train_years: [2020]
+  train_years: [2019,2020]
   valid_years: [2021]
 
-  train_date_range: ['20200301', '20200830']
+  train_date_range: ['20190101', '20201231']
   valid_date_range: ['20210405', '20210407']
 
   history_len: 1
@@ -131,13 +131,13 @@ trainer:
   no_hang_pin_memory: False
   no_hang_persistent_workers: True
   no_hang_timeout_s: 180
-  train_batch_size: 3
-  valid_batch_size: 3
+  train_batch_size: 8
+  valid_batch_size: 8
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 6
-  valid_thread_workers: 6
-  prefetch_factor: 2
+  thread_workers: 8
+  valid_thread_workers: 8
+  prefetch_factor: 1
   dataloader_timeout_s: 180
   update_learning_rate: False
   learning_rate: 1.0e-4
@@ -168,7 +168,7 @@ trainer:
   save_metric_vars: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
 
 loss:
-  latitude_weights: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/stats_da/latitude_weights_placeholder.nc'
+  latitude_weights: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0409/stats_da/latitude_weights_placeholder.nc'
   use_latitude_weights: False
   use_variable_weights: False
   training_loss: 'mse'
@@ -185,10 +185,10 @@ loss:
 eval:
   mode: 'none'
   task: 'da-test-eval'
-  test_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/cases/wofs_*.zarr.zip'
-  test_dyn_path: '/work2/zhanxianghua/wofs_preprocess_to_credit_0409/cases/wofs_*.zarr.zip'
+  test_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0409/cases/wofs_*.zarr.zip'
+  test_dyn_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0409/cases/wofs_*.zarr.zip'
   test_date_range: ['20200415', '20200515']
-  save_forecast: '/work2/zhanxianghua/da_test/wofs_da_increment_experiment_0413/eval_test'
+  save_forecast: '/scratch5/purged/Zhanxiang.Hua/da_test/wofs_da_increment_experiment_0413/eval_test'
   output_inference_name: 'test_samples_2020.zarr'
   output_metrics_name: 'test_metrics_2020.csv'
   save_inference: True
