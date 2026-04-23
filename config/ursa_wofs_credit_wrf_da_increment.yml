@@ -162,7 +162,7 @@ trainer:
     warmup_steps: 999
     gamma: 0.8
   grad_max_norm: 1.0
-  grad_accum_every: 3
+  grad_accum_every: 1
   save_backup_weights: True
   save_best_weights: True
   save_metric_vars: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']

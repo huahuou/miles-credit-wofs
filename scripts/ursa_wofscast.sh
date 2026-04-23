@@ -22,7 +22,7 @@
 #SBATCH --nodes=1                             # Number of nodes (adjust as needed)
 #SBATCH --ntasks-per-node=1                   # 1 Slurm task per node (torchrun handles GPU processes)
 #SBATCH --gpus-per-node=h100:2                # 2 H100 GPUs per node
-#SBATCH --cpus-per-task=16                    # CPU cores per task (for data loading workers)
+#SBATCH --cpus-per-task=192                    # CPU cores per task (for data loading workers)
 #SBATCH --mem=0                               # Use all available memory on the node
 #SBATCH --time=02:00:00                       # Wall time limit
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out                   # stdout: <job-name>-<job-id>.out
@@ -145,7 +145,7 @@ PY
 
 cd ${PROJECT_DIR}
 
-srun torchrun \
+srun --cpu-bind=none torchrun \
     --nnodes=${NUM_NODES} \
     --nproc-per-node=${NPROC_PER_NODE} \
     --rdzv-id=${SLURM_JOB_ID} \
