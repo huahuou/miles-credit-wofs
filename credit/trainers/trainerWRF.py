@@ -9,11 +9,13 @@ import numpy as np
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.utils.data import IterableDataset
 
 import optuna
 from credit.data import concat_and_reshape, reshape_only
+from credit.losses.weighted_loss import binary_focal_with_logits, soft_dice_loss_from_logits
 from credit.scheduler import update_on_batch
 from credit.trainers.utils import accum_log, cycle
 from credit.trainers.base_trainer import BaseTrainer
@@ -26,6 +28,122 @@ class Trainer(BaseTrainer):
         super().__init__(model, rank)
 
         logger.info("WRF single-step training")
+
+    def _occupancy_channel_mask(self, conf, num_prog, dtype):
+        occ_conf = conf.get("loss", {}).get("occupancy", {})
+        configured_vars = occ_conf.get("variables", conf["data"]["variables"])
+        if configured_vars is None:
+            configured_vars = []
+        occ_vars = set(configured_vars)
+
+        prog_vars = conf["data"]["variables"]
+        n_vars = len(prog_vars)
+        if n_vars <= 0 or num_prog <= 0:
+            return torch.zeros((1, num_prog, 1, 1, 1), device=self.device, dtype=dtype)
+
+        if num_prog % n_vars != 0:
+            # Fallback: apply occupancy to all prognostic channels if layout is unexpected.
+            return torch.ones((1, num_prog, 1, 1, 1), device=self.device, dtype=dtype)
+
+        levels = num_prog // n_vars
+        channel_mask = torch.zeros((num_prog,), device=self.device, dtype=dtype)
+        for var_idx, var_name in enumerate(prog_vars):
+            if var_name in occ_vars:
+                start = var_idx * levels
+                end = start + levels
+                channel_mask[start:end] = 1.0
+
+        return channel_mask.view(1, num_prog, 1, 1, 1)
+
+    def _compute_loss_with_occupancy(self, conf, batch, y, y_pred, criterion, varnum_diag):
+        occ_conf = conf.get("loss", {}).get("occupancy", {})
+        occ_enabled = bool(occ_conf.get("enabled", False))
+
+        reg_loss = criterion(y, y_pred)
+        occ_ce = None
+        gate_mean = None
+
+        if not occ_enabled:
+            return reg_loss, reg_loss, occ_ce, gate_mean
+
+        required_keys = ("y_occupancy", "y_occ_delta_threshold_norm")
+        if not all(key in batch for key in required_keys):
+            return reg_loss, reg_loss, occ_ce, gate_mean
+
+        num_prog = y_pred.shape[1] - varnum_diag
+        if num_prog <= 0:
+            return reg_loss, reg_loss, occ_ce, gate_mean
+
+        tau = float(occ_conf.get("logit_temperature", 0.25))
+        tau = max(tau, 1.0e-6)
+        ce_weight = float(occ_conf.get("ce_weight", 0.2))
+        use_masked_reg = bool(occ_conf.get("use_masked_regression", True))
+        masked_mode = str(occ_conf.get("masked_regression_mode", "soft")).lower().strip()
+        reg_mask_min = float(occ_conf.get("reg_mask_min", 0.05))
+
+        y_prog_pred = y_pred[:, :num_prog, ...]
+        y_occ = reshape_only(batch["y_occupancy"]).to(self.device, dtype=y_pred.dtype, non_blocking=True)
+        delta_thr_norm = reshape_only(batch["y_occ_delta_threshold_norm"]).to(
+            self.device, dtype=y_pred.dtype, non_blocking=True
+        )
+
+        occ_logits = (torch.abs(y_prog_pred) - delta_thr_norm) / tau
+        occ_channel_mask = self._occupancy_channel_mask(conf, num_prog, y_pred.dtype)
+        occ_weight = occ_channel_mask.expand_as(occ_logits)
+
+        pos_weight = occ_conf.get("pos_weight", None)
+        pos_weight_tensor = None
+        if pos_weight is not None:
+            pos_weight_tensor = torch.tensor(float(pos_weight), device=self.device, dtype=y_pred.dtype)
+
+        occ_loss_map = F.binary_cross_entropy_with_logits(
+            occ_logits,
+            y_occ,
+            reduction="none",
+            pos_weight=pos_weight_tensor,
+        )
+        occ_denom = occ_weight.sum().clamp_min(1.0)
+        occ_ce = (occ_loss_map * occ_weight).sum() / occ_denom
+
+        occ_aux_loss = torch.zeros((), device=self.device, dtype=y_pred.dtype)
+        if bool(occ_conf.get("use_focal", False)):
+            occ_aux_loss = occ_aux_loss + float(occ_conf.get("focal_weight", 0.0)) * binary_focal_with_logits(
+                occ_logits,
+                y_occ,
+                alpha=float(occ_conf.get("focal_alpha", 0.25)),
+                gamma=float(occ_conf.get("focal_gamma", 2.0)),
+                mask=occ_weight,
+            )
+        if bool(occ_conf.get("use_dice", False)):
+            occ_aux_loss = occ_aux_loss + float(occ_conf.get("dice_weight", 0.0)) * soft_dice_loss_from_logits(
+                occ_logits,
+                y_occ,
+                smooth=float(occ_conf.get("dice_smooth", 1.0)),
+                mask=occ_weight,
+            )
+
+        if use_masked_reg:
+            if masked_mode == "hard" and "y_regression_mask_hard" in batch:
+                reg_mask_prog = reshape_only(batch["y_regression_mask_hard"]).to(
+                    self.device, dtype=y_pred.dtype, non_blocking=True
+                )
+            else:
+                reg_floor = torch.tensor(reg_mask_min, device=self.device, dtype=y_pred.dtype)
+                reg_mask_prog = torch.maximum(torch.sigmoid(occ_logits).detach(), reg_floor)
+
+            # Channels not selected for occupancy keep full regression supervision.
+            reg_mask_prog = reg_mask_prog * occ_channel_mask + (1.0 - occ_channel_mask)
+
+            full_reg_mask = torch.ones_like(y_pred)
+            full_reg_mask[:, :num_prog, ...] = reg_mask_prog
+            reg_loss = criterion(y, y_pred, mask=full_reg_mask)
+        else:
+            reg_loss = criterion(y, y_pred)
+
+        gate_mean = (torch.sigmoid(occ_logits).detach() * occ_weight).sum() / occ_denom
+        total_loss = reg_loss + ce_weight * (occ_ce + occ_aux_loss)
+        # print(reg_loss.item(), occ_ce.item(), occ_aux_loss.item(), gate_mean.item())
+        return total_loss, reg_loss, occ_ce, gate_mean
 
     # Training function.
     def train_one_epoch(self, epoch, conf, trainloader, optimizer, criterion, scaler, scheduler, metrics):
@@ -142,7 +260,14 @@ class Trainer(BaseTrainer):
                 y = y.to(device=self.device, dtype=y_pred.dtype, non_blocking=True)
 
                 # loss compute
-                loss = criterion(y, y_pred)
+                loss, reg_loss, occ_ce, gate_mean = self._compute_loss_with_occupancy(
+                    conf,
+                    batch,
+                    y,
+                    y_pred,
+                    criterion,
+                    varnum_diag,
+                )
 
                 # Metrics
                 # metrics_dict = metrics(y_pred.float(), y.float())
@@ -161,6 +286,12 @@ class Trainer(BaseTrainer):
                 scaler.scale(loss / grad_accum_every).backward(retain_graph=retain_graph)
 
             accum_log(logs, {"loss": loss.item() / grad_accum_every})
+            if reg_loss is not None:
+                accum_log(logs, {"reg_loss": reg_loss.item() / grad_accum_every})
+            if occ_ce is not None:
+                accum_log(logs, {"occ_ce": occ_ce.item() / grad_accum_every})
+            if gate_mean is not None:
+                accum_log(logs, {"occ_gate_mean": gate_mean.item()})
 
 
             # Note: DDP synchronizes gradients during backward(); no explicit barrier needed.
@@ -182,6 +313,24 @@ class Trainer(BaseTrainer):
                 dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
 
             results_dict["train_loss"].append(batch_loss[0].item())
+
+            if "reg_loss" in logs:
+                reg_loss_tensor = torch.tensor([logs["reg_loss"]], device=self.device)
+                if distributed:
+                    dist.all_reduce(reg_loss_tensor, dist.ReduceOp.AVG, async_op=False)
+                results_dict["train_reg_loss"].append(reg_loss_tensor[0].item())
+
+            if "occ_ce" in logs:
+                occ_ce_tensor = torch.tensor([logs["occ_ce"]], device=self.device)
+                if distributed:
+                    dist.all_reduce(occ_ce_tensor, dist.ReduceOp.AVG, async_op=False)
+                results_dict["train_occ_ce"].append(occ_ce_tensor[0].item())
+
+            if "occ_gate_mean" in logs:
+                occ_gate_tensor = torch.tensor([logs["occ_gate_mean"]], device=self.device)
+                if distributed:
+                    dist.all_reduce(occ_gate_tensor, dist.ReduceOp.AVG, async_op=False)
+                results_dict["train_occ_gate_mean"].append(occ_gate_tensor[0].item())
 
             if "forecast_hour" in batch:
                 forecast_hour_tensor = batch["forecast_hour"].to(self.device, non_blocking=True)
@@ -328,7 +477,15 @@ class Trainer(BaseTrainer):
                     else:
                         y_pred = y_pred + residual
 
-                loss = criterion(y.to(y_pred.dtype), y_pred)
+                y = y.to(device=self.device, dtype=y_pred.dtype, non_blocking=True)
+                loss, reg_loss, occ_ce, gate_mean = self._compute_loss_with_occupancy(
+                    conf,
+                    batch,
+                    y,
+                    y_pred,
+                    criterion,
+                    varnum_diag,
+                )
 
                 # Metrics
                 # metrics_dict = metrics(y_pred, y)
@@ -348,6 +505,12 @@ class Trainer(BaseTrainer):
                     torch.distributed.barrier()
 
                 results_dict["valid_loss"].append(batch_loss[0].item())
+                if reg_loss is not None:
+                    results_dict["valid_reg_loss"].append(reg_loss.item())
+                if occ_ce is not None:
+                    results_dict["valid_occ_ce"].append(occ_ce.item())
+                if gate_mean is not None:
+                    results_dict["valid_occ_gate_mean"].append(gate_mean.item())
                 results_dict["valid_forecast_len"].append(forecast_len + 1)
 
                 # print to tqdm

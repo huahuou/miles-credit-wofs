@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0422'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423'
 seed: 1000
 
 data:
@@ -72,6 +72,10 @@ data:
   lead_time_periods: 1
   levels: 17
   prognostic_levels: 17  # effective model levels for concentration prognostic variables
+  occupancy_delta_threshold: 5.0e-9
+  occupancy_delta_threshold_by_var: {}
+  occupancy_variables: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
+  occupancy_target_source: 'delta_abs'
   static_first: False
 
   boundary:
@@ -172,6 +176,25 @@ loss:
   use_latitude_weights: False
   use_variable_weights: False
   training_loss: 'mse'
+  occupancy:
+    enabled: true
+    delta_threshold: 5.0e-9
+    delta_threshold_by_var: {}
+    variables: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
+    target_source: 'delta_abs'
+    use_masked_regression: true
+    masked_regression_mode: 'soft'
+    reg_mask_min: 0.05
+    ce_weight: 0.3
+    pos_weight: 1.0
+    logit_temperature: 0.25
+    use_focal: false
+    focal_weight: 0.0
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    use_dice: false
+    dice_weight: 0.0
+    dice_smooth: 1.0
   variable_weights:
     QRAIN: 1.5
     QNRAIN: 1.5

@@ -132,6 +132,26 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.dyn_ds_cache = OrderedDict()
         self._concentration_params = {var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in CONCENTRATION_VARS}
         self._concentration_level_ops = conf["data"].get("concentration_level_ops", {})
+        self._occupancy_delta_threshold = float(conf["data"].get("occupancy_delta_threshold", 1.0e-10))
+        if self._occupancy_delta_threshold <= 0.0:
+            self._occupancy_delta_threshold = 1.0e-10
+
+        raw_occ_by_var = conf["data"].get("occupancy_delta_threshold_by_var", {})
+        self._occupancy_delta_threshold_by_var = {}
+        if isinstance(raw_occ_by_var, dict):
+            for var_name, value in raw_occ_by_var.items():
+                try:
+                    value_f = float(value)
+                except Exception:
+                    continue
+                if value_f > 0.0:
+                    self._occupancy_delta_threshold_by_var[var_name] = value_f
+
+        raw_occ_vars = conf["data"].get("occupancy_variables", self.varname_prognostic)
+        if raw_occ_vars is None:
+            raw_occ_vars = []
+        self._occupancy_variables = set(raw_occ_vars)
+
         default_prog_levels = int(
             conf["data"].get(
                 "prognostic_levels",
@@ -548,6 +568,11 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         std = self._broadcast_stats_for_var(self._std_values[var_name], transformed_values, var_name)
         return (transformed_values - mean) / std
 
+    def _delta_threshold_for_var(self, var_name: str) -> float:
+        if var_name in self._occupancy_delta_threshold_by_var:
+            return float(self._occupancy_delta_threshold_by_var[var_name])
+        return float(self._occupancy_delta_threshold)
+
     # ------------------------------------------------------------------ #
     # Lazy dataset opening (called per DataLoader worker)
     # ------------------------------------------------------------------ #
@@ -798,6 +823,9 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         # ================================================================ #
         x_prog_list = []
         y_incr_list = []
+        y_occ_list = []
+        y_reg_mask_hard_list = []
+        y_occ_delta_thr_norm_list = []
         for var in self.varname_prognostic:
             raw_t0 = chunk[var].isel(time=0).values
             raw_t1 = chunk[var].isel(time=1).values
@@ -808,9 +836,30 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             x_prog_list.append(norm_t0)          # (level, H, W)
             y_incr_list.append(norm_t1 - norm_t0)  # increment in normalized space
 
+            delta_raw = reduced_t1 - reduced_t0
+            delta_threshold = self._delta_threshold_for_var(var)
+            if var in self._occupancy_variables:
+                y_occ = (np.abs(delta_raw) >= delta_threshold).astype(np.float32, copy=False)
+            else:
+                y_occ = np.zeros_like(delta_raw, dtype=np.float32)
+            y_occ_list.append(y_occ)
+            y_reg_mask_hard_list.append(y_occ.copy())
+
+            std = self._broadcast_stats_for_var(self._std_values[var], reduced_t0, var)
+            delta_thr_norm = np.asarray(delta_threshold / std, dtype=np.float32)
+            if delta_thr_norm.ndim == 0:
+                n_levels = reduced_t0.shape[0] if np.asarray(reduced_t0).ndim > 0 else 1
+                delta_thr_norm = np.full((n_levels, 1, 1), float(delta_thr_norm), dtype=np.float32)
+            elif delta_thr_norm.ndim == 1:
+                delta_thr_norm = delta_thr_norm[:, np.newaxis, np.newaxis]
+            y_occ_delta_thr_norm_list.append(delta_thr_norm)
+
         # (time=1, num_prog_vars, level, H, W)
         x_prog = np.stack(x_prog_list, axis=0)[np.newaxis, ...]
         y_incr = np.stack(y_incr_list, axis=0)[np.newaxis, ...]
+        y_occ = np.stack(y_occ_list, axis=0)[np.newaxis, ...]
+        y_reg_mask_hard = np.stack(y_reg_mask_hard_list, axis=0)[np.newaxis, ...]
+        y_occ_delta_thr_norm = np.stack(y_occ_delta_thr_norm_list, axis=0)[np.newaxis, ...]
 
         # ================================================================ #
         # 2. Context 3D variables (input-only, flattened)
@@ -876,6 +925,9 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             "x_forcing_static": torch.as_tensor(forcing_static, dtype=self.output_dtype),
             "x_boundary": torch.as_tensor(x_boundary, dtype=self.output_dtype),
             "y": torch.as_tensor(y_incr, dtype=self.output_dtype),
+            "y_occupancy": torch.as_tensor(y_occ, dtype=self.output_dtype),
+            "y_regression_mask_hard": torch.as_tensor(y_reg_mask_hard, dtype=self.output_dtype),
+            "y_occ_delta_threshold_norm": torch.as_tensor(y_occ_delta_thr_norm, dtype=self.output_dtype),
             "x_time_encode": torch.as_tensor(time_encode, dtype=self.output_dtype),
             "index": index,
         }

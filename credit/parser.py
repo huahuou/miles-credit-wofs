@@ -394,6 +394,40 @@ def credit_main_parser(conf, parse_training=True, parse_predict=True, print_summ
         if "sst_forcing" not in conf["data"]:
             conf["data"]["sst_forcing"] = {"activate": False}
 
+        # occupancy defaults for DA increment training
+        if "occupancy_variables" not in conf["data"] or conf["data"]["occupancy_variables"] is None:
+            conf["data"]["occupancy_variables"] = list(conf["data"]["variables"])
+        else:
+            conf["data"]["occupancy_variables"] = list(conf["data"]["occupancy_variables"])
+
+        var_set = set(conf["data"]["variables"])
+        invalid_occ_vars = [var_name for var_name in conf["data"]["occupancy_variables"] if var_name not in var_set]
+        assert len(invalid_occ_vars) == 0, (
+            "occupancy_variables must be a subset of data.variables; invalid entries: {}".format(invalid_occ_vars)
+        )
+
+        conf["data"].setdefault("occupancy_delta_threshold", 1.0e-10)
+        if conf["data"]["occupancy_delta_threshold"] is None:
+            conf["data"]["occupancy_delta_threshold"] = 1.0e-10
+        conf["data"]["occupancy_delta_threshold"] = float(conf["data"]["occupancy_delta_threshold"])
+        if conf["data"]["occupancy_delta_threshold"] <= 0.0:
+            conf["data"]["occupancy_delta_threshold"] = 1.0e-10
+
+        conf["data"].setdefault("occupancy_delta_threshold_by_var", {})
+        if conf["data"]["occupancy_delta_threshold_by_var"] is None:
+            conf["data"]["occupancy_delta_threshold_by_var"] = {}
+        assert isinstance(conf["data"]["occupancy_delta_threshold_by_var"], dict), (
+            "data.occupancy_delta_threshold_by_var must be a dict"
+        )
+        for key, value in conf["data"]["occupancy_delta_threshold_by_var"].items():
+            assert key in var_set, "data.occupancy_delta_threshold_by_var key '{}' is not in data.variables".format(key)
+            assert float(value) > 0.0, "data.occupancy_delta_threshold_by_var value for '{}' must be > 0".format(key)
+
+        conf["data"].setdefault("occupancy_target_source", "delta_abs")
+        assert conf["data"]["occupancy_target_source"] in ["delta_abs"], (
+            "data.occupancy_target_source currently supports 'delta_abs' only"
+        )
+
         # end old-style conf['data'] check
         # ===========================================#
 
@@ -989,6 +1023,49 @@ def credit_main_parser(conf, parse_training=True, parse_predict=True, print_summ
 
                 if "spectral_wavenum_init" not in conf["loss"]:
                     conf["loss"]["spectral_wavenum_init"] = 20
+
+            occ_loss = conf["loss"].setdefault("occupancy", {})
+            occ_loss.setdefault("enabled", False)
+            occ_loss.setdefault("delta_threshold", conf["data"].get("occupancy_delta_threshold", 1.0e-10))
+            occ_loss.setdefault("delta_threshold_by_var", conf["data"].get("occupancy_delta_threshold_by_var", {}))
+            occ_loss.setdefault("variables", list(conf["data"].get("occupancy_variables", conf["data"]["variables"])))
+            occ_loss.setdefault("target_source", conf["data"].get("occupancy_target_source", "delta_abs"))
+            occ_loss.setdefault("use_masked_regression", True)
+            occ_loss.setdefault("masked_regression_mode", "soft")
+            occ_loss.setdefault("reg_mask_min", 0.05)
+            occ_loss.setdefault("ce_weight", 0.2)
+            occ_loss.setdefault("pos_weight", 4.0)
+            occ_loss.setdefault("logit_temperature", 0.25)
+            occ_loss.setdefault("use_focal", False)
+            occ_loss.setdefault("focal_weight", 0.0)
+            occ_loss.setdefault("focal_alpha", 0.25)
+            occ_loss.setdefault("focal_gamma", 2.0)
+            occ_loss.setdefault("use_dice", False)
+            occ_loss.setdefault("dice_weight", 0.0)
+            occ_loss.setdefault("dice_smooth", 1.0)
+
+            occ_vars = set(conf["data"]["variables"])
+            invalid_occ_loss_vars = [var_name for var_name in occ_loss["variables"] if var_name not in occ_vars]
+            assert len(invalid_occ_loss_vars) == 0, (
+                "loss.occupancy.variables must be a subset of data.variables; invalid entries: {}".format(
+                    invalid_occ_loss_vars
+                )
+            )
+            assert occ_loss["target_source"] in ["delta_abs"], "loss.occupancy.target_source must be 'delta_abs'"
+            assert occ_loss["masked_regression_mode"] in ["soft", "hard"], (
+                "loss.occupancy.masked_regression_mode must be 'soft' or 'hard'"
+            )
+            assert isinstance(occ_loss["delta_threshold_by_var"], dict), (
+                "loss.occupancy.delta_threshold_by_var must be a dict"
+            )
+            for key, value in occ_loss["delta_threshold_by_var"].items():
+                assert key in occ_vars, "loss.occupancy.delta_threshold_by_var key '{}' is not in data.variables".format(key)
+                assert float(value) > 0.0, (
+                    "loss.occupancy.delta_threshold_by_var value for '{}' must be > 0".format(key)
+                )
+            assert float(occ_loss["delta_threshold"]) > 0.0, "loss.occupancy.delta_threshold must be > 0"
+            assert float(occ_loss["logit_temperature"]) > 0.0, "loss.occupancy.logit_temperature must be > 0"
+            assert float(occ_loss["ce_weight"]) >= 0.0, "loss.occupancy.ce_weight must be >= 0"
 
     # --------------------------------------------------------- #
     # conf['parse_predict'] section

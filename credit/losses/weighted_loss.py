@@ -2,6 +2,7 @@ import torch
 import xarray as xr
 import numpy as np
 import logging
+import torch.nn.functional as F
 
 from credit.losses.base_losses import base_losses
 from credit.losses.spectral import SpectralLoss2D
@@ -9,6 +10,39 @@ from credit.losses.power import PSDLoss
 
 
 logger = logging.getLogger(__name__)
+
+
+def binary_focal_with_logits(logits, target, alpha=0.25, gamma=2.0, mask=None):
+    """Binary focal loss on logits with optional element-wise mask."""
+    target = target.to(dtype=logits.dtype)
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    probs = torch.sigmoid(logits)
+    p_t = probs * target + (1.0 - probs) * (1.0 - target)
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    loss = alpha_t * torch.pow(1.0 - p_t, gamma) * bce
+
+    if mask is not None:
+        mask = mask.to(dtype=loss.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (loss * mask).sum() / denom
+
+    return loss.mean()
+
+
+def soft_dice_loss_from_logits(logits, target, smooth=1.0, mask=None):
+    """Soft dice loss on logits with optional element-wise mask."""
+    target = target.to(dtype=logits.dtype)
+    probs = torch.sigmoid(logits)
+
+    if mask is not None:
+        mask = mask.to(dtype=probs.dtype)
+        probs = probs * mask
+        target = target * mask
+
+    intersection = (probs * target).sum()
+    denom = probs.sum() + target.sum()
+    dice = (2.0 * intersection + smooth) / (denom + smooth)
+    return 1.0 - dice
 
 
 def latitude_weights(conf):
@@ -195,7 +229,7 @@ class VariableTotalLoss2D(torch.nn.Module):
         else:
             self.loss_fn = base_losses(conf, reduction="none", validation=False)
 
-    def forward(self, target, pred):
+    def forward(self, target, pred, mask=None):
         """Calculate the total loss for the given target and prediction.
 
         This method computes the base loss between the target and prediction,
@@ -217,14 +251,28 @@ class VariableTotalLoss2D(torch.nn.Module):
         loss_dict = {}
         for i, var in enumerate(self.vars):
             var_loss = loss[:, i]
+            weight_map = None
+            if mask is not None:
+                weight_map = mask[:, i].to(target.device, dtype=var_loss.dtype)
+                var_loss = var_loss * weight_map
 
             if self.lat_weights is not None:
-                var_loss = torch.mul(var_loss, self.lat_weights.to(target.device))
+                lat_weights = self.lat_weights.to(target.device)
+                var_loss = torch.mul(var_loss, lat_weights)
+                if weight_map is not None:
+                    weight_map = torch.mul(weight_map, lat_weights)
 
             if self.var_weights is not None:
-                var_loss *= self.var_weights[i].to(target.device)
+                var_weight = self.var_weights[i].to(target.device)
+                var_loss *= var_weight
+                if weight_map is not None:
+                    weight_map = weight_map * var_weight
 
-            loss_dict[f"loss_{var}"] = var_loss.mean()
+            if weight_map is None:
+                loss_dict[f"loss_{var}"] = var_loss.mean()
+            else:
+                denom = weight_map.sum().clamp_min(1.0)
+                loss_dict[f"loss_{var}"] = var_loss.sum() / denom
 
         loss = torch.mean(torch.stack(list(loss_dict.values())))
 
