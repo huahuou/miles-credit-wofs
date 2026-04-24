@@ -251,28 +251,28 @@ class VariableTotalLoss2D(torch.nn.Module):
         loss_dict = {}
         for i, var in enumerate(self.vars):
             var_loss = loss[:, i]
-            weight_map = None
+            norm_map = None
             if mask is not None:
-                weight_map = mask[:, i].to(target.device, dtype=var_loss.dtype)
-                var_loss = var_loss * weight_map
+                norm_map = mask[:, i].to(target.device, dtype=var_loss.dtype)
+                var_loss = var_loss * norm_map
 
             if self.lat_weights is not None:
                 lat_weights = self.lat_weights.to(target.device)
                 var_loss = torch.mul(var_loss, lat_weights)
-                if weight_map is not None:
-                    weight_map = torch.mul(weight_map, lat_weights)
+                if norm_map is not None:
+                    norm_map = torch.mul(norm_map, lat_weights)
+
+            if norm_map is None:
+                var_loss = var_loss.mean()
+            else:
+                denom = norm_map.sum().clamp_min(1.0)
+                var_loss = var_loss.sum() / denom
 
             if self.var_weights is not None:
                 var_weight = self.var_weights[i].to(target.device)
-                var_loss *= var_weight
-                if weight_map is not None:
-                    weight_map = weight_map * var_weight
+                var_loss = var_loss * var_weight
 
-            if weight_map is None:
-                loss_dict[f"loss_{var}"] = var_loss.mean()
-            else:
-                denom = weight_map.sum().clamp_min(1.0)
-                loss_dict[f"loss_{var}"] = var_loss.sum() / denom
+            loss_dict[f"loss_{var}"] = var_loss
 
         loss = torch.mean(torch.stack(list(loss_dict.values())))
 
