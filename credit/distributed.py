@@ -229,7 +229,13 @@ def distributed_model_wrapper(conf, neural_network, device):
         )
 
     elif conf["trainer"]["mode"] == "ddp":
-        model = DDP(neural_network, device_ids=[device], find_unused_parameters=True)
+        ddp_find_unused_parameters = bool(conf["trainer"].get("ddp_find_unused_parameters", True))
+        logging.info(f"DDP find_unused_parameters={ddp_find_unused_parameters}")
+        model = DDP(
+            neural_network,
+            device_ids=[device],
+            find_unused_parameters=ddp_find_unused_parameters,
+        )
 
     else:
         model = neural_network

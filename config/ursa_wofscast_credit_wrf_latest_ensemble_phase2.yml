@@ -82,7 +82,8 @@ model:
     latent_dim: 128
     flow_hidden_div: 4
     spatial_noise_init: 0.01
-    step_scale_init: 0.1
+    max_noise_scale_init: 0.8
+    growth_rate_init: 0.04
     sample_latent_if_none: True
     freeze_base_model_weights: False
 
@@ -93,6 +94,7 @@ trainer:
   valid_batch_size: 2
   ensemble_size: 2
   distributed_ensemble: True
+  ddp_find_unused_parameters: False
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
   thread_workers: 8

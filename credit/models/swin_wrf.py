@@ -222,7 +222,8 @@ class UpBlock(nn.Module):
 
 
 class FlowDependentNoiseInjection(nn.Module):
-    """StyleGAN-like noise injection with a flow-dependent spatial modulation mask."""
+    """StyleGAN-like noise injection with a flow-dependent spatial modulation mask,
+    using Tanh saturation for mesoscale autoregressive stability."""
 
     def __init__(
         self,
@@ -230,39 +231,56 @@ class FlowDependentNoiseInjection(nn.Module):
         latent_dim: int = 128,
         flow_hidden_div: int = 4,
         spatial_noise_init: float = 0.01,
-        step_scale_init: float = 0.1,
+        max_noise_scale_init: float = 0.8,
+        growth_rate_init: float = 0.04,
     ):
         super().__init__()
         self.dim = dim
         self.latent_dim = latent_dim
         hidden_dim = max(1, dim // max(1, flow_hidden_div))
 
+        # 1. Global latent style mapping
         self.style_mlp = nn.Sequential(
             nn.Linear(latent_dim, dim),
             nn.SiLU(),
             nn.Linear(dim, dim * 2),
         )
 
+        # 2. Flow-dependent spatial mask generator
         self.flow_modulator = nn.Sequential(
             nn.Conv2d(dim, hidden_dim, kernel_size=3, padding=1),
             nn.SiLU(),
             nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1),
-            nn.Softplus(),
+            nn.Softplus(),  # Ensures mask is positive
         )
 
+        # 3. Learnable Noise Scaling Parameters
         self.spatial_noise_weight = nn.Parameter(torch.ones(1) * float(spatial_noise_init))
-        self.step_scale_param = nn.Parameter(torch.ones(1) * float(step_scale_init))
+        self.max_noise_scale = nn.Parameter(torch.ones(1) * float(max_noise_scale_init))
+        self.growth_rate = nn.Parameter(torch.ones(1) * float(growth_rate_init))
 
     def forward(self, x: torch.Tensor, latent_z: torch.Tensor | None = None, step: int = 0) -> torch.Tensor:
         batch_size, channels, height, width = x.shape
-
+        
+        # Ensure parameters stay strictly positive during optimization
+        growth_rate = F.softplus(self.growth_rate)
+        max_noise_scale = F.softplus(self.max_noise_scale)
+        
+        # Calculate Tanh saturation curve
+        step_tensor = torch.tensor(float(step), device=x.device, dtype=x.dtype)
+        saturation_curve = torch.tanh(step_tensor * growth_rate)
+        
+        # Step factor asymptotes to (1.0 + max_noise_scale)
+        step_factor = 1.0 + (max_noise_scale * saturation_curve)
+        
+        # Generate spatial mask and raw Gaussian noise
         flow_mask = self.flow_modulator(x)
         raw_noise = torch.randn(batch_size, 1, height, width, device=x.device, dtype=x.dtype)
 
-        step_scale = F.softplus(self.step_scale_param)
-        step_factor = 1.0 + step_scale * float(step)
+        # Inject the dynamically scaled noise
         x = x + raw_noise * flow_mask * self.spatial_noise_weight * step_factor
 
+        # Apply global latent style modulation
         if latent_z is not None:
             latent_z = latent_z.to(device=x.device, dtype=x.dtype)
             style = self.style_mlp(latent_z)
@@ -562,7 +580,10 @@ class WRFTransformer(BaseModel):
                 latent_dim=int(noise_conf.get("latent_dim", 128)),
                 flow_hidden_div=int(noise_conf.get("flow_hidden_div", 4)),
                 spatial_noise_init=float(noise_conf.get("spatial_noise_init", 0.01)),
-                step_scale_init=float(noise_conf.get("step_scale_init", 0.1)),
+                max_noise_scale_init=float(
+                    noise_conf.get("max_noise_scale_init", noise_conf.get("step_scale_init", 0.1))
+                ),
+                growth_rate_init=float(noise_conf.get("growth_rate_init", 0.04)),
             )
             logger.info("Flow-dependent noise injection is active for WRFTransformer")
             if self.freeze_base_model_weights:

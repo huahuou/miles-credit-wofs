@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/Zhanxiang.Hua/credit_runs/wofs_wrf_experiment_multi_0422_ensemble'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/Zhanxiang.Hua/credit_runs/wofs_wrf_experiment_multi_0424_ensemble'
 seed: 1000
 
 data:
@@ -22,7 +22,7 @@ data:
   train_years: [2019,2020]
   valid_years: [2021]
 
-  train_date_range: ['20190101', '20201231']
+  train_date_range: ['20190101', '20191231']
   valid_date_range: ['20210402', '20210515']
 
   history_len: 1
@@ -82,7 +82,8 @@ model:
     latent_dim: 128
     flow_hidden_div: 4
     spatial_noise_init: 0.01
-    step_scale_init: 0.1
+    max_noise_scale_init: 0.8
+    growth_rate_init: 0.04
     sample_latent_if_none: True
     freeze_base_model_weights: False
 
@@ -93,6 +94,7 @@ trainer:
   valid_batch_size: 2
   ensemble_size: 4
   distributed_ensemble: False
+  ddp_find_unused_parameters: False
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
   thread_workers: 8
@@ -111,7 +113,7 @@ trainer:
   load_scaler: False
   skip_validation: True
   use_scheduler: True
-  reload_epoch: True
+  reload_epoch: False
   epochs: &epochs 100
   scheduler:
     scheduler_type: cosine-annealing-restarts

@@ -200,17 +200,27 @@ def load_model_states_and_optimizer(conf, model, device):
             if load_weights:
                 checkpoint_io.load_unsharded_model(model, os.path.join(save_loc, "model_checkpoint.pt"))
             if load_optimizer_conf:
-                checkpoint_io.load_unsharded_optimizer(optimizer, os.path.join(save_loc, "optimizer_checkpoint.pt"))
+                try:
+                    checkpoint_io.load_unsharded_optimizer(optimizer, os.path.join(save_loc, "optimizer_checkpoint.pt"))
+                except Exception as exc:
+                    logging.warning(
+                        "Skipping FSDP optimizer state reload due to mismatch with current model parameters: %s", exc
+                    )
+                    load_optimizer_conf = False
+                    load_scheduler_conf = False
+                    load_scaler_conf = False
         else:
             # DDP settings
             if conf["trainer"]["mode"] == "ddp":
                 logging.info(f"Loading DDP {checkpoint_states_msg} from {save_loc}")
                 if load_weights:
-                    model.module.load_state_dict(checkpoint["model_state_dict"])
+                    load_msg = model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                    load_state_dict_error_handler(load_msg)
             else:
                 logging.info(f"Loading single-GPU {checkpoint_states_msg} from {save_loc}")
                 if load_weights:
-                    model.load_state_dict(checkpoint["model_state_dict"])
+                    load_msg = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                    load_state_dict_error_handler(load_msg)
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=learning_rate,
@@ -218,7 +228,15 @@ def load_model_states_and_optimizer(conf, model, device):
                 betas=(0.9, 0.95),
             )
             if load_optimizer_conf:
-                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                try:
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                except ValueError as exc:
+                    logging.warning(
+                        "Skipping optimizer state reload due to mismatch with current model parameters: %s", exc
+                    )
+                    load_optimizer_conf = False
+                    load_scheduler_conf = False
+                    load_scaler_conf = False
 
         scheduler = load_scheduler(optimizer, conf)
         scaler = ShardedGradScaler(enabled=amp) if conf["trainer"]["mode"] == "fsdp" else GradScaler(enabled=amp)

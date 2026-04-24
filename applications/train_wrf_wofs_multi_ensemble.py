@@ -354,9 +354,23 @@ def primary_main():
         noise_conf.setdefault("latent_dim", 128)
         noise_conf.setdefault("flow_hidden_div", 4)
         noise_conf.setdefault("spatial_noise_init", 0.01)
-        noise_conf.setdefault("step_scale_init", 0.1)
+        noise_conf.setdefault("max_noise_scale_init", 0.8)
+        noise_conf.setdefault("growth_rate_init", 0.04)
         noise_conf.setdefault("sample_latent_if_none", True)
         noise_conf.setdefault("freeze_base_model_weights", False)
+
+    # DDP safety: unfrozen ensemble model can have rank-wise unused params in some steps.
+    # Keep find_unused_parameters=True unless the user is running noise-only fine-tuning.
+    if conf.get("trainer", {}).get("mode") == "ddp":
+        conf.setdefault("trainer", {})
+        freeze_base = bool(conf.get("model", {}).get("noise_injection", {}).get("freeze_base_model_weights", False))
+        conf["trainer"].setdefault("ddp_find_unused_parameters", not freeze_base)
+        if (not freeze_base) and (conf["trainer"].get("ddp_find_unused_parameters") is False):
+            logging.warning(
+                "Overriding trainer.ddp_find_unused_parameters=False to True because "
+                "noise_injection.freeze_base_model_weights=False can leave parameters unused in DDP iterations."
+            )
+            conf["trainer"]["ddp_find_unused_parameters"] = True
 
     conf = credit_main_parser(conf, parse_training=True, parse_predict=False, print_summary=False)
 

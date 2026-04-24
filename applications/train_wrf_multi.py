@@ -30,7 +30,11 @@ from credit.parser import credit_main_parser
 from credit.metrics import LatWeightedMetrics
 from credit.pbs import launch_script, launch_script_mpi
 from credit.models import load_model
-from credit.models.checkpoint import FSDPOptimizerWrapper, TorchFSDPCheckpointIO
+from credit.models.checkpoint import (
+    FSDPOptimizerWrapper,
+    TorchFSDPCheckpointIO,
+    load_state_dict_error_handler,
+)
 
 
 warnings.filterwarnings("ignore")
@@ -154,10 +158,12 @@ def load_model_states_and_optimizer(conf, model, device):
             checkpoint = torch.load(ckpt, map_location=device)
             if conf["trainer"]["mode"] == "ddp":
                 logging.info(f"Loading DDP model from {save_loc}")
-                model.module.load_state_dict(checkpoint["model_state_dict"])
+                load_msg = model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                load_state_dict_error_handler(load_msg)
             else:
                 logging.info(f"Loading single-GPU model from {save_loc}")
-                model.load_state_dict(checkpoint["model_state_dict"])
+                load_msg = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                load_state_dict_error_handler(load_msg)
 
         # Load the learning rate scheduler and mixed precision grad scaler
         scheduler = load_scheduler(optimizer, conf)
@@ -203,12 +209,14 @@ def load_model_states_and_optimizer(conf, model, device):
             if conf["trainer"]["mode"] == "ddp":
                 logging.info(f"Loading DDP {checkpoint_states_msg} from {save_loc}")
                 if load_weights:
-                    model.module.load_state_dict(checkpoint["model_state_dict"])
+                    load_msg = model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                    load_state_dict_error_handler(load_msg)
 
             else:
                 logging.info(f"Loading single-GPU {checkpoint_states_msg} from {save_loc}")
                 if load_weights:
-                    model.load_state_dict(checkpoint["model_state_dict"])
+                    load_msg = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                    load_state_dict_error_handler(load_msg)
 
             optimizer = torch.optim.AdamW(
                 model.parameters(),
