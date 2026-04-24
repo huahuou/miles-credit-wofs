@@ -12,6 +12,7 @@ from credit.trainers.trainer_om4_samudra import Trainer as TrainerSamudra
 from credit.trainers.trainerLES import Trainer as TrainerLES
 from credit.trainers.trainerWRF import Trainer as TrainerWRF
 from credit.trainers.trainerWRF_multi import Trainer as TrainerWRFMulti
+from credit.trainers.trainerWRF_multi_ensemble import Trainer as TrainerWRFMultiEnsemble
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ trainer_types = {
     "standard-les": (TrainerLES, "Loading a single-step LES trainer"),
     "standard-wrf": (TrainerWRF, "Loading a single-step WRF trainer"),
     "multi-step-wrf": (TrainerWRFMulti, "Loading a multi-step WRF trainer"),
+    "multi-step-wrf-ensemble": (
+        TrainerWRFMultiEnsemble,
+        "Loading a multi-step WRF ensemble trainer for KCRPS/almost-fair-crps training.",
+    ),
     "samudra": (
         TrainerSamudra,
         "Loading a single or multi-step trainer for the Samudra OM4 dataset that uses gradient accumulation on forecast lengths > 1.",

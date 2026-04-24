@@ -221,6 +221,59 @@ class UpBlock(nn.Module):
         return x + self.b(x)
 
 
+class FlowDependentNoiseInjection(nn.Module):
+    """StyleGAN-like noise injection with a flow-dependent spatial modulation mask."""
+
+    def __init__(
+        self,
+        dim: int,
+        latent_dim: int = 128,
+        flow_hidden_div: int = 4,
+        spatial_noise_init: float = 0.01,
+        step_scale_init: float = 0.1,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.latent_dim = latent_dim
+        hidden_dim = max(1, dim // max(1, flow_hidden_div))
+
+        self.style_mlp = nn.Sequential(
+            nn.Linear(latent_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim * 2),
+        )
+
+        self.flow_modulator = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1),
+            nn.Softplus(),
+        )
+
+        self.spatial_noise_weight = nn.Parameter(torch.ones(1) * float(spatial_noise_init))
+        self.step_scale_param = nn.Parameter(torch.ones(1) * float(step_scale_init))
+
+    def forward(self, x: torch.Tensor, latent_z: torch.Tensor | None = None, step: int = 0) -> torch.Tensor:
+        batch_size, channels, height, width = x.shape
+
+        flow_mask = self.flow_modulator(x)
+        raw_noise = torch.randn(batch_size, 1, height, width, device=x.device, dtype=x.dtype)
+
+        step_scale = F.softplus(self.step_scale_param)
+        step_factor = 1.0 + step_scale * float(step)
+        x = x + raw_noise * flow_mask * self.spatial_noise_weight * step_factor
+
+        if latent_z is not None:
+            latent_z = latent_z.to(device=x.device, dtype=x.dtype)
+            style = self.style_mlp(latent_z)
+            gamma, beta = style.chunk(2, dim=1)
+            gamma = gamma.view(batch_size, channels, 1, 1)
+            beta = beta.view(batch_size, channels, 1, 1)
+            x = x * (1 + gamma) + beta
+
+        return x
+
+
 # ---------------------------------------------------------------------------
 # UTransformer  – FIX 2: dynamic padding and dynamic_mask=True
 # ---------------------------------------------------------------------------
@@ -499,6 +552,28 @@ class WRFTransformer(BaseModel):
         # ── FiLM conditioning ─────────────────────────────────────────────
         self.film = nn.Linear(self.time_encode, 2 * self.total_dim)
 
+        noise_conf = kwargs.get("noise_injection", {}) or {}
+        self.use_flow_dependent_noise = bool(noise_conf.get("activate", False))
+        self.sample_latent_if_none = bool(noise_conf.get("sample_latent_if_none", True))
+        self.freeze_base_model_weights = bool(noise_conf.get("freeze_base_model_weights", False))
+        if self.use_flow_dependent_noise:
+            self.flow_noise = FlowDependentNoiseInjection(
+                dim=self.total_dim,
+                latent_dim=int(noise_conf.get("latent_dim", 128)),
+                flow_hidden_div=int(noise_conf.get("flow_hidden_div", 4)),
+                spatial_noise_init=float(noise_conf.get("spatial_noise_init", 0.01)),
+                step_scale_init=float(noise_conf.get("step_scale_init", 0.1)),
+            )
+            logger.info("Flow-dependent noise injection is active for WRFTransformer")
+            if self.freeze_base_model_weights:
+                for param in self.parameters():
+                    param.requires_grad = False
+                for param in self.flow_noise.parameters():
+                    param.requires_grad = True
+                logger.info("Base model weights are frozen; training noise injection layers only")
+        else:
+            self.flow_noise = None
+
     # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
@@ -508,6 +583,9 @@ class WRFTransformer(BaseModel):
         x: torch.Tensor,          # (B, Vars, T, Lat, Lon)  – interior
         x_outside: torch.Tensor,  # (B, Vars, T, Lat, Lon)  – exterior
         x_extra: torch.Tensor,    # (B, time_encode_dim)
+        latent_z: torch.Tensor | None = None,
+        forecast_step: int = 0,
+        ensemble_size: int = 1,
     ) -> torch.Tensor:
 
         # ── optional post-block bookkeeping ───────────────────────────────
@@ -541,6 +619,11 @@ class WRFTransformer(BaseModel):
         x_outside = alpha * x_outside + beta
 
         x = x + x_outside                                     # (B, dim, Lat_p, Lon_p)
+
+        if self.use_flow_dependent_noise and ensemble_size > 1:
+            if latent_z is None and self.sample_latent_if_none:
+                latent_z = torch.randn(B, self.flow_noise.latent_dim, device=x.device, dtype=x.dtype)
+            x = self.flow_noise(x, latent_z=latent_z, step=forecast_step)
 
         # ── U-Transformer (dynamic padding/crop inside) ───────────────────
         x = self.u_transformer(x)                             # (B, dim, Lat_p, Lon_p)
