@@ -39,8 +39,9 @@ TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 CONDA_ENV="credit-wofs"                       # Name or path of your conda environment
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
 # CONFIG="${PROJECT_DIR}/config/ursa_wofscast_credit_wrf_latest.yml"
-CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_wrf_experiment_multi_0417/model.yml"  # Path to your YAML config file
-TRAINING_SCRIPT="applications/train_wrf_wofs_multi_ensemble.py"   # Multi-step WoFS trainer
+CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_wrf_experiment_multi_0417_determistic/model.yml"  # Path to your YAML config file
+# TRAINING_SCRIPT="applications/train_wrf_wofs_multi_ensemble.py"   # Multi-step WoFS trainer
+TRAINING_SCRIPT="applications/train_wrf_wofs_multi.py"   # Multi-step WoFS trainer
 # For single-step training, use: TRAINING_SCRIPT="applications/train_wrf_wofs.py"
 
 #----- Load Modules ------------------------------------------------------------
