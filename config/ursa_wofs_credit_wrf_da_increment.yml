@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0424_debug'
 seed: 1000
 
 data:
@@ -124,7 +124,7 @@ model:
 
 trainer:
   type: 'standard-wrf'
-  mode: 'ddp'
+  mode: 'none'
   use_file_locality_sampler: True
   sync_batch_barrier: False
   no_hang_debug: False

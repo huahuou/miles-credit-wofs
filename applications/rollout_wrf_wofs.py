@@ -4,6 +4,7 @@ import copy
 import logging
 import os
 import re
+import shutil
 import warnings
 from argparse import ArgumentParser
 from datetime import datetime
@@ -17,7 +18,7 @@ import xarray as xr
 import yaml
 from pandas.errors import EmptyDataError
 
-from credit.data import concat_and_reshape, reshape_only
+from credit.data import concat_and_reshape, drop_var_from_dataset, reshape_only
 from credit.datasets.wrf_wofs_singlestep import WoFSSingleStepDataset
 from credit.distributed import distributed_model_wrapper, get_rank_info, setup
 from credit.metrics import LatWeightedMetrics
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_case_date(file_path: str) -> str | None:
-    match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr$", Path(file_path).name)
+    match = re.search(r"wofs_(\d{8})_\d{4}_mem\d+\.zarr(?:\.zip)?$", Path(file_path).name)
     return match.group(1) if match else None
 
 
@@ -61,7 +62,11 @@ def _expand_anchor_dataset(dataset: xr.Dataset, boundary_seq_len: int) -> xr.Dat
     return repeated
 
 
-def _build_case_dataset(case_path: str, conf: dict) -> WoFSSingleStepDataset:
+def _build_case_dataset(
+    case_path: str,
+    conf: dict,
+    transform: NormalizeWRF | None = None,
+) -> WoFSSingleStepDataset:
     param_interior = {
         "varname_upper_air": conf["data"]["variables"],
         "varname_surface": conf["data"]["surface_variables"],
@@ -85,7 +90,7 @@ def _build_case_dataset(case_path: str, conf: dict) -> WoFSSingleStepDataset:
         "forecast_len": conf["data"]["boundary"]["forecast_len"],
     }
 
-    return WoFSSingleStepDataset(param_interior, param_outside, transform=None, seed=conf["seed"])
+    return WoFSSingleStepDataset(param_interior, param_outside, transform=transform, seed=conf["seed"])
 
 
 def _distributed_conf(conf: dict) -> dict:
@@ -194,18 +199,75 @@ def _apply_residual_prediction(
 
 
 def _case_name(case_path: str) -> str:
+    name = Path(case_path).name
+    if name.endswith(".zarr.zip"):
+        return name[:-4]
+    if name.endswith(".zarr"):
+        return name
     return Path(case_path).stem
 
 
+def _resolve_rollout_start_index(conf: dict) -> int:
+    history_len = int(conf["data"]["history_len"])
+    target_start_step = int(conf["data"].get("target_start_step", history_len))
+    if target_start_step < 0:
+        raise ValueError("data.target_start_step must be >= 0")
+    return max(0, target_start_step - history_len)
+
+
+def _lead_step_from_sample_index(sample_index: int, history_len: int) -> int:
+    # sample_index points to the first input frame in the rolling window.
+    # The model target is at sample_index + history_len.
+    return sample_index + history_len
+
+
+def _prediction_to_dataset(
+    y_pred_denorm: torch.Tensor,
+    valid_time: datetime,
+    y_coord,
+    x_coord,
+    conf: dict,
+) -> xr.Dataset:
+    darray_upper_air, darray_single_level = make_xarray(y_pred_denorm, valid_time, y_coord, x_coord, conf)
+    ds_upper = darray_upper_air.to_dataset(dim="vars")
+    if darray_single_level is None:
+        return ds_upper
+    ds_single = darray_single_level.to_dataset(dim="vars")
+    return xr.merge([ds_upper, ds_single])
+
+
+def _apply_metadata(ds: xr.Dataset, meta_data: dict | bool) -> xr.Dataset:
+    if meta_data is False:
+        return ds
+
+    for var in ds.variables:
+        if var in meta_data and var != "time":
+            ds[var].attrs.update(meta_data[var])
+    return ds
+
+
+def _save_case_zarr(case_name: str, case_ds: xr.Dataset, conf: dict) -> str:
+    save_root = conf["predict"]["save_forecast"]
+    zarr_name = case_name if case_name.endswith(".zarr") else f"{case_name}.zarr"
+    zarr_path = os.path.join(save_root, zarr_name)
+
+    if os.path.isdir(zarr_path):
+        shutil.rmtree(zarr_path)
+
+    case_ds.to_zarr(zarr_path, mode="w", consolidated=True)
+    return zarr_path
+
+
 def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: torch.device) -> pd.DataFrame:
-    dataset = _build_case_dataset(case_path, conf)
     state_transformer = NormalizeWRF(conf)
+    dataset = _build_case_dataset(case_path, conf, transform=state_transformer)
     to_tensor = ToTensorWRF(conf)
     metrics = LatWeightedMetrics(conf)
     meta_data = load_metadata(conf)
 
     history_len = conf["data"]["history_len"]
-    max_steps = len(dataset)
+    start_index = _resolve_rollout_start_index(conf)
+    max_steps = max(0, len(dataset) - start_index)
     varnum_diag = len(conf["data"]["diagnostic_variables"])
     residual_prediction = conf["trainer"].get("residual_prediction", False)
     static_dim_size = (
@@ -213,20 +275,28 @@ def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: tor
         + len(conf["data"]["forcing_variables"])
         + len(conf["data"]["static_variables"])
     )
+    lead_time_periods = int(conf["data"].get("lead_time_periods", 1))
+    save_step_netcdf = bool(conf.get("predict", {}).get("save_step_netcdf", False))
 
     case_results: list[dict] = []
+    case_pred_steps: list[xr.Dataset] = []
+    case_lead_steps: list[int] = []
+    case_lead_periods: list[int] = []
     x_state = None
     case_name = _case_name(case_path)
     y_coord = None
     x_coord = None
 
     for step in range(max_steps):
-        raw_sample = dataset[step]
+        sample_index = start_index + step
+        lead_step = _lead_step_from_sample_index(sample_index, history_len)
+        lead_period = lead_step * lead_time_periods
+        raw_sample = dataset[sample_index]
         if y_coord is None or x_coord is None:
             target_ds = raw_sample["WRF_target"]
             y_coord = target_ds["y"].values if "y" in target_ds.coords else target_ds["south_north"].values
             x_coord = target_ds["x"].values if "x" in target_ds.coords else target_ds["west_east"].values
-        sample = to_tensor(state_transformer(raw_sample))
+        sample = to_tensor(raw_sample)
 
         if step == 0:
             x_model, x_boundary, x_time_encode = _sample_to_model_inputs(sample, device)
@@ -246,14 +316,26 @@ def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: tor
         y_pred_denorm = state_transformer.inverse_transform(y_pred.cpu())
         y_true_denorm = state_transformer.inverse_transform(y_true.cpu())
 
-        metrics_dict = metrics(y_pred_denorm, y_true_denorm, forecast_datetime=step + 1)
-        result_row = {"case": case_name, "forecast_step": step + 1}
+        metrics_dict = metrics(y_pred_denorm, y_true_denorm, forecast_datetime=lead_step)
+        result_row = {
+            "case": case_name,
+            "forecast_step": lead_step,
+            "forecast_period": lead_period,
+            "rollout_index": step + 1,
+            "sample_index": sample_index,
+        }
         result_row.update({k: float(v) for k, v in metrics_dict.items()})
         case_results.append(result_row)
 
         valid_time = datetime.utcfromtimestamp(int(raw_sample["WRF_target"]["time"].values[0].astype("datetime64[s]").astype(int)))
-        darray_upper_air, darray_single_level = make_xarray(y_pred_denorm, valid_time, y_coord, x_coord, conf)
-        save_netcdf_clean(darray_upper_air, darray_single_level, case_name, step + 1, meta_data, conf, use_logger=False)
+        step_ds = _prediction_to_dataset(y_pred_denorm, valid_time, y_coord, x_coord, conf)
+        case_pred_steps.append(step_ds)
+        case_lead_steps.append(lead_step)
+        case_lead_periods.append(lead_period)
+
+        if save_step_netcdf:
+            darray_upper_air, darray_single_level = make_xarray(y_pred_denorm, valid_time, y_coord, x_coord, conf)
+            save_netcdf_clean(darray_upper_air, darray_single_level, case_name, lead_step, meta_data, conf, use_logger=False)
 
         if history_len == 1:
             x_state = y_pred[:, :-varnum_diag, ...].detach().cpu() if varnum_diag > 0 else y_pred.detach().cpu()
@@ -267,6 +349,30 @@ def rollout_case(case_path: str, conf: dict, model: torch.nn.Module, device: tor
 
             new_state = y_pred[:, :-varnum_diag, ...].detach().cpu() if varnum_diag > 0 else y_pred.detach().cpu()
             x_state = torch.cat([x_detach, new_state], dim=2)
+
+    if not case_pred_steps:
+        logger.warning("No rollout steps generated for case %s", case_name)
+        return pd.DataFrame(case_results)
+
+    case_ds = xr.concat(case_pred_steps, dim="time")
+    case_ds = case_ds.assign_coords(
+        forecast_step=("time", case_lead_steps),
+        forecast_period=("time", case_lead_periods),
+    )
+    case_ds["forecast_step"] = case_ds["forecast_step"].astype("int32")
+    case_ds["forecast_period"] = case_ds["forecast_period"].astype("int32")
+
+    if "save_vars" in conf.get("predict", {}) and len(conf["predict"]["save_vars"]) > 0:
+        case_ds = drop_var_from_dataset(case_ds, conf["predict"]["save_vars"])
+
+    case_ds = _apply_metadata(case_ds, meta_data)
+    case_ds.attrs["history_len"] = history_len
+    case_ds.attrs["target_start_step"] = int(conf["data"].get("target_start_step", history_len))
+    case_ds.attrs["rollout_start_sample_index"] = start_index
+    case_ds.attrs["lead_time_periods"] = lead_time_periods
+
+    case_zarr_path = _save_case_zarr(case_name, case_ds, conf)
+    logger.info("Saved case rollout zarr to %s", case_zarr_path)
 
     return pd.DataFrame(case_results)
 
@@ -296,8 +402,10 @@ def main() -> None:
         conf = yaml.safe_load(f)
 
     conf = credit_main_parser(conf, parse_training=False, parse_predict=False, print_summary=False)
+    conf.setdefault("predict", {})
     if args.mode is not None:
-        conf.setdefault("predict", {})["mode"] = args.mode
+        conf["predict"]["mode"] = args.mode
+    conf["predict"].setdefault("mode", "ddp")
     conf["save_loc"] = os.path.expandvars(conf["save_loc"])
     conf["predict"]["save_forecast"] = os.path.expandvars(conf["predict"]["save_forecast"])
     os.makedirs(conf["predict"]["save_forecast"], exist_ok=True)

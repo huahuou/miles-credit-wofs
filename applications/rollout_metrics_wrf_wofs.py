@@ -47,7 +47,11 @@ def _select_files(glob_pattern: str, date_range: list[str] | tuple[str, str] | N
     ]
 
 
-def _build_case_dataset(case_path: str, conf: dict) -> WoFSSingleStepDataset:
+def _build_case_dataset(
+    case_path: str,
+    conf: dict,
+    transform: NormalizeWRF | None = None,
+) -> WoFSSingleStepDataset:
     param_interior = {
         "varname_upper_air": conf["data"]["variables"],
         "varname_surface": conf["data"]["surface_variables"],
@@ -71,7 +75,7 @@ def _build_case_dataset(case_path: str, conf: dict) -> WoFSSingleStepDataset:
         "forecast_len": conf["data"]["boundary"]["forecast_len"],
     }
 
-    return WoFSSingleStepDataset(param_interior, param_outside, transform=None, seed=conf["seed"])
+    return WoFSSingleStepDataset(param_interior, param_outside, transform=transform, seed=conf["seed"])
 
 
 def _distributed_conf(conf: dict) -> dict:
@@ -180,17 +184,37 @@ def _apply_residual_prediction(
 
 
 def _case_name(case_path: str) -> str:
+    name = Path(case_path).name
+    if name.endswith(".zarr.zip"):
+        return name[:-4]
+    if name.endswith(".zarr"):
+        return name
     return Path(case_path).stem
 
 
+def _resolve_rollout_start_index(conf: dict) -> int:
+    history_len = int(conf["data"]["history_len"])
+    target_start_step = int(conf["data"].get("target_start_step", history_len))
+    if target_start_step < 0:
+        raise ValueError("data.target_start_step must be >= 0")
+    return max(0, target_start_step - history_len)
+
+
+def _lead_step_from_sample_index(sample_index: int, history_len: int) -> int:
+    # sample_index points to the first input frame in the rolling window.
+    # The model target is at sample_index + history_len.
+    return sample_index + history_len
+
+
 def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, device: torch.device) -> pd.DataFrame:
-    dataset = _build_case_dataset(case_path, conf)
     state_transformer = NormalizeWRF(conf)
+    dataset = _build_case_dataset(case_path, conf, transform=state_transformer)
     to_tensor = ToTensorWRF(conf)
     metrics = LatWeightedMetrics(conf)
 
     history_len = conf["data"]["history_len"]
-    max_steps = len(dataset)
+    start_index = _resolve_rollout_start_index(conf)
+    max_steps = max(0, len(dataset) - start_index)
     varnum_diag = len(conf["data"]["diagnostic_variables"])
     residual_prediction = conf["trainer"].get("residual_prediction", False)
     static_dim_size = (
@@ -198,14 +222,18 @@ def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, dev
         + len(conf["data"]["forcing_variables"])
         + len(conf["data"]["static_variables"])
     )
+    lead_time_periods = int(conf["data"].get("lead_time_periods", 1))
 
     case_results: list[dict] = []
     x_state: torch.Tensor | None = None
     case_name = _case_name(case_path)
 
     for step in range(max_steps):
-        raw_sample = dataset[step]
-        sample = to_tensor(state_transformer(raw_sample))
+        sample_index = start_index + step
+        lead_step = _lead_step_from_sample_index(sample_index, history_len)
+        lead_period = lead_step * lead_time_periods
+        raw_sample = dataset[sample_index]
+        sample = to_tensor(raw_sample)
 
         if step == 0:
             x_model, x_boundary, x_time_encode = _sample_to_model_inputs(sample, device)
@@ -225,8 +253,14 @@ def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, dev
         y_pred_denorm = state_transformer.inverse_transform(y_pred.cpu())
         y_true_denorm = state_transformer.inverse_transform(y_true.cpu())
 
-        metrics_dict = metrics(y_pred_denorm, y_true_denorm, forecast_datetime=step + 1)
-        result_row = {"case": case_name, "forecast_step": step + 1}
+        metrics_dict = metrics(y_pred_denorm, y_true_denorm, forecast_datetime=lead_step)
+        result_row = {
+            "case": case_name,
+            "forecast_step": lead_step,
+            "forecast_period": lead_period,
+            "rollout_index": step + 1,
+            "sample_index": sample_index,
+        }
         result_row.update({k: float(v) for k, v in metrics_dict.items()})
         case_results.append(result_row)
 
@@ -307,7 +341,7 @@ def main() -> None:
 
     if args.mode is not None:
         conf["predict"]["mode"] = args.mode
-    conf["predict"].setdefault("mode", "none")
+    conf["predict"].setdefault("mode", "ddp")
 
     conf["save_loc"] = os.path.expandvars(conf["save_loc"])
     conf["predict"]["save_forecast"] = os.path.expandvars(conf["predict"]["save_forecast"])
