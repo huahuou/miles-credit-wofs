@@ -1,0 +1,227 @@
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_crossformer_wrf_det_v1'
+seed: 1000
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase-1 deterministic pre-training config for CrossFormerWRFEnsemble.
+#
+# Training strategy (two-phase):
+#   Phase 1  (this file)  — deterministic, MSE + spectral loss, no noise.
+#                           Trains the backbone to get the mean state right.
+#   Phase 2  (ensemble)   — load Phase-1 weights, freeze backbone, activate
+#                           noise injection, train with KCRPS.
+#                           Use ursa_wofscast_crossformer_wrf_ensemble.yml with
+#                             noise_injection.freeze_base_model_weights: True
+#                             trainer.load_weights: True
+# ──────────────────────────────────────────────────────────────────────────────
+
+data:
+  scaler_type: 'std-wrf'
+
+  variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
+  dynamic_forcing_variables: ['cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation']
+  diagnostic_variables: ['UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP']
+  forcing_variables: []
+  static_variables: []
+
+  save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_surface: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_dynamic_forcing: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_diagnostic: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+
+  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
+  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
+
+  train_years: [2019, 2020]
+  valid_years: [2021]
+
+  train_date_range: ['20190101', '20201231']
+  valid_date_range: ['20210402', '20210515']
+
+  history_len: 1
+  valid_history_len: 1
+  forecast_len: 2
+  valid_forecast_len: 2
+  target_start_step: 0
+  zarr_time_chunk: 4
+  lead_time_periods: 1
+  levels: 17
+  static_first: False
+
+  boundary:
+    variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+    surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+    reuse_interior_stats: True
+    levels: 17
+    history_len: 1
+    forecast_len: 0
+    all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+
+  all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+
+model:
+  type: 'crossformer_wrf_ensemble'
+
+  varname_upper_air: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  varname_surface: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
+  varname_dyn_forcing: ['cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation']
+  varname_forcing: []
+  varname_static: []
+  varname_diagnostic: ['UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP']
+
+  varname_boundary_upper: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  varname_boundary_surface: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+
+  levels: 17
+  boundary_levels: 17
+  frames: 1
+
+  embed_dim: 128
+  boundary_embed_dim: 64
+  time_encode_dim: 12
+
+  # Medium-A config: ~20.08M params (measured). Bottleneck reduced 512→384 to
+  # stay within 20M for deterministic phase-1. Compatible for weight transfer
+  # to phase-2 ensemble only if phase-2 uses the same dim (or Compact's
+  # subset — layers that don't match simply won't load via strict=False).
+  dim: [64, 128, 192, 384]
+  depth: [2, 2, 12, 2]
+  dim_head: 32
+  global_window_size: [8, 6, 4, 1]  # wider long-range window at stages 1-2; free in params
+  local_window_size: 8
+  cross_embed_kernel_sizes:
+    - [4, 8, 16, 32]
+    - [2, 4]
+    - [2, 4]
+    - [2, 4]
+  cross_embed_strides: [2, 2, 2, 2]
+  attn_dropout: 0.0
+  ff_dropout: 0.0
+
+  use_spectral_norm: True
+
+  # Noise disabled for deterministic phase-1 pre-training.
+  # For phase-2 fine-tuning: set activate: True and
+  # freeze_base_model_weights: True, then load these weights as the
+  # starting checkpoint in the ensemble config.
+  noise_injection:
+    activate: False
+    latent_dim: 128
+    noise_scales: [0.30, 0.15, 0.05, 0.01]
+    encoder_noise: True
+    correlated: False
+    sample_latent_if_none: True
+    freeze_base_model_weights: False
+
+  # ── Boundary padding ─────────────────────────────────────────────────────
+  # WoFS is a limited-area domain (LAM) — NOT globally periodic.
+  # Use mode: mirror (reflection), NOT mode: earth.
+  #   earth mode does a circular longitude wrap with a 180° pole shift,
+  #   designed for global models; it is WRONG for a CONUS subdomain where
+  #   east/west edges are not adjacent.
+  #   mirror mode reflects the field at each edge, which is physically neutral
+  #   and prevents the hard-zero-wall artifact at domain boundaries without
+  #   introducing false periodicity.
+  # pad_lon: 16 covers ~48 km east/west — enough to fill the receptive field
+  #   of the largest CrossEmbedLayer kernel (32px × 3km = 96km receptive field).
+  # Adds ~11% to H/W and therefore ~22% compute cost. Disable if memory-limited.
+  padding_conf:
+    activate: True       # set True once memory budget is confirmed
+    mode: mirror          # correct choice for LAM (not earth)
+    pad_lat: [16, 16]    # 48 km north/south
+    pad_lon: [16, 16]    # 48 km east/west
+
+trainer:
+  type: 'multi-step-wrf'    # deterministic single-member trainer
+  mode: 'ddp'
+  train_batch_size: 8
+  valid_batch_size: 8
+  distributed_ensemble: False
+  ddp_find_unused_parameters: False
+  batches_per_epoch: 0
+  valid_batches_per_epoch: 0
+  thread_workers: 8
+  valid_thread_workers: 8
+  prefetch_factor: 1
+  residual_prediction: True
+  update_learning_rate: False
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  amp: True
+  start_epoch: 0
+  load_weights: False
+  load_optimizer: False
+  load_scheduler: False
+  load_scaler: False
+  skip_validation: True
+  use_scheduler: True
+  reload_epoch: True
+  epochs: &epochs 100
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 1000
+    cycle_mult: 2.0
+    max_lr: 1.0e-03
+    min_lr: 1.0e-04
+    warmup_steps: 999
+    gamma: 0.8
+  grad_max_norm: 1.0
+  grad_accum_every: 1
+  save_backup_weights: True
+  save_best_weights: True
+  save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+
+loss:
+  latitude_weights: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0409/stats/latitude_weights_placeholder.nc'
+  use_latitude_weights: False
+  # use_variable_weights: True routes through VariableTotalLoss2D, which is the
+  # only loss wrapper that applies use_spectral_loss. Must be True to use
+  # spectral regularisation, even if you don't care about variable weights.
+  use_variable_weights: True
+  training_loss: 'mse'
+  validation_loss: 'mse'
+  variable_weights:
+    # Upper-air vars: list of 17 weights (one per eta level, surface→model-top).
+    # Rationale (3km WRF WoFS, convection-focused):
+    #   T      — boundary layer hardest to predict; taper off above ~500 hPa.
+    #   QVAPOR — moisture concentrated near surface; near-zero above ~400 hPa.
+    #   U/V    — low-level jet (~850 hPa) and storm inflow critical; upper softer.
+    #   W      — peaks at mid-troposphere (~500-300 hPa); near-zero at boundaries.
+    #   GEOPOT — smooth; mild tapering only.
+    # Tune using per-level validation MAE after first training run.
+    T:      [1.6, 1.5, 1.4, 1.3, 1.2, 1.2, 1.1, 1.1, 1.0, 1.0, 0.9, 0.9, 0.8, 0.8, 0.7, 0.7, 0.6]
+    QVAPOR: [2.2, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1, 0.1, 0.1]
+    U:      [1.4, 1.3, 1.3, 1.2, 1.2, 1.1, 1.1, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.8, 0.7, 0.7]
+    V:      [1.3, 1.2, 1.2, 1.1, 1.1, 1.1, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.8, 0.7, 0.7]
+    W:      [0.5, 0.7, 0.9, 1.1, 1.3, 1.4, 1.5, 1.6, 1.6, 1.5, 1.4, 1.3, 1.1, 0.9, 0.7, 0.6, 0.5]
+    GEOPOT: [1.0, 1.0, 1.0, 1.0, 1.1, 1.1, 1.1, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    # Surface and diagnostic vars: scalar is fine (parser passes them directly).
+    U10: 1.1
+    V10: 1.1
+    T2: 1.2
+    Q2: 1.5
+    WSPD80: 1.5
+    COMPOSITE_REFL_10CM: 2.0
+    RAIN_AMOUNT: 2.0
+    UP_HELI_MAX: 3.0
+    W_UP_MAX: 3.0
+    LWP: 3.5
+  # Spectral loss penalises amplitude under-representation at fine scales,
+  # counteracting the blurring tendency of pure MSE.
+  # wavenum_init: 10 targets wavenumbers ≥ 10 → physical scales ≤ 90km.
+  #   For 300px at 3km the Nyquist is wavenum 150 (6km features).
+  #   Convective cells are 10–50km → wavenumbers 18–90.
+  #   wavenum_init: 10 captures most of the convective-permitting spectrum.
+  # spectral_lambda_reg: 0.05 is a conservative start. Once training is stable
+  #   (loss not oscillating) try increasing to 0.1.
+  use_spectral_loss: True
+  spectral_lambda_reg: 0.05
+  spectral_wavenum_init: 10
+
+predict:
+  mode: 'none'
+  save_forecast: '/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/crossformer_det/'
+  save_vars: ['T2', 'Q2', 'U10', 'V10', 'T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+  metadata: False
+  custom_date_range: ['20210412', '20210630']
+  max_cases: 20

@@ -20,6 +20,7 @@ from credit.models.unet_diffusion import UnetDiffusion
 from credit.diffusion import ModifiedGaussianDiffusion
 from credit.models.swin_wrf import WRFTransformer
 from credit.models.dscale_wrf import DscaleTransformer
+from credit.models.wxformer.crossformer_wrf_ensemble import CrossFormerWRFEnsemble
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,10 @@ model_types = {
     "graph": (GraphResTransfGRU, "Loading Graph Residual Transformer GRU model"),
     "debugger": (DebuggerModel, "Loading the debugger model"),
     "wrf": (WRFTransformer, "Loading WRF Transformer"),
+    "crossformer_wrf_ensemble": (
+        CrossFormerWRFEnsemble,
+        "Loading CrossFormerWRFEnsemble – variable-flexible, resolution-flexible ensemble model",
+    ),
     "dscale": (DscaleTransformer, "Loading downscaling Transformer"),
     "crossformer_downscaling": (
         DownscalingCrossFormer,

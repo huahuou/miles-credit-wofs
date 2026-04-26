@@ -1,0 +1,215 @@
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_crossformer_wrf_ensemble_0417_v1'
+seed: 1000
+
+data:
+  scaler_type: 'std-wrf'
+
+  variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
+  dynamic_forcing_variables: ['cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation']
+  diagnostic_variables: ['UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP']
+  forcing_variables: []
+  static_variables: []
+
+  save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_surface: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_dynamic_forcing: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+  save_loc_diagnostic: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+
+  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
+  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
+
+  train_years: [2019, 2020]
+  valid_years: [2021]
+
+  train_date_range: ['20190101', '20201231']
+  valid_date_range: ['20210402', '20210515']
+
+  history_len: 1
+  valid_history_len: 1
+  forecast_len: 5
+  valid_forecast_len: 5
+  target_start_step: 0
+  zarr_time_chunk: 7
+  lead_time_periods: 1
+  levels: 17
+  static_first: False
+
+  boundary:
+    variables: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+    surface_variables: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+    reuse_interior_stats: True
+    levels: 17
+    history_len: 1
+    forecast_len: 0
+    all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+
+  all_varnames: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'T2', 'Q2', 'U10', 'V10', 'cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+
+model:
+  type: 'crossformer_wrf_ensemble'
+
+  # ── Variable name lists ─────────────────────────────────────────────────
+  # These drive the VariableTokenEmbedder slice specs. To add a new variable
+  # at fine-tuning time, append its name here and call
+  # model.interior_embedder.add_variable(name, n_chans, start_channel).
+  # The backbone weights load unchanged from the pre-trained checkpoint.
+  varname_upper_air: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  varname_surface: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT']
+  varname_dyn_forcing: ['cos_latitude', 'sin_latitude', 'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day', 'cos_local_time', 'sin_local_time', 'cos_solar_zenith_angle', 'insolation']
+  varname_forcing: []
+  varname_static: []
+  varname_diagnostic: ['UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP']
+
+  varname_boundary_upper: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
+  varname_boundary_surface: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'RAIN_AMOUNT', 'XLAND', 'HGT']
+
+  # ── Vertical levels ─────────────────────────────────────────────────────
+  levels: 17
+  boundary_levels: 17
+
+  # ── Temporal ────────────────────────────────────────────────────────────
+  frames: 1
+
+  # ── Token embedding ─────────────────────────────────────────────────────
+  # embed_dim is the common token dimension after VariableTokenEmbedder.
+  # It is also dim_in for the first CrossEmbedLayer.
+  embed_dim: 128          # reduce from 192 to ease GPU memory; increase for capacity
+  boundary_embed_dim: 64
+  time_encode_dim: 12     # must match data.lead_time_periods * cycle encoding
+
+  # ── CrossFormer backbone ─────────────────────────────────────────────────
+  # U-Net encoder dims. Compact config: ~14.76M params (measured).
+  # Reduced from YAML-default (33.44M) to fit within 20M AND leave activation
+  # headroom for ensemble_size=8 forward passes on a single H100 (96GB).
+  # Load phase-1 (Medium-A det) weights via strict=False — all layer names match
+  # except dim[2] 192→192 and dim[3] 384→256 heads, which will not load and
+  # will be randomly re-initialised. The noise layers train from scratch.
+  # If you want full weight transfer from phase-1, use the same dim here.
+  dim: [64, 128, 192, 384]
+  depth: [2, 2, 12, 2]
+  dim_head: 32
+  global_window_size: [8, 6, 4, 1]  # wider long-range window; free in params
+  local_window_size: 8    # divisibility req: H must be ≡ 0 mod (8 × 16 = 128)
+  cross_embed_kernel_sizes:
+    - [4, 8, 16, 32]
+    - [2, 4]
+    - [2, 4]
+    - [2, 4]
+  cross_embed_strides: [2, 2, 2, 2]   # must all be 2 for symmetric U-Net decoder
+  attn_dropout: 0.0
+  ff_dropout: 0.0
+
+  # ── Regularisation ───────────────────────────────────────────────────────
+  use_spectral_norm: True
+
+  # ── Stochastic noise injection ────────────────────────────────────────────
+  # activate: True enables multi-scale noise at 4 decoder levels.
+  # noise_scales: initial noise factors, index 0 = coarsest (most noise).
+  # correlated: True shares one z across all injection sites (coherent noise).
+  # freeze_base_model_weights: True → only noise layers are trained (fine-tune).
+  noise_injection:
+    activate: True
+    latent_dim: 128
+    noise_scales: [0.30, 0.15, 0.05, 0.01]
+    encoder_noise: True
+    correlated: False
+    sample_latent_if_none: True
+    freeze_base_model_weights: False
+
+  # ── Boundary padding ─────────────────────────────────────────────────────
+  # Same earth-padding as WRFTransformer to handle domain boundaries.
+  padding_conf:
+    activate: True       # set True once memory budget is confirmed
+    mode: mirror          # correct choice for LAM (not earth)
+    pad_lat: [16, 16]    # 48 km north/south
+    pad_lon: [16, 16]    # 48 km east/west
+
+trainer:
+  type: 'multi-step-wrf-ensemble'
+  mode: 'ddp'
+  train_batch_size: 4
+  valid_batch_size: 4
+  ensemble_size: 8
+  distributed_ensemble: False
+  ddp_find_unused_parameters: False
+  batches_per_epoch: 0
+  valid_batches_per_epoch: 0
+  thread_workers: 8
+  valid_thread_workers: 8
+  prefetch_factor: 1
+  residual_prediction: True
+  update_learning_rate: False
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  amp: True
+  start_epoch: 0
+  load_weights: False
+  load_optimizer: False
+  load_scheduler: False
+  load_scaler: False
+  skip_validation: False
+  use_scheduler: True
+  reload_epoch: True
+  epochs: &epochs 100
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 1000
+    cycle_mult: 2.0
+    max_lr: 1.0e-03
+    min_lr: 1.0e-04
+    warmup_steps: 999
+    gamma: 0.8
+  grad_max_norm: 1.0
+  grad_accum_every: 1
+  save_backup_weights: True
+  save_best_weights: True
+  save_metric_vars: ['T2', 'Q2', 'U10', 'V10', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+
+loss:
+  latitude_weights: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0409/stats/latitude_weights_placeholder.nc'
+  use_latitude_weights: False
+  use_variable_weights: True
+  training_loss: 'KCRPS'
+  validation_loss: 'KCRPS'
+  # Upper-air vars: list of 17 weights (one per eta level, surface→model-top).
+  # Rationale (3km WRF WoFS, convection-focused):
+  #   T      — boundary layer and low-level temperature hardest to predict due to
+  #             surface heating/convective mixing; taper off above ~500 hPa.
+  #   QVAPOR — moisture is exponentially concentrated near the surface; near-zero
+  #             above ~400 hPa so upper levels have negligible gradient signal.
+  #   U/V    — low-level jet (~850 hPa) and storm inflow are critical; upper levels
+  #             still important for steering and divergence aloft but softer.
+  #   W      — vertical velocity peaks at mid-troposphere during deep convection
+  #             (~500-300 hPa, levels 8-12); near-zero at surface and model top.
+  #   GEOPOT — smooth and predictable; mild level-dependent tapering.
+  # Tune these once you have per-level validation MAE statistics.
+  variable_weights:
+    T:      [1.6, 1.5, 1.4, 1.3, 1.2, 1.2, 1.1, 1.1, 1.0, 1.0, 0.9, 0.9, 0.8, 0.8, 0.7, 0.7, 0.6]
+    QVAPOR: [2.2, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1, 0.1, 0.1]
+    U:      [1.4, 1.3, 1.3, 1.2, 1.2, 1.1, 1.1, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.8, 0.7, 0.7]
+    V:      [1.3, 1.2, 1.2, 1.1, 1.1, 1.1, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.8, 0.7, 0.7]
+    W:      [0.5, 0.7, 0.9, 1.1, 1.3, 1.4, 1.5, 1.6, 1.6, 1.5, 1.4, 1.3, 1.1, 0.9, 0.7, 0.6, 0.5]
+    GEOPOT: [1.0, 1.0, 1.0, 1.0, 1.1, 1.1, 1.1, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    # Surface and diagnostic vars: scalar.
+    U10: 1.1
+    V10: 1.1
+    T2: 1.2
+    Q2: 1.5
+    WSPD80: 1.5
+    COMPOSITE_REFL_10CM: 2.0
+    RAIN_AMOUNT: 2.0
+    UP_HELI_MAX: 3.0
+    W_UP_MAX: 3.0
+    LWP: 3.5
+  use_spectral_loss: False
+  spectral_lambda_reg: 0.1
+  spectral_wavenum_init: 25
+
+predict:
+  mode: 'none'
+  save_forecast: '/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/crossformer_ens/'
+  save_vars: ['T2', 'Q2', 'U10', 'V10', 'T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
+  metadata: False
+  custom_date_range: ['20210412', '20210630']
+  max_cases: 20

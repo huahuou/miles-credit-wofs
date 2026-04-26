@@ -359,16 +359,23 @@ def primary_main():
         noise_conf.setdefault("sample_latent_if_none", True)
         noise_conf.setdefault("freeze_base_model_weights", False)
 
-    # DDP safety: unfrozen ensemble model can have rank-wise unused params in some steps.
-    # Keep find_unused_parameters=True unless the user is running noise-only fine-tuning.
+    # DDP safety: an active, unfrozen noise injection can leave parameters unused on some
+    # DDP ranks when ensemble_size < total ranks. Only override to True when noise is
+    # both activated AND the base model weights are not frozen. If noise is disabled or
+    # the user has explicitly set ddp_find_unused_parameters in the config, respect it.
     if conf.get("trainer", {}).get("mode") == "ddp":
         conf.setdefault("trainer", {})
-        freeze_base = bool(conf.get("model", {}).get("noise_injection", {}).get("freeze_base_model_weights", False))
-        conf["trainer"].setdefault("ddp_find_unused_parameters", not freeze_base)
-        if (not freeze_base) and (conf["trainer"].get("ddp_find_unused_parameters") is False):
+        noise_conf = conf.get("model", {}).get("noise_injection", {})
+        noise_active = bool(noise_conf.get("activate", False))
+        freeze_base = bool(noise_conf.get("freeze_base_model_weights", False))
+        # Only force True when noise is active AND base weights are not frozen.
+        needs_unused = noise_active and (not freeze_base)
+        conf["trainer"].setdefault("ddp_find_unused_parameters", needs_unused)
+        if needs_unused and (conf["trainer"].get("ddp_find_unused_parameters") is False):
             logging.warning(
                 "Overriding trainer.ddp_find_unused_parameters=False to True because "
-                "noise_injection.freeze_base_model_weights=False can leave parameters unused in DDP iterations."
+                "noise_injection.activate=True and freeze_base_model_weights=False can leave "
+                "parameters unused across DDP ranks."
             )
             conf["trainer"]["ddp_find_unused_parameters"] = True
 

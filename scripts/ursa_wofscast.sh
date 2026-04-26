@@ -24,7 +24,7 @@
 #SBATCH --gpus-per-node=h100:2                # 2 H100 GPUs per node
 #SBATCH --cpus-per-task=192                    # CPU cores per task (for data loading workers)
 #SBATCH --mem=0                               # Use all available memory on the node
-#SBATCH --time=1-08:00:00                       # Wall time limit
+#SBATCH --time=1-07:30:00                       # Wall time limit
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out                   # stdout: <job-name>-<job-id>.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err                     # stderr: <job-name>-<job-id>.err
 #SBATCH --exclusive                           # Exclusive node access for best GPU performance
@@ -38,8 +38,8 @@ TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
 CONDA_ENV="credit-wofs"                       # Name or path of your conda environment
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
-# CONFIG="${PROJECT_DIR}/config/ursa_wofscast_credit_wrf_latest.yml"
-CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_wrf_experiment_multi_0417_deterministic/model.yml"  # Path to your YAML config file
+CONFIG="${PROJECT_DIR}/config/ursa_wofscast_crossformer_wrf_det.yml"
+# CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_wrf_experiment_multi_0417_deterministic/model.yml"  # Path to your YAML config file
 # TRAINING_SCRIPT="applications/train_wrf_wofs_multi_ensemble.py"   # Multi-step WoFS trainer
 TRAINING_SCRIPT="applications/train_wrf_wofs_multi.py"   # Multi-step WoFS trainer
 # For single-step training, use: TRAINING_SCRIPT="applications/train_wrf_wofs.py"
