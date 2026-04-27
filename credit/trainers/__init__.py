@@ -13,6 +13,7 @@ from credit.trainers.trainerLES import Trainer as TrainerLES
 from credit.trainers.trainerWRF import Trainer as TrainerWRF
 from credit.trainers.trainerWRF_multi import Trainer as TrainerWRFMulti
 from credit.trainers.trainerWRF_multi_ensemble import Trainer as TrainerWRFMultiEnsemble
+from credit.trainers.trainerWRF_mae import TrainerMAE
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,10 @@ trainer_types = {
     "samudra": (
         TrainerSamudra,
         "Loading a single or multi-step trainer for the Samudra OM4 dataset that uses gradient accumulation on forecast lengths > 1.",
+    ),
+    "standard-wrf-mae": (
+        TrainerMAE,
+        "Multi-modal MAE trainer for WoFS data assimilation pre-training.",
     ),
 }
 

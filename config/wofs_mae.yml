@@ -1,0 +1,242 @@
+# WoFS Multi-Modal Masked Autoencoder — Training Config
+# -------------------------------------------------------
+# Single-stage self-supervised pre-training; no VAE required.
+# Trains WoFSMultiModalMAE on WoFS zarr cases.
+#
+# Usage:
+#   torchrun --standalone --nnodes=1 --nproc-per-node=4 \
+#       applications/train_wrf_wofs_mae.py -c config/wofs_mae.yml
+
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1'
+seed: 1000
+
+# ===========================================================================
+# Data
+# ===========================================================================
+data:
+  # Zarr files glob
+  save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+
+  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
+  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
+  concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
+
+  # Modality variable groupings  ─────────────────────────────────────────
+  background_vars:
+    - T
+    - QVAPOR
+    - U
+    - V
+    - W
+    - GEOPOT
+
+  precip_vars:
+    - QRAIN
+    - QNRAIN
+    - QHAIL
+    - QNHAIL
+    - QGRAUP
+    - QNGRAUPEL
+    - QSNOW
+    - QNSNOW
+
+  reflectivity_vars:
+    - REFL_10CM
+
+  surface_vars:
+    - XLAND
+    - HGT
+
+  dynamic_forcing_variables:
+    - cos_lat
+    - sin_lat
+    - cos_lon
+    - sin_lon
+    - cos_julian_day
+    - sin_julian_day
+    - cos_local_time
+    - sin_local_time
+    - cos_solar_zenith
+    - insolation
+
+  # Spatial / temporal config  ────────────────────────────────────────────
+  levels: 17
+  mae_pad_to: 304                 # pad 300×300 → 304×304 for 8×8 patch tiling
+  mae_include_t1_refl: true       # use t1 REFL (predict-ahead proxy)
+
+  # Date / year splits  ────────────────────────────────────────────────────
+  train_years: [2020, 2021]
+  valid_years: [2022]
+
+  # Alternatively use explicit date ranges:
+  # train_date_range: ['20200301', '20211130']
+  # valid_date_range: ['20220405', '20221031']
+
+  # DataLoader tuning
+  zarr_time_chunk: 2
+  max_open_files_per_worker: 8
+  max_dataset_open_retries: 3
+
+  # Fields required by credit_main_parser (unused by MAE but must exist)
+  scaler_type: 'std-wrf'
+  variables: []
+  surface_variables: []
+  forcing_variables: []
+  static_variables: []
+  diagnostic_variables: []
+  all_varnames: []
+  history_len: 1
+  valid_history_len: 1
+  forecast_len: 0
+  valid_forecast_len: 0
+  target_start_step: 1
+  lead_time_periods: 1
+  static_first: false
+
+# ===========================================================================
+# Model
+# ===========================================================================
+model:
+  type: 'wofs-mae'
+
+  # Modality channel counts (must match data variable counts × levels)
+  modality_channels:
+    background: 102          # 6 vars × 17 levels
+    precip: 136              # 8 vars × 17 levels
+    reflectivity: 17         # 1 var  × 17 levels
+    surface: 2               # XLAND, HGT
+    forcing: 10              # 10 dynamic forcing channels
+
+  non_masked_modalities:
+    - surface
+    - forcing
+
+  # Patch / image config
+  patch_size: 8
+  surface_forcing_stride: 16
+  image_size: [304, 304]
+
+  # Backbone ViT
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+
+  # Output adapter (decoder)
+  decoder_dim: 384
+  decoder_depth: 6
+  decoder_num_heads: 8
+
+  # Masking
+  num_global_tokens: 2
+  num_encoded_tokens: 512      # kept tokens out of ~1444 maskable
+  drop_path_rate: 0.1
+  use_gradient_checkpointing: false  # trade compute for memory
+# ===========================================================================
+# Trainer
+# ===========================================================================
+trainer:
+  type: 'standard-wrf-mae'
+  mode: 'ddp'                    # 'ddp' | 'fsdp' | 'none'
+  ddp_find_unused_parameters: false  # MAE has no unused params; avoid extra autograd traversal
+
+  # File locality sampler groups workers so each worker reads few files
+  use_file_locality_sampler: true
+
+  # Batch sizes
+  train_batch_size: 4
+  valid_batch_size: 4
+
+  # Epoch config
+  epochs: 100
+  start_epoch: 0
+  stopping_patience: 100         # effectively disabled (= epochs); MAE pre-training doesn't use early stopping
+  batches_per_epoch: 0         # ~8 min/epoch at 1 s/it; was 0 (=full 7445) which caused itertools.cycle OOM
+  valid_batches_per_epoch: 50    # 0 = full validation set
+
+  # DataLoader workers
+  thread_workers: 4
+  valid_thread_workers: 4
+  prefetch_factor: 1
+  pin_memory: true
+  persistent_workers: true
+  dataloader_timeout_s: 180
+
+  # Debug / hang prevention
+  no_hang_debug: false
+  no_hang_thread_workers: 1
+  no_hang_valid_thread_workers: 1
+  no_hang_prefetch_factor: 1
+  no_hang_valid_prefetch_factor: 1
+  no_hang_pin_memory: false
+  no_hang_persistent_workers: true
+  no_hang_timeout_s: 180
+
+  # Optimization
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  amp: true
+  grad_max_norm: 1.0
+  grad_accum_every: 2    # effective batch = 2 * 4 * 2 GPUs = 16 (same as before)
+
+  # Per-modality MAE loss weights
+  loss_weights:
+    background: 0.5
+    precip: 2.0
+    reflectivity: 1.0
+
+  # Masking config (overrides model.num_encoded_tokens if set)
+  num_encoded_tokens: 512
+  dirichlet_alpha: 1.0           # Dirichlet concentration; 1.0 = uniform allocation
+
+  # Validation masking (true = same masked forward as training)
+  val_mask_inputs: true
+
+  # Checkpointing
+  load_weights: false
+  load_optimizer: false
+  load_scheduler: false
+  load_scaler: false
+  save_backup_weights: true
+  save_best_weights: true
+  training_metric: 'valid_loss'
+  training_metric_direction: 'min'
+
+  skip_validation: false
+
+  # LR scheduler
+  use_scheduler: true
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 1000
+    cycle_mult: 2.0
+    max_lr: 1.0e-3
+    min_lr: 5.0e-5
+    warmup_steps: 500
+    gamma: 0.8
+
+  # required by base_trainer (no-ops for MAE)
+  residual_prediction: false
+  update_learning_rate: false
+
+# ===========================================================================
+# Loss (required by credit_main_parser; actual MAE loss is computed in TrainerMAE)
+# ===========================================================================
+loss:
+  latitude_weights: ''
+  use_latitude_weights: false
+  use_variable_weights: false
+  training_loss: 'mse'
+
+# ===========================================================================
+# PBS / SLURM submission (optional)
+# ===========================================================================
+pbs:
+  queue: 'main'
+  account: 'NAML0001'
+  walltime: '12:00:00'
+  nodes: 1
+  ncpus_per_node: 128
+  ngpus_per_node: 4
+  mem: '240GB'
+  jobname: 'wofs-mae-pretrain'

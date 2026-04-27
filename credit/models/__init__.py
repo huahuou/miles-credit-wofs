@@ -21,6 +21,7 @@ from credit.diffusion import ModifiedGaussianDiffusion
 from credit.models.swin_wrf import WRFTransformer
 from credit.models.dscale_wrf import DscaleTransformer
 from credit.models.wxformer.crossformer_wrf_ensemble import CrossFormerWRFEnsemble
+from credit.models.wofs_mae import WoFSMultiModalMAE
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ model_types = {
         "Loading downscaling crossformer model",
     ),
     "unet_downscaling": (DownscalingSegmentationModel, "Loading downscaling U-net"),
+    "wofs-mae": (WoFSMultiModalMAE, "Multi-modal MAE for WoFS data assimilation"),
 }
 
 

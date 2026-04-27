@@ -152,8 +152,8 @@ loss:
 
 predict:
   mode: 'ddp'
-  save_forecast: '/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/deterministic'
+  save_forecast: '/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/deterministic_12h'
   save_vars: ['T2', 'Q2', 'U10', 'V10', 'T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
   metadata: False
-  custom_date_range: ['20210417', '20210730']
-  max_cases: 480
+  custom_date_range: ['20210416', '20210730']
+  max_cases: 500

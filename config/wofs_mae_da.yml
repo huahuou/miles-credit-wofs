@@ -1,0 +1,176 @@
+# WoFS MAE Data Assimilation Rollout Config
+# ------------------------------------------
+# Runs assimilate() for date ranges using a trained WoFSMultiModalMAE checkpoint.
+#
+# Usage:
+#   python applications/rollout_wrf_wofs_mae_da.py \
+#       -c config/wofs_mae_da.yml \
+#       --checkpoint /path/to/checkpoint.pt \
+#       --start-date 20230501 --end-date 20230531 \
+#       --out-dir /work2/zhanxianghua/wofs_mae_analysis
+
+save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_mae_da_rollout_v1'
+seed: 1000
+
+# ===========================================================================
+# Data paths (same as training config)
+# ===========================================================================
+data:
+  save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
+
+  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
+  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
+  concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
+
+  # Variable groupings — must match training config
+  background_vars:
+    - T
+    - QVAPOR
+    - U
+    - V
+    - W
+    - GEOPOT
+
+  precip_vars:
+    - QRAIN
+    - QNRAIN
+    - QHAIL
+    - QNHAIL
+    - QGRAUP
+    - QNGRAUPEL
+    - QSNOW
+    - QNSNOW
+
+  reflectivity_vars:
+    - REFL_10CM
+
+  surface_vars:
+    - XLAND
+    - HGT
+
+  dynamic_forcing_variables:
+    - cos_lat
+    - sin_lat
+    - cos_lon
+    - sin_lon
+    - cos_julian_day
+    - sin_julian_day
+    - cos_local_time
+    - sin_local_time
+    - cos_solar_zenith
+    - insolation
+
+  levels: 17
+  mae_pad_to: 304
+  mae_include_t1_refl: false   # rollout: t0 REFL is the observation
+
+  zarr_time_chunk: 2
+  max_open_files_per_worker: 4
+  max_dataset_open_retries: 3
+
+  # Fields required by credit_main_parser (not used during rollout)
+  scaler_type: 'std-wrf'
+  variables: []
+  surface_variables: []
+  forcing_variables: []
+  static_variables: []
+  diagnostic_variables: []
+  all_varnames: []
+  history_len: 1
+  valid_history_len: 1
+  forecast_len: 0
+  valid_forecast_len: 0
+  target_start_step: 1
+  lead_time_periods: 1
+  static_first: false
+
+# ===========================================================================
+# Model (must match checkpoint architecture)
+# ===========================================================================
+model:
+  type: 'wofs-mae'
+
+  modality_channels:
+    background: 102
+    precip: 136
+    reflectivity: 17
+    surface: 2
+    forcing: 10
+
+  non_masked_modalities:
+    - surface
+    - forcing
+
+  patch_size: 8
+  surface_forcing_stride: 16
+  image_size: [304, 304]
+
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+
+  decoder_dim: 384
+  decoder_depth: 6
+  decoder_num_heads: 8
+
+  num_global_tokens: 2
+  num_encoded_tokens: 256
+  drop_path_rate: 0.0   # no dropout during inference
+
+# ===========================================================================
+# Loss (required by credit_main_parser)
+# ===========================================================================
+loss:
+  latitude_weights: ''
+  use_latitude_weights: false
+  use_variable_weights: false
+  training_loss: 'mse'
+
+# ===========================================================================
+# Rollout-specific settings
+# ===========================================================================
+rollout:
+  # blend_alpha: 1.0 = pure observed reflectivity, 0.0 = pure model background
+  blend_alpha: 1.0
+  # Timesteps to skip at the start / end of each case (warm-up / cold-start)
+  skip_first_n: 0
+  skip_last_n: 0
+
+# ===========================================================================
+# Trainer (required by credit_main_parser; not actively used during rollout)
+# ===========================================================================
+trainer:
+  type: 'standard-wrf-mae'
+  mode: 'none'
+  train_batch_size: 1
+  valid_batch_size: 1
+  epochs: 1
+  start_epoch: 0
+  batches_per_epoch: 0
+  valid_batches_per_epoch: 0
+  thread_workers: 0
+  valid_thread_workers: 0
+  amp: false
+  load_weights: false
+  load_optimizer: false
+  load_scheduler: false
+  load_scaler: false
+  save_backup_weights: false
+  save_best_weights: false
+  skip_validation: true
+  use_scheduler: false
+  grad_max_norm: null
+  grad_accum_every: 1
+  residual_prediction: false
+  update_learning_rate: false
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 100
+    cycle_mult: 1.0
+    max_lr: 1.0e-4
+    min_lr: 1.0e-5
+    warmup_steps: 0
+    gamma: 1.0
