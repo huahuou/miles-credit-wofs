@@ -214,6 +214,13 @@ loss:
   #   wavenum_init: 10 captures most of the convective-permitting spectrum.
   # spectral_lambda_reg: 0.05 is a conservative start. Once training is stable
   #   (loss not oscillating) try increasing to 0.1.
+  # Interior loss crop: compute loss only on the interior [n:-n, n:-n] pixels.
+  # Excludes the boundary zone from the gradient signal — physically motivated
+  # because the outermost pixels are tightly constrained by x_boundary and
+  # contribute little useful learning signal while potentially biasing the loss.
+  # 16 px × 3 km = 48 km, matching the pad_lat/pad_lon ring in padding_conf.
+  # Set to 0 to disable. Compatible with padding_conf.activate: True/False.
+  interior_crop_pixels: 16
   use_spectral_loss: True
   spectral_lambda_reg: 0.05
   spectral_wavenum_init: 10
@@ -224,4 +231,4 @@ predict:
   save_vars: ['T2', 'Q2', 'U10', 'V10', 'T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
   metadata: False
   custom_date_range: ['20210412', '20210630']
-  max_cases: 20
+  max_cases: 50

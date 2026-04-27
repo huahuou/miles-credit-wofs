@@ -133,6 +133,12 @@ class Trainer(BaseTrainer):
                 use_distributed_ensemble,
             )
         logger.info("Use residual prediction: {}".format(residual_prediction))
+        # Interior crop: exclude outermost N pixels from the loss so that boundary-
+        # zone pixels (which are highly constrained by x_boundary) do not dominate
+        # the gradient signal.  Set loss.interior_crop_pixels: 0 to disable.
+        interior_crop = int(conf.get("loss", {}).get("interior_crop_pixels", 0))
+        if interior_crop > 0:
+            logger.info("Interior loss crop: excluding %d pixels from each edge", interior_crop)
         # number of diagnostic variables
         varnum_diag = len(conf["data"]["diagnostic_variables"])
 
@@ -270,8 +276,13 @@ class Trainer(BaseTrainer):
                         y = torch.cat((y, y_diag_batch), dim=1)
 
                     with autocast(enabled=amp):
-                        criterion_target = y
-                        criterion_pred = y_pred
+                        if interior_crop > 0:
+                            n = interior_crop
+                            criterion_target = y[..., n:-n, n:-n]
+                            criterion_pred = y_pred[..., n:-n, n:-n]
+                        else:
+                            criterion_target = y
+                            criterion_pred = y_pred
                         if ensemble_size > 1 and distributed and use_distributed_ensemble:
                             criterion_pred = gather_tensor_with_grad(criterion_pred)
                             criterion_target = gather_tensor_no_grad(criterion_target)

@@ -23,7 +23,7 @@
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=192
 #SBATCH --mem=0
-#SBATCH --time=11:59:00
+#SBATCH --time=04:59:00
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err
 #SBATCH --exclusive
@@ -41,7 +41,7 @@ MODE=${MODE:-ddp}
 
 CONDA_ENV="credit-wofs"
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"
-CONFIG="${PROJECT_DIR}/config/ursa_wofscast_credit_wrf_latest.yml"
+CONFIG="${PROJECT_DIR}/config/ursa_wofscast_crossformer_wrf_det.yml"
 BACKEND=${BACKEND:-nccl}
 MAX_CASES=${MAX_CASES:-""}
 OUTPUT_NAME=${OUTPUT_NAME:-rollout_metrics.csv}

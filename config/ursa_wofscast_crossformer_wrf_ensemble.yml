@@ -202,6 +202,8 @@ loss:
     UP_HELI_MAX: 3.0
     W_UP_MAX: 3.0
     LWP: 3.5
+  # Interior loss crop: same rationale as the det config.
+  interior_crop_pixels: 16
   use_spectral_loss: False
   spectral_lambda_reg: 0.1
   spectral_wavenum_init: 25

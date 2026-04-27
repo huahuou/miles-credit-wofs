@@ -94,6 +94,12 @@ class Trainer(BaseTrainer):
         retain_graph = conf["data"].get("retain_graph", False)
         residual_prediction = conf["trainer"].get("residual_prediction", False)
         logger.info("Use residual prediction: {}".format(residual_prediction))
+        # Interior crop: exclude outermost N pixels from the loss so that boundary-
+        # zone pixels (which are highly constrained by x_boundary) do not dominate
+        # the gradient signal.  Set loss.interior_crop_pixels: 0 to disable.
+        interior_crop = int(conf.get("loss", {}).get("interior_crop_pixels", 0))
+        if interior_crop > 0:
+            logger.info("Interior loss crop: excluding %d pixels from each edge", interior_crop)
         # number of diagnostic variables
         varnum_diag = len(conf["data"]["diagnostic_variables"])
 
@@ -220,7 +226,13 @@ class Trainer(BaseTrainer):
                         y = torch.cat((y, y_diag_batch), dim=1)
 
                     with autocast(enabled=amp):
-                        loss = criterion(y.to(y_pred.dtype), y_pred).mean()
+                        if interior_crop > 0:
+                            n = interior_crop
+                            _y   = y[..., n:-n, n:-n]
+                            _yp  = y_pred[..., n:-n, n:-n]
+                        else:
+                            _y, _yp = y, y_pred
+                        loss = criterion(_y.to(_yp.dtype), _yp).mean()
 
                     # track the loss
                     accum_log(logs, {"loss": loss.item()})
