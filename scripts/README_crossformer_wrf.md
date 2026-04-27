@@ -52,42 +52,61 @@ Time encoding     (B, time_encode_dim)
             ▼
 ┌───────────────────────────────────────────────────────────────┐
 │  VariableTokenEmbedder                                        │
-│  per-var 1×1 Conv2d → sigmoid gate → sum → LayerNorm         │
-│  (B, C_total, H, W)  →  (B, embed_dim, H, W)                 │
+│  per-var 1×1 Conv2d → sigmoid gate → sum → LayerNorm          │
+│  (B, C_total, H, W)  →  (B, embed_dim, H, W)                  │
 └───────────┬───────────────────────────────────────────────────┘
             │                      ▲ FiLM γ,β from boundary pool + time enc
             ▼                      │
-      x_emb × γ + β  ─────────────┘
+      x_emb × γ + β  ──────────────┘
             │
             │  pad H,W to multiple of local_window_size × 2⁴
             ▼
-╔══════════════════════════════════════════════════════════╗
-║  CrossFormer Encoder  (4 stages, stride-2 each)         ║
-║                                                         ║
-║  stage 0: CrossEmbedLayer(embed_dim → dim[0])           ║
-║           Transformer(local=8, global=global_ws[0])     ║  enc[0]
-║  stage 1: CrossEmbedLayer(dim[0] → dim[1])              ║
-║           Transformer(local=8, global=global_ws[1])     ║  enc[1]
-║  stage 2: CrossEmbedLayer(dim[1] → dim[2])              ║
-║           Transformer(local=8, global=global_ws[2])     ║  enc[2]
-║  stage 3: CrossEmbedLayer(dim[2] → dim[3])              ║
-║           Transformer(local=8, global=global_ws[3])     ║  feat (H/16)
-╚══════════════════════════════════════════════════════════╝
-            │
-╔══════════════════════════════════════════════════════════╗
-║  Anti-Checkerboard Decoder (4 stages, 2× upsample each) ║
-║                                                         ║
-║  up1: nearest+Conv → [noise] → cat(enc[2]) → H/8       ║
-║  up2: nearest+Conv → [noise] → cat(enc[1]) → H/4       ║
-║  up3: nearest+Conv → [noise] → cat(enc[0]) → H/2       ║
-║  up4: nearest+Conv → [noise]               → H          ║
-╚══════════════════════════════════════════════════════════╝
-            │  crop to orig_H × orig_W
-            ▼
+
+  ┌──────────────────────────────────────────────────┐
+  │  Stage 0: CrossEmbedLayer(embed_dim → dim[0])    │─── enc[0] (H/2) ──────────────────┐
+  │           Transformer(local, global=ws[0])  H/2  │                                   │
+  └───────────────────────┬──────────────────────────┘                                   │
+                          │                                                              │
+  ┌──────────────────────────────────────────────────┐                                   │
+  │  Stage 1: CrossEmbedLayer(dim[0] → dim[1])       │─── enc[1] (H/4) ──────────┐       │
+  │           Transformer(local, global=ws[1])  H/4  │                           │       │
+  └───────────────────────┬──────────────────────────┘                           │       │
+                          │                                                      │       │
+  ┌──────────────────────────────────────────────────┐                           │       │
+  │  Stage 2: CrossEmbedLayer(dim[1] → dim[2])       │─── enc[2] (H/8) ──┐       │       │
+  │           Transformer(local, global=ws[2])  H/8  │                   │       │       │
+  └───────────────────────┬──────────────────────────┘                   │       │       │
+                          │                                              │       │       │
+  ┌──────────────────────────────────────────────────┐                   │       │       │
+  │  Stage 3: CrossEmbedLayer(dim[2] → dim[3])       │  (bottleneck)     │       │       │
+  │           Transformer(local, global=ws[3]) H/16  │                   │       │       │
+  └───────────────────────┬──────────────────────────┘                   │       │       │
+                          │ feat (H/16)                                  │       │       │
+  ┌──────────────────────────────────────────────────┐                   │       │       │
+  │  Up1: AnticheckboardUp  H/16 → H/8               │◄──────────────────┘       │       │
+  │       nearest+Conv → [noise] → cat(enc[2])       │                           │       │
+  └───────────────────────┬──────────────────────────┘                           │       │
+                          │ H/8                                                  │       │
+  ┌──────────────────────────────────────────────────┐                           │       │
+  │  Up2: AnticheckboardUp  H/8 → H/4                │◄──────────────────────────┘       │
+  │       nearest+Conv → [noise] → cat(enc[1])       │                                   │
+  └───────────────────────┬──────────────────────────┘                                   │
+                          │ H/4                                                          │
+  ┌──────────────────────────────────────────────────┐                                   │
+  │  Up3: AnticheckboardUp  H/4 → H/2                │◄──────────────────────────────────┘
+  │       nearest+Conv → [noise] → cat(enc[0])       │
+  └───────────────────────┬──────────────────────────┘
+                          │ H/2
+  ┌──────────────────────────────────────────────────┐
+  │  Up4: AnticheckboardUp  H/2 → H                  │  (no skip)
+  │       nearest+Conv → [noise]                     │
+  └───────────────────────┬──────────────────────────┘
+                          │  crop to orig_H × orig_W
+                          ▼
 ┌───────────────────────────────────────────────────────────────┐
 │  VariableTokenDecoder                                         │
-│  per-var 1×1 Conv2d heads → concatenate                      │
-│  (B, feat_dim, H, W)  →  (B, C_out, H, W)                    │
+│  per-var 1×1 Conv2d heads → concatenate                       │
+│  (B, feat_dim, H, W)  →  (B, C_out, H, W)                     │
 └───────────┬───────────────────────────────────────────────────┘
             │  unsqueeze T dim
             ▼
