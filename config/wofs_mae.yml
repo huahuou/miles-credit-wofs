@@ -153,6 +153,9 @@ trainer:
   stopping_patience: 100         # effectively disabled (= epochs); MAE pre-training doesn't use early stopping
   batches_per_epoch: 0         # ~8 min/epoch at 1 s/it; was 0 (=full 7445) which caused itertools.cycle OOM
   valid_batches_per_epoch: 50    # 0 = full validation set
+  reload_epoch: true             # if true, set start_epoch from checkpoint["epoch"]+1 on resume
+  train_one_epoch: false         # if true, stop after a single epoch (smoke-test mode)
+  stop_after_epoch: false        # if true, exit after first full epoch (alias for train_one_epoch)
 
   # DataLoader workers
   thread_workers: 4
@@ -193,16 +196,19 @@ trainer:
   val_mask_inputs: true
 
   # Checkpointing
-  load_weights: false
-  load_optimizer: false
+  load_weights: true
+  load_optimizer: true
   load_scheduler: false
-  load_scaler: false
+  load_scaler: true
   save_backup_weights: true
   save_best_weights: true
   training_metric: 'valid_loss'
   training_metric_direction: 'min'
 
   skip_validation: false
+
+  # Metric variables logged per-variable at checkpoint time (empty = use loss only)
+  save_metric_vars: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
 
   # LR scheduler
   use_scheduler: true

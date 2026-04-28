@@ -423,38 +423,153 @@ class WoFSMultiModalMAE(BaseModel):
         """
         Data assimilation inference: reconstruct precip given observed reflectivity.
 
+        Implements the plan exactly:
+          - background tokens → all visible (unmasked)
+          - reflectivity tokens → replaced with obs_refl (all visible)
+          - precip tokens → fully masked (mask_token embeddings, not zeros)
+          - surface + forcing → always visible
+
+        This is consistent with what the model was trained on: masked positions
+        use the learnable mask_token, never zero-valued inputs.
+
         Args:
-            background  : (B, 102, H, W) — normalized background atmospheric state
-            obs_refl    : (B, 17, H, W)  — normalized observed REFL_10CM
-            surface     : (B, 2, H, W)   — normalized surface fields
-            forcing     : (B, 10, H, W)  — normalized dynamic forcing
-            blend_alpha : 1.0 = pure obs reflectivity, 0.0 = pure model REFL
+            background  : (B, C_bg, H, W) — normalized background atmospheric state
+            obs_refl    : (B, C_rf, H, W) — normalized observed REFL_10CM
+            surface     : (B, C_sf, H, W) — normalized surface fields
+            forcing     : (B, C_fo, H, W) — normalized dynamic forcing
+            blend_alpha : 1.0 = pure obs REFL, 0.0 = pure model REFL (background‐REFL
+                          must be provided by caller if blend_alpha < 1.0 — here we
+                          linearly interpolate towards the zero-mean normalized state)
 
         Returns:
-            precip_analysis : (B, 136, H, W) — reconstructed precip in normalized space
+            precip_analysis : (B, C_pr, H, W) — reconstructed precip in normalized space
         """
-        # Build modality dict with blended reflectivity
-        # background must contain REFL_10CM; we blend it with obs
-        # For simplicity: pass obs_refl as the reflectivity modality directly
+        B = background.shape[0]
+        device = background.device
+
+        # Optional blend: interpolate obs toward normalized zero (≈ background mean)
+        refl_input = blend_alpha * obs_refl  # blend_alpha=1 → pure obs
+
+        # Build modality dict — precip value doesn't matter; it will be fully masked
+        # We still need a tensor of the right shape for tokenization, but only the
+        # mask_token embeddings will reach the encoder.
         modality_dict = {
             "background": background,
             "precip": torch.zeros(
-                background.shape[0], self.modality_channels["precip"],
+                B, self.modality_channels["precip"],
                 background.shape[-2], background.shape[-1],
-                device=background.device, dtype=background.dtype
+                device=device, dtype=background.dtype,
             ),
-            "reflectivity": obs_refl,
+            "reflectivity": refl_input,
             "surface": surface,
             "forcing": forcing,
         }
 
-        if blend_alpha < 1.0 and "reflectivity" in modality_dict:
-            # Blend: replace some of obs with model background REFL
-            # The caller should pass model_refl separately if blend_alpha < 1.0;
-            # for now we just scale obs towards zero (background REFL ≈ 0 in normalized space)
-            modality_dict["reflectivity"] = blend_alpha * obs_refl
+        orig_h, orig_w = background.shape[-2], background.shape[-1]
 
-        # Run with all tokens visible except precip (fully masked)
-        # We achieve this by setting mask_inputs=False (keep all) and zeroing precip
-        recon_dict, _ = self.forward(modality_dict, mask_inputs=False)
-        return recon_dict["precip"]
+        # 1. Tokenize all modalities
+        tokens_per_mod: Dict[str, torch.Tensor] = {}
+        for mod, adapter in self.input_adapters.items():
+            if mod in modality_dict:
+                tokens_per_mod[mod] = adapter(modality_dict[mod])
+
+        # 2. Build maskable token pool (same order as forward())
+        #    pool = [background | precip | reflectivity]
+        n_per_mod = self._maskable_token_counts()  # [n_bg, n_pr, n_rf]
+        offsets = [0]
+        for n in n_per_mod[:-1]:
+            offsets.append(offsets[-1] + n)
+        mod_offsets = {m: offsets[i] for i, m in enumerate(self.maskable_modalities)}
+
+        maskable_tokens = torch.cat(
+            [tokens_per_mod[m] for m in self.maskable_modalities], dim=1
+        )  # (B, total_maskable, embed_dim)
+        total_maskable = maskable_tokens.shape[1]
+
+        # 3. Build DA mask: keep all background + all reflectivity; mask all precip
+        task_masks: Dict[str, torch.Tensor] = {}
+        for mod in self.maskable_modalities:
+            n = self._num_tokens(mod)
+            if mod == "precip":
+                task_masks[mod] = torch.ones(B, n, device=device, dtype=torch.long)   # all masked
+            else:
+                task_masks[mod] = torch.zeros(B, n, device=device, dtype=torch.long)  # all visible
+
+        # 4. Build ids_keep from non-precip maskable tokens
+        keep_parts = []
+        for mod in self.maskable_modalities:
+            if mod == "precip":
+                continue
+            off = mod_offsets[mod]
+            n = self._num_tokens(mod)
+            idx = torch.arange(off, off + n, device=device).unsqueeze(0).expand(B, -1)
+            keep_parts.append(idx)
+        ids_keep = torch.cat(keep_parts, dim=1)  # (B, n_bg + n_rf)
+
+        # 5. Build ids_restore: sort combined mask so visible tokens come first
+        combined_mask = torch.cat(
+            [task_masks[m] for m in self.maskable_modalities], dim=1
+        ).float()  # (B, total_maskable): 0=visible, 1=masked
+        # Stable sort: visible (0) before masked (1), preserve relative order
+        ids_shuffle = torch.argsort(combined_mask, dim=1, stable=True)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # Use sorted ids_keep to match the combined-sort convention used in forward()
+        # (forward uses argsort of combined_mask as ids_keep)
+        n_visible = ids_keep.shape[1]
+        ids_keep = ids_shuffle[:, :n_visible]  # first n_visible are the visible positions
+
+        # 6. Gather visible maskable tokens and apply mask_token to masked positions
+        #    (mask_tokens are substituted inside the output adapter; the encoder only
+        #     receives the visible subset gathered here)
+        visible_maskable = torch.gather(
+            maskable_tokens, 1,
+            ids_keep.unsqueeze(-1).expand(-1, -1, self.embed_dim),
+        )  # (B, n_visible, embed_dim)
+
+        # 7. Append always-visible tokens
+        always_visible = []
+        for mod in self.non_masked_modalities:
+            if mod in tokens_per_mod:
+                always_visible.append(tokens_per_mod[mod])
+        if self.global_tokens is not None:
+            always_visible.append(self.global_tokens.expand(B, -1, -1))
+
+        full_visible = torch.cat([visible_maskable] + always_visible, dim=1) \
+            if always_visible else visible_maskable
+
+        # 8. Encode
+        enc_out = full_visible
+        for blk in self.encoder_blocks:
+            if self.use_gradient_checkpointing and enc_out.requires_grad:
+                enc_out = grad_checkpoint(blk, enc_out, use_reentrant=False)
+            else:
+                enc_out = blk(enc_out)
+        enc_out = self.encoder_norm(enc_out)
+
+        # 9. Build input_info for output adapters
+        input_info: Dict = {"tasks": OrderedDict(), "orig_h": orig_h, "orig_w": orig_w}
+        cursor = 0
+        for mod in list(tokens_per_mod.keys()):
+            n = tokens_per_mod[mod].shape[1]
+            input_info["tasks"][mod] = {
+                "num_tokens": n,
+                "start_idx": cursor,
+                "end_idx": cursor + n,
+            }
+            cursor += n
+        input_info["num_global_tokens"] = self.num_global_tokens
+
+        # 10. Decode precip only
+        maskable_token_counts = self._maskable_token_counts()
+        precip_idx = list(self.maskable_modalities).index("precip")
+        task_start = sum(maskable_token_counts[:precip_idx])
+        precip_recon = self.output_adapters["precip"](
+            encoder_tokens=enc_out,
+            ids_keep=ids_keep,
+            ids_restore=ids_restore,
+            num_task_tokens=total_maskable,
+            task_start_idx=task_start,
+            input_info=input_info,
+        )
+        return precip_recon

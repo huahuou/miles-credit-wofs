@@ -9,7 +9,7 @@
 #       --start-date 20230501 --end-date 20230531 \
 #       --out-dir /work2/zhanxianghua/wofs_mae_analysis
 
-save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_mae_da_rollout_v1'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1'
 seed: 1000
 
 # ===========================================================================

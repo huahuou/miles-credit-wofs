@@ -27,7 +27,7 @@
 #SBATCH --gpus-per-node=h100:1                # 1 GPU is sufficient for inference
 #SBATCH --cpus-per-task=32                    # Modest CPU count — rollout is mostly GPU-bound
 #SBATCH --mem=0                               # Use all available memory on the node
-#SBATCH --time=12:00:00                       # Rollout is faster than training
+#SBATCH --time=04:00:00                       # Rollout is faster than training
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err
 #SBATCH --exclusive
@@ -42,11 +42,11 @@ ROLLOUT_SCRIPT="applications/rollout_wrf_wofs_mae_da.py"
 CHECKPOINT="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1/best_checkpoint.pt"
 
 # Date range to process (YYYYMMDD, inclusive)
-START_DATE="20230501"
-END_DATE="20230531"
+START_DATE="20200415"
+END_DATE="20200515"
 
 # Directory where analysis zarr.zip files will be written
-OUT_DIR="/work2/zhanxianghua/wofs_mae_analysis"
+OUT_DIR="/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/mae_da_test1"
 
 #----- Load Modules ------------------------------------------------------------
 source $MODULESHOME/init/bash

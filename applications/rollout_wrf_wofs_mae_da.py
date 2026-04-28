@@ -37,6 +37,7 @@ import torch
 import xarray as xr
 import yaml
 import zarr
+import zarr.storage
 
 from credit.datasets.wrf_wofs_mae import (
     WoFSMAEDataset,
@@ -71,7 +72,8 @@ def _inverse_concentration_numpy(arr: np.ndarray, params: dict) -> np.ndarray:
     scale = np.arctan(c2 * np.log(cmax / eps + 1.0))
     x_ang = x * scale
     x_ang = np.clip(x_ang, -np.pi / 2 + 1e-7, np.pi / 2 - 1e-7)
-    x_out = eps * (np.exp(np.tan(x_ang) / c1) - 1.0)
+    exp_arg = np.clip(np.tan(x_ang) / c1, None, 709.0)  # prevent float64 overflow in exp
+    x_out = eps * (np.exp(exp_arg) - 1.0)
     x_out = np.clip(x_out, 0.0, None)
 
     clip_min = params.get("value_clip_min")
@@ -322,7 +324,7 @@ def run_rollout(args, conf: dict):
             ))
             ds = get_forward_data(case_file)
             ds = filter_ds(ds, all_vars)
-            n_time = ds.dims.get("time", ds.sizes.get("time", 0))
+            n_time = ds.sizes.get("time", 0)
 
             recon_by_var: Dict[str, List[np.ndarray]] = {v: [] for v in dummy_ds.precip_vars}
 
@@ -348,14 +350,14 @@ def run_rollout(args, conf: dict):
                     recon_by_var[var].append(arr)
 
             # Stack along time and write zarr
-            out_store = zarr.ZipStore(out_path, mode="w")
-            out_root = zarr.group(out_store)
+            out_store = zarr.storage.ZipStore(out_path, mode="w")
+            out_root = zarr.open_group(store=out_store, mode="w")
             time_vals = ds["time"].values if "time" in ds.coords else np.arange(n_time)
-            out_root.create_dataset("time", data=time_vals, dtype=object)
+            out_root.create_array("time", data=time_vals)
 
             for var, frames in recon_by_var.items():
-                stacked = np.stack(frames, axis=0)  # (T, level, H, W)
-                out_root.create_dataset(var, data=stacked, chunks=(1,) + stacked.shape[1:], dtype="float32")
+                stacked = np.stack(frames, axis=0).astype(np.float32)  # (T, level, H, W)
+                out_root.create_array(var, data=stacked, chunks=(1,) + stacked.shape[1:])
 
             out_store.close()
             logger.info("Wrote analysis to %s", out_path)

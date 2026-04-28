@@ -640,6 +640,98 @@ provide better vertical structure learning at the cost of a larger patch vocabul
 This is implemented in `WoFSMultiModalMAE.assimilate()` by linearly interpolating the
 normalized reflectivity token values before passing to the encoder.
 
+### Dirichlet masking: theory and implementation
+
+During MAE training, the token budget for maskable modalities is distributed via a
+Dirichlet draw:
+
+$$\boldsymbol{\pi} \sim \text{Dirichlet}(\alpha, \alpha, \alpha), \quad \boldsymbol{\pi} \in \Delta^2$$
+
+where $K = 3$ (background, precip, reflectivity) and $\Delta^2$ is the 2-simplex.
+The number of tokens *kept visible* for modality $k$ is:
+
+$$n_k = \text{round}\!\left(\pi_k \times \texttt{num\_encoded\_tokens}\right)$$
+
+All remaining tokens of that modality are replaced with a learnable `mask_token` and
+decoded by the output adapter.
+
+**Effect of $\alpha$:**
+
+| $\alpha$ | Distribution character | DA implication |
+|---|---|---|
+| $\alpha \to 0$ | Degenerate — almost all tokens from one modality | Unimodal reconstruction; poor cross-modal generalization |
+| $\alpha = 1$ | Uniform on $\Delta^2$ — any split equally likely | **Any-to-any reconstruction** — forces all single-modality and mixed cases |
+| $\alpha \to \infty$ | Concentrated near $(\tfrac{1}{3}, \tfrac{1}{3}, \tfrac{1}{3})$ | Always balanced; never trains the "full occlusion" case |
+
+**$\alpha = 1$ is the recommended default.** It guarantees the model sees every extreme
+masking configuration with positive probability, including the DA-critical case where
+*all* precip tokens are masked and only obs REFL + background are visible.
+
+**Token budget with `num_encoded_tokens = 512` (current config):**
+
+| Quantity | Value |
+|---|---|
+| Always-visible tokens | 361 (surface) + 361 (forcing) + 2 (global) = 724 |
+| Maskable budget | 512 distributed across 3 modalities via Dirichlet |
+| Expected per modality ($\alpha=1$) | ~171 tokens (≈ 12% of 1,444) |
+| Backbone total | 512 + 724 = **1,236 tokens** |
+
+The expected fraction per modality is $1/K = 1/3$, so on average ~171 of 1,444 tokens
+per maskable modality are visible — an ~88% per-modality mask rate. The model must
+reconstruct the full 38×38 patch grid from any sparse subset.
+
+### Flow-dependent alpha at DA inference
+
+At training time, $\alpha$ is fixed (e.g., 1.0). At DA inference time, the goal is to
+weight modalities according to local observation quality. Three approaches of increasing
+complexity:
+
+#### Approach 1 — Innovation magnitude (zero implementation cost)
+
+$$\alpha_\text{obs}(\mathbf{x}) = \sigma\!\left(\frac{|\text{REFL}_\text{obs}(\mathbf{x}) - \text{REFL}_\text{bg}(\mathbf{x})|}{\delta}\right)$$
+
+where $\sigma$ is sigmoid and $\delta$ is a threshold (e.g., 5 dBZ). The spatially-
+averaged $\bar{\alpha}_\text{obs}$ then directly controls the proportion of observation
+tokens kept visible. No new model parameters — purely data-driven at inference time.
+
+- Large innovation → $\bar{\alpha}_\text{obs} \to 1$ → more obs tokens, less background
+- Small innovation → $\bar{\alpha}_\text{obs} \to 0.5$ → balanced obs/background tokens
+
+**Recommended starting point.** Requires no additional training and directly ties
+observation quality to the physical innovation signal.
+
+#### Approach 2 — Ensemble Kalman analogy
+
+Use ensemble spread to estimate background and observation error variances:
+
+$$\alpha_\text{obs} = \frac{\sigma_\text{bg}^2}{\sigma_\text{bg}^2 + \sigma_\text{obs}^2}$$
+
+analogous to the Kalman gain. Requires either a WoFS ensemble or a separate error
+covariance estimate. Provides theoretically grounded weighting but adds a data dependency
+on ensemble output at inference time.
+
+#### Approach 3 — Learned flow-dependent alpha (MLP)
+
+Add a small MLP on top of the encoded background tokens to predict a per-token
+$\alpha(x, y)$ that gates which obs REFL tokens are admitted:
+
+```python
+class AlphaPredictor(nn.Module):
+    def __init__(self, embed_dim=768):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, 64), nn.ReLU(),
+            nn.Linear(64, 1), nn.Sigmoid()
+        )
+
+    def forward(self, bg_tokens):  # (B, N_bg, d) → (B, N_bg, 1)
+        return self.mlp(bg_tokens)
+```
+
+Requires an additional training objective (e.g., reconstruction quality as a reward
+signal, or a supervised surrogate using ensemble analyses as targets). Most expressive
+but highest implementation cost.
+
 ---
 
 ## 12. File Summary
