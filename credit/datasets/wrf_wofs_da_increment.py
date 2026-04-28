@@ -386,7 +386,8 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             hi = np.where(need_expand, hi * 2.0, hi)
             hi_val = forward(hi)
 
-        for _ in range(48):
+        # 25 steps give ~1e-7 relative precision — sufficient for float32 output.
+        for _ in range(25):
             mid = 0.5 * (lo + hi)
             f_mid = forward(mid)
             go_right = f_mid < target

@@ -133,6 +133,7 @@ def assimilate_one_timestep(
     device: torch.device,
     target_size: int = 304,
     blend_alpha: float = 1.0,
+    precip_mask_ratio: float = 1.0,
 ) -> Dict[str, np.ndarray]:
     """
     Run MAE DA for one timestep; return denormalized precip arrays.
@@ -183,6 +184,7 @@ def assimilate_one_timestep(
             surface=to_tensor(surf_arr),
             forcing=to_tensor(forcing_arr),
             blend_alpha=blend_alpha,
+            precip_mask_ratio=precip_mask_ratio,
         )  # (1, 136, H_pad, W_pad)
 
     precip_norm = precip_recon[0].cpu().numpy()  # (136, H_pad, W_pad)
@@ -190,14 +192,16 @@ def assimilate_one_timestep(
 
     # Denormalize each precip variable
     levels = precip_norm.shape[0] // len(dummy_dataset.precip_vars)
-    out = {}
+    out: Dict[str, np.ndarray] = {}
+    out_norm: Dict[str, np.ndarray] = {}  # raw network output in normalized space
     offset = 0
     for var in dummy_dataset.precip_vars:
         n_lev = levels
         slc = precip_norm[offset: offset + n_lev, ...]
+        out_norm[var] = slc.copy()  # save normalized slice before inversion
         out[var] = _denormalize_array(slc, var, mean_values, std_values, concentration_params)
         offset += n_lev
-    return out
+    return out, out_norm
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +289,7 @@ def run_rollout(args, conf: dict):
 
     target_size = int(conf["data"].get("mae_pad_to", 304))
     blend_alpha = float(conf.get("rollout", {}).get("blend_alpha", 1.0))
+    precip_mask_ratio = float(conf.get("rollout", {}).get("precip_mask_ratio", 1.0))
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
@@ -327,6 +332,7 @@ def run_rollout(args, conf: dict):
             n_time = ds.sizes.get("time", 0)
 
             recon_by_var: Dict[str, List[np.ndarray]] = {v: [] for v in dummy_ds.precip_vars}
+            recon_by_var_norm: Dict[str, List[np.ndarray]] = {v: [] for v in dummy_ds.precip_vars}
 
             for t_idx in range(n_time):
                 t0_data: Dict[str, np.ndarray] = {}
@@ -335,7 +341,7 @@ def run_rollout(args, conf: dict):
                     if var in chunk:
                         t0_data[var] = chunk[var].values
 
-                result = assimilate_one_timestep(
+                result, result_norm = assimilate_one_timestep(
                     model=m,
                     t0_data=t0_data,
                     mean_values=mean_values,
@@ -345,9 +351,12 @@ def run_rollout(args, conf: dict):
                     device=device,
                     target_size=target_size,
                     blend_alpha=blend_alpha,
+                    precip_mask_ratio=precip_mask_ratio,
                 )
                 for var, arr in result.items():
                     recon_by_var[var].append(arr)
+                for var, arr in result_norm.items():
+                    recon_by_var_norm[var].append(arr)
 
             # Stack along time and write zarr
             out_store = zarr.storage.ZipStore(out_path, mode="w")
@@ -355,9 +364,16 @@ def run_rollout(args, conf: dict):
             time_vals = ds["time"].values if "time" in ds.coords else np.arange(n_time)
             out_root.create_array("time", data=time_vals)
 
+            # Denormalized (physical units)
             for var, frames in recon_by_var.items():
                 stacked = np.stack(frames, axis=0).astype(np.float32)  # (T, level, H, W)
                 out_root.create_array(var, data=stacked, chunks=(1,) + stacked.shape[1:])
+
+            # Raw network output in normalized space (debugging: is jaggedness pre- or post-inversion?)
+            norm_grp = out_root.require_group("norm_output")
+            for var, frames in recon_by_var_norm.items():
+                stacked = np.stack(frames, axis=0).astype(np.float32)  # (T, level, H, W)
+                norm_grp.create_array(var, data=stacked, chunks=(1,) + stacked.shape[1:])
 
             out_store.close()
             logger.info("Wrote analysis to %s", out_path)

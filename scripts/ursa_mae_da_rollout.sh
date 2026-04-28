@@ -39,14 +39,14 @@ CONFIG="${PROJECT_DIR}/config/wofs_mae_da.yml"
 ROLLOUT_SCRIPT="applications/rollout_wrf_wofs_mae_da.py"
 
 # Path to the trained checkpoint (.pt file)
-CHECKPOINT="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1/best_checkpoint.pt"
+CHECKPOINT="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v2/best_checkpoint.pt"
 
 # Date range to process (YYYYMMDD, inclusive)
 START_DATE="20200415"
 END_DATE="20200515"
 
 # Directory where analysis zarr.zip files will be written
-OUT_DIR="/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/mae_da_test1"
+OUT_DIR="/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/mae_da_test3"
 
 #----- Load Modules ------------------------------------------------------------
 source $MODULESHOME/init/bash

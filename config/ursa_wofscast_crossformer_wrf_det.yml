@@ -151,8 +151,8 @@ trainer:
   start_epoch: 0
   load_weights: True
   load_optimizer: True
-  load_scheduler: False
-  load_scaler: False
+  load_scheduler: True
+  load_scaler: True
   skip_validation: True
   use_scheduler: True
   reload_epoch: True
@@ -227,8 +227,8 @@ loss:
 
 predict:
   mode: 'none'
-  save_forecast: '/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/crossformer_det_epoch4/'
+  save_forecast: '/scratch5/purged/Zhanxiang.Hua/credit_wofs_rollout_example/crossformer_det_epoch8/'
   save_vars: ['T2', 'Q2', 'U10', 'V10', 'T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT', 'COMPOSITE_REFL_10CM', 'UP_HELI_MAX', 'WSPD80', 'W_UP_MAX', 'LWP', 'RAIN_AMOUNT']
   metadata: False
-  custom_date_range: ['20210415', '20210630']
+  custom_date_range: ['20210415', '20210505']
   max_cases: 100

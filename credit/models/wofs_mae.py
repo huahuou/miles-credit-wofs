@@ -419,6 +419,8 @@ class WoFSMultiModalMAE(BaseModel):
         surface: torch.Tensor,
         forcing: torch.Tensor,
         blend_alpha: float = 1.0,
+        precip_mask_ratio: float = 1.0,
+        precip_background: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Data assimilation inference: reconstruct precip given observed reflectivity.
@@ -426,40 +428,54 @@ class WoFSMultiModalMAE(BaseModel):
         Implements the plan exactly:
           - background tokens → all visible (unmasked)
           - reflectivity tokens → replaced with obs_refl (all visible)
-          - precip tokens → fully masked (mask_token embeddings, not zeros)
+          - precip tokens → masked according to precip_mask_ratio
           - surface + forcing → always visible
 
         This is consistent with what the model was trained on: masked positions
         use the learnable mask_token, never zero-valued inputs.
 
         Args:
-            background  : (B, C_bg, H, W) — normalized background atmospheric state
-            obs_refl    : (B, C_rf, H, W) — normalized observed REFL_10CM
-            surface     : (B, C_sf, H, W) — normalized surface fields
-            forcing     : (B, C_fo, H, W) — normalized dynamic forcing
-            blend_alpha : 1.0 = pure obs REFL, 0.0 = pure model REFL (background‐REFL
-                          must be provided by caller if blend_alpha < 1.0 — here we
-                          linearly interpolate towards the zero-mean normalized state)
+            background        : (B, C_bg, H, W) — normalized background atmospheric state
+            obs_refl          : (B, C_rf, H, W) — normalized observed REFL_10CM
+            surface           : (B, C_sf, H, W) — normalized surface fields
+            forcing           : (B, C_fo, H, W) — normalized dynamic forcing
+            blend_alpha       : 1.0 = pure obs REFL, 0.0 = pure model REFL (linearly
+                                interpolates toward zero-mean normalized state)
+            precip_mask_ratio : fraction of precip tokens to mask (0.0 = fully visible,
+                                1.0 = fully masked). Tokens are selected randomly and
+                                uniformly. Default 1.0 (standard DA mode).
+            precip_background : (B, C_pr, H, W) optional background precip used as the
+                                visible precip token values when precip_mask_ratio < 1.0.
+                                If None, zeros are used for the visible token positions
+                                (normalized-space mean).
 
         Returns:
             precip_analysis : (B, C_pr, H, W) — reconstructed precip in normalized space
         """
+        precip_mask_ratio = float(precip_mask_ratio)
+        if not (0.0 <= precip_mask_ratio <= 1.0):
+            raise ValueError(f"precip_mask_ratio must be in [0, 1], got {precip_mask_ratio}")
+
         B = background.shape[0]
         device = background.device
 
         # Optional blend: interpolate obs toward normalized zero (≈ background mean)
         refl_input = blend_alpha * obs_refl  # blend_alpha=1 → pure obs
 
-        # Build modality dict — precip value doesn't matter; it will be fully masked
-        # We still need a tensor of the right shape for tokenization, but only the
-        # mask_token embeddings will reach the encoder.
-        modality_dict = {
-            "background": background,
-            "precip": torch.zeros(
+        # Build precip input tensor: use background precip for visible tokens if provided
+        precip_input = (
+            precip_background
+            if precip_background is not None
+            else torch.zeros(
                 B, self.modality_channels["precip"],
                 background.shape[-2], background.shape[-1],
                 device=device, dtype=background.dtype,
-            ),
+            )
+        )
+
+        modality_dict = {
+            "background": background,
+            "precip": precip_input,
             "reflectivity": refl_input,
             "surface": surface,
             "forcing": forcing,
@@ -486,27 +502,51 @@ class WoFSMultiModalMAE(BaseModel):
         )  # (B, total_maskable, embed_dim)
         total_maskable = maskable_tokens.shape[1]
 
-        # 3. Build DA mask: keep all background + all reflectivity; mask all precip
+        # 3. Build DA mask: keep all background + all reflectivity;
+        #    mask a fraction (precip_mask_ratio) of precip tokens randomly.
         task_masks: Dict[str, torch.Tensor] = {}
+        precip_keep_indices: Optional[torch.Tensor] = None  # local indices within precip
         for mod in self.maskable_modalities:
             n = self._num_tokens(mod)
             if mod == "precip":
-                task_masks[mod] = torch.ones(B, n, device=device, dtype=torch.long)   # all masked
+                n_mask = int(round(precip_mask_ratio * n))
+                n_keep = n - n_mask
+                if n_keep == 0:
+                    # Fully masked — all ones
+                    task_masks[mod] = torch.ones(B, n, device=device, dtype=torch.long)
+                    precip_keep_indices = None
+                else:
+                    # Randomly select n_keep tokens to keep (uniform across batch)
+                    noise = torch.rand(B, n, device=device)
+                    ids_shuffle_pr = torch.argsort(noise, dim=1)  # (B, n)
+                    ids_restore_pr = torch.argsort(ids_shuffle_pr, dim=1)
+                    mask_pr = torch.arange(n, device=device).unsqueeze(0).expand(B, -1)
+                    mask_pr = (mask_pr >= n_keep).long()
+                    # Unshuffle to original token order
+                    mask_pr = torch.gather(mask_pr, 1, ids_restore_pr)
+                    task_masks[mod] = mask_pr
+                    # Local indices of kept precip tokens for ids_keep construction
+                    precip_keep_indices = ids_shuffle_pr[:, :n_keep]  # (B, n_keep) local
             else:
                 task_masks[mod] = torch.zeros(B, n, device=device, dtype=torch.long)  # all visible
 
-        # 4. Build ids_keep from non-precip maskable tokens
+        # 4. Build ids_keep from non-precip maskable tokens + visible precip tokens
         keep_parts = []
         for mod in self.maskable_modalities:
-            if mod == "precip":
-                continue
             off = mod_offsets[mod]
             n = self._num_tokens(mod)
-            idx = torch.arange(off, off + n, device=device).unsqueeze(0).expand(B, -1)
-            keep_parts.append(idx)
-        ids_keep = torch.cat(keep_parts, dim=1)  # (B, n_bg + n_rf)
+            if mod == "precip":
+                if precip_keep_indices is not None:
+                    # Shift local precip indices to global pool indices
+                    keep_parts.append(precip_keep_indices + off)
+                # else: fully masked, nothing to keep
+            else:
+                idx = torch.arange(off, off + n, device=device).unsqueeze(0).expand(B, -1)
+                keep_parts.append(idx)
+        ids_keep = torch.cat(keep_parts, dim=1)  # (B, n_bg + n_visible_precip + n_rf)
 
-        # 5. Build ids_restore: sort combined mask so visible tokens come first
+        # 5. Build ids_restore: sort combined mask so visible tokens come first.
+        #    Works for both full (precip_mask_ratio=1.0) and partial masking.
         combined_mask = torch.cat(
             [task_masks[m] for m in self.maskable_modalities], dim=1
         ).float()  # (B, total_maskable): 0=visible, 1=masked
@@ -514,8 +554,8 @@ class WoFSMultiModalMAE(BaseModel):
         ids_shuffle = torch.argsort(combined_mask, dim=1, stable=True)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        # Use sorted ids_keep to match the combined-sort convention used in forward()
-        # (forward uses argsort of combined_mask as ids_keep)
+        # Re-derive ids_keep from the stable-sorted shuffle to keep consistent convention
+        # with forward() (ids_keep = first n_visible positions of the combined shuffle)
         n_visible = ids_keep.shape[1]
         ids_keep = ids_shuffle[:, :n_visible]  # first n_visible are the visible positions
 

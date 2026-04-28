@@ -6,6 +6,7 @@ import re
 import csv
 import shutil
 import multiprocessing as mp
+import time
 from argparse import ArgumentParser
 from glob import glob
 from pathlib import Path
@@ -576,21 +577,38 @@ def main() -> None:
     first_zarr_batch = True
     first_physical_batch = True
 
+    total_dataset_samples = len(dataset)
+    total_expected_samples = min(total_dataset_samples, int(max_samples)) if max_samples is not None else total_dataset_samples
+    total_batches = (total_expected_samples + batch_size - 1) // batch_size
+    logger.info("Starting evaluation: %s total dataset samples, expecting ~%s samples in ~%s batches",
+                total_dataset_samples, total_expected_samples, total_batches)
+    eval_start_time = time.monotonic()
+
     try:
         with torch.no_grad():
             for batch_id, batch in enumerate(loader):
+                batch_start = time.monotonic()
                 if max_samples is not None and processed_samples >= int(max_samples):
                     logger.info("Reached max_samples=%s; stopping early", int(max_samples))
                     break
 
+                logger.info(
+                    "[Batch %d/%d | %d/%d samples] Starting model inference ...",
+                    batch_id + 1, total_batches, processed_samples, total_expected_samples,
+                )
+
+                t0 = time.monotonic()
                 x, x_boundary, x_time_encode, y_true = _sample_to_model_inputs(batch, device)
                 y_pred = model(x.float(), x_boundary.float(), x_time_encode.float())
                 y_pred = _apply_residual_prediction(y_pred, x, residual_prediction, varnum_diag)
+                logger.info("  model inference done in %.2fs", time.monotonic() - t0)
 
+                t0 = time.monotonic()
                 x_np = x.detach().cpu().numpy()
                 x_boundary_np = x_boundary.detach().cpu().numpy()
                 y_true_np = y_true.detach().cpu().numpy()
                 y_pred_np = y_pred.detach().cpu().numpy()
+                logger.info("  GPU->CPU transfer done in %.2fs", time.monotonic() - t0)
 
                 index_values = batch["index"].detach().cpu().numpy().astype(np.int64).tolist()
 
@@ -645,6 +663,7 @@ def main() -> None:
                     batch_metric_rows.append(row)
 
                 if save_netcdf_enabled:
+                    t0 = time.monotonic()
                     ds_batch = _build_batch_dataset_for_zarr(
                         conf=conf,
                         sample_offset=processed_samples,
@@ -660,11 +679,15 @@ def main() -> None:
                     )
                     _append_batch_to_zarr(save_netcdf, ds_batch, is_first_batch=first_zarr_batch)
                     first_zarr_batch = False
+                    logger.info("  normalized zarr write done in %.2fs", time.monotonic() - t0)
 
                 if save_physical_enabled:
                     x_prog_np = x_np[:, :n_prog_channels, ...]
+                    t0 = time.monotonic()
                     y_true_phys_np = _denormalize_prog_increments(dataset, y_true_np, x_prog_np)
                     y_pred_phys_np = _denormalize_prog_increments(dataset, y_pred_np, x_prog_np)
+                    logger.info("  denormalization done in %.2fs", time.monotonic() - t0)
+                    t0 = time.monotonic()
                     ds_phys = _build_batch_physical_dataset_for_zarr(
                         conf=conf,
                         sample_offset=processed_samples,
@@ -677,11 +700,19 @@ def main() -> None:
                     )
                     _append_batch_to_zarr(save_physical, ds_phys, is_first_batch=first_physical_batch)
                     first_physical_batch = False
+                    logger.info("  physical zarr write done in %.2fs", time.monotonic() - t0)
 
                 processed_samples += take_n
-
-                if (batch_id + 1) % 20 == 0:
-                    logger.info("Processed %s samples", processed_samples)
+                elapsed = time.monotonic() - eval_start_time
+                rate = processed_samples / elapsed if elapsed > 0 else 0.0
+                remaining = (total_expected_samples - processed_samples) / rate if rate > 0 else float("inf")
+                logger.info(
+                    "[Batch %d/%d] batch done in %.2fs | total %d/%d samples | %.2f samples/s | ETA %.0fs",
+                    batch_id + 1, total_batches,
+                    time.monotonic() - batch_start,
+                    processed_samples, total_expected_samples,
+                    rate, remaining,
+                )
 
         if processed_samples == 0:
             raise RuntimeError("No samples were evaluated. Check --test-path and --test-date-range.")

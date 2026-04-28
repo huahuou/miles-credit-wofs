@@ -207,8 +207,9 @@ trainer:
 
   skip_validation: false
 
-  # Metric variables logged per-variable at checkpoint time (empty = use loss only)
-  save_metric_vars: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
+  # Modality loss keys logged to training_log.csv (must match keys returned by TrainerMAE:
+  # train_background_loss, train_precip_loss, train_reflectivity_loss)
+  save_metric_vars: ['background', 'precip', 'reflectivity']
 
   # LR scheduler
   use_scheduler: true

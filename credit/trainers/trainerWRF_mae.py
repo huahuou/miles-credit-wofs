@@ -28,6 +28,7 @@ import tqdm
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader, IterableDataset
 
+from credit.scheduler import update_on_batch
 from credit.trainers.base_trainer import BaseTrainer
 
 logger = logging.getLogger(__name__)
@@ -231,9 +232,14 @@ class TrainerMAE(BaseTrainer):
                     dist.all_reduce(ml_t, dist.ReduceOp.AVG, async_op=False)
                 results_dict[f"train_{mod}_loss"].append(ml_t[0].item())
 
+            # Step batch-level LR schedulers (e.g. cosine-annealing-restarts)
+            if conf["trainer"]["use_scheduler"] and conf["trainer"]["scheduler"]["scheduler_type"] in update_on_batch:
+                if (i + 1) % grad_accum_every == 0:
+                    scheduler.step()
+
             # tqdm description
-            to_print = "Epoch: {} train_loss: {:.6f}".format(
-                epoch, np.mean(results_dict["train_loss"])
+            to_print = "Epoch: {} train_loss: {:.6f} lr: {:.3e}".format(
+                epoch, np.mean(results_dict["train_loss"]), optimizer.param_groups[0]["lr"]
             )
             if self.rank == 0:
                 batch_group_generator.set_description(to_print)

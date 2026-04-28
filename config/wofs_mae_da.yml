@@ -9,7 +9,7 @@
 #       --start-date 20230501 --end-date 20230531 \
 #       --out-dir /work2/zhanxianghua/wofs_mae_analysis
 
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v2'
 seed: 1000
 
 # ===========================================================================
@@ -133,6 +133,11 @@ loss:
 rollout:
   # blend_alpha: 1.0 = pure observed reflectivity, 0.0 = pure model background
   blend_alpha: 1.0
+  # precip_mask_ratio: fraction of precip tokens masked during assimilation.
+  # 1.0 = fully masked (standard DA — model must infer all precip from REFL + background)
+  # 0.0 = fully visible (reconstruction check; model sees background precip as context)
+  # 0.5 = partial masking (intermediate; model fills in masked half conditioned on visible half)
+  precip_mask_ratio: 0.8
   # Timesteps to skip at the start / end of each case (warm-up / cold-start)
   skip_first_n: 0
   skip_last_n: 0
