@@ -156,6 +156,60 @@ def _apply_residual_prediction(
     return y_pred + residual
 
 
+def _denormalize_prog_increments(
+    dataset: "WoFSDAIncrementDataset",
+    y_norm_incr: np.ndarray,
+    x_norm_z0: np.ndarray,
+) -> np.ndarray:
+    """Convert normalized-space prognostic increments to physical-space increments.
+
+    Inverts ``norm(Q_t1) - norm(Q_t0)`` back to ``Q_t1 - Q_t0`` in original units.
+    Handles concentration transforms (QRAIN, QNRAIN, …) automatically.
+
+    Args:
+        dataset: An opened ``WoFSDAIncrementDataset`` providing normalization stats.
+        y_norm_incr: Normalized increments, shape ``(batch, n_vars*n_levels, time, H, W)``.
+        x_norm_z0: Normalized prognostic-only state at t0,
+            shape ``(batch, n_vars*n_levels, time, H, W)``.
+
+    Returns:
+        Physical increments in original variable units, same shape as inputs.
+    """
+    if not getattr(dataset, "_opened", False):
+        dataset._open_datasets()
+
+    n_levels = dataset._prognostic_levels
+    phys = np.empty_like(y_norm_incr, dtype=np.float32)
+
+    for var_idx, var_name in enumerate(dataset.varname_prognostic):
+        ch0 = var_idx * n_levels
+        ch1 = ch0 + n_levels
+
+        dz = y_norm_incr[:, ch0:ch1, ...].astype(np.float64)
+        z0 = x_norm_z0[:, ch0:ch1, ...].astype(np.float64)
+        z1 = z0 + dz
+
+        std = np.asarray(dataset._std_values[var_name], dtype=np.float64)
+        mean = np.asarray(dataset._mean_values[var_name], dtype=np.float64)
+        # Crop to reduced levels if a ceiling_level was applied
+        if std.ndim == 1 and std.shape[0] > n_levels:
+            std = std[:n_levels]
+            mean = mean[:n_levels]
+
+        # Reshape for broadcasting over (batch, n_levels, time, H, W)
+        std_bc = std.reshape(1, -1, 1, 1, 1)
+        mean_bc = mean.reshape(1, -1, 1, 1, 1)
+
+        transformed_t0 = (z0 * std_bc + mean_bc).astype(np.float32)
+        transformed_t1 = (z1 * std_bc + mean_bc).astype(np.float32)
+
+        q_t0 = dataset._inverse_var_transform(transformed_t0, var_name)
+        q_t1 = dataset._inverse_var_transform(transformed_t1, var_name)
+        phys[:, ch0:ch1, ...] = (q_t1 - q_t0).astype(np.float32)
+
+    return phys
+
+
 def _make_output_channel_names(conf: dict) -> list[str]:
     varnames = conf["data"]["variables"]
     num_levels = int(conf["model"]["param_interior"]["levels"])
@@ -264,31 +318,72 @@ def _build_batch_dataset_for_zarr(
     return ds
 
 
+def _build_batch_physical_dataset_for_zarr(
+    conf: dict,
+    sample_offset: int,
+    y_true_phys: np.ndarray,
+    y_pred_phys: np.ndarray,
+    sample_indices: list[int],
+    case_names: list[str],
+    case_paths: list[str],
+    valid_times: list[np.datetime64],
+) -> xr.Dataset:
+    output_channels = _make_output_channel_names(conf)
+    n_samples, _, n_time, n_y, n_x = y_true_phys.shape
+
+    if y_true_phys.shape[1] != len(output_channels):
+        output_channels = [f"output_ch_{i}" for i in range(y_true_phys.shape[1])]
+
+    ds = xr.Dataset(
+        data_vars={
+            "y_true_phys": (["sample", "output_channel", "time", "y", "x"], y_true_phys.astype(np.float32)),
+            "y_pred_phys": (["sample", "output_channel", "time", "y", "x"], y_pred_phys.astype(np.float32)),
+            "case_name": (["sample"], _fixed_bytes(case_names, 128)),
+            "case_path": (["sample"], _fixed_bytes(case_paths, 512)),
+            "global_index": (["sample"], np.array(sample_indices, dtype=np.int64)),
+        },
+        coords={
+            "sample": np.arange(sample_offset, sample_offset + n_samples, dtype=np.int64),
+            "time": np.arange(n_time, dtype=np.int64),
+            "y": np.arange(n_y, dtype=np.int64),
+            "x": np.arange(n_x, dtype=np.int64),
+            "output_channel": np.array(output_channels, dtype=str),
+            "valid_time": (["sample"], np.array(valid_times, dtype="datetime64[ns]")),
+        },
+    )
+    ds.attrs["description"] = "Physical-space WoFS DA increments — y_true and y_pred denormalized to original variable units"
+    ds.attrs["metric_space"] = "physical space (original variable units, e.g. kg kg-1)"
+    ds.attrs["save_loc"] = str(conf.get("save_loc", ""))
+    ds.attrs["variables"] = ",".join(conf["data"].get("variables", []))
+    return ds
+
+
 def _append_batch_to_zarr(store_path: str, ds_batch: xr.Dataset, is_first_batch: bool) -> None:
     store_dir = os.path.dirname(store_path)
     if store_dir:
         os.makedirs(store_dir, exist_ok=True)
-    encoding = {
-        "x_input": {"chunks": (1, ds_batch.sizes["input_channel"], ds_batch.sizes["time"], ds_batch.sizes["y"], ds_batch.sizes["x"])},
-        "x_boundary": {
-            "chunks": (
-                1,
-                ds_batch.sizes["boundary_channel"],
-                ds_batch.sizes["time"],
-                ds_batch.sizes["y"],
-                ds_batch.sizes["x"],
-            )
-        },
-        "y_true": {"chunks": (1, ds_batch.sizes["output_channel"], ds_batch.sizes["time"], ds_batch.sizes["y"], ds_batch.sizes["x"])},
-        "y_pred": {"chunks": (1, ds_batch.sizes["output_channel"], ds_batch.sizes["time"], ds_batch.sizes["y"], ds_batch.sizes["x"])},
-        "metric_acc": {"chunks": (max(1, ds_batch.sizes["sample"]),)},
-        "metric_rmse": {"chunks": (max(1, ds_batch.sizes["sample"]),)},
-        "metric_mse": {"chunks": (max(1, ds_batch.sizes["sample"]),)},
-        "metric_mae": {"chunks": (max(1, ds_batch.sizes["sample"]),)},
-        "global_index": {"chunks": (max(1, ds_batch.sizes["sample"]),)},
-        "case_name": {"chunks": (max(1, ds_batch.sizes["sample"]),)},
-        "case_path": {"chunks": (max(1, ds_batch.sizes["sample"]),)},
-    }
+
+    sz = ds_batch.sizes
+    n_sample = max(1, sz["sample"])
+    spatial_chunk = (1, sz.get("time", 1), sz.get("y", 1), sz.get("x", 1))
+
+    encoding: dict = {}
+    if "x_input" in ds_batch:
+        encoding["x_input"] = {"chunks": (1, sz["input_channel"]) + spatial_chunk[1:]}
+    if "x_boundary" in ds_batch:
+        encoding["x_boundary"] = {"chunks": (1, sz["boundary_channel"]) + spatial_chunk[1:]}
+    if "y_true" in ds_batch:
+        encoding["y_true"] = {"chunks": (1, sz["output_channel"]) + spatial_chunk[1:]}
+    if "y_pred" in ds_batch:
+        encoding["y_pred"] = {"chunks": (1, sz["output_channel"]) + spatial_chunk[1:]}
+    if "y_true_phys" in ds_batch:
+        encoding["y_true_phys"] = {"chunks": (1, sz["output_channel"]) + spatial_chunk[1:]}
+    if "y_pred_phys" in ds_batch:
+        encoding["y_pred_phys"] = {"chunks": (1, sz["output_channel"]) + spatial_chunk[1:]}
+    for scalar_var in ("metric_acc", "metric_rmse", "metric_mse", "metric_mae", "global_index", "case_name", "case_path"):
+        if scalar_var in ds_batch:
+            encoding[scalar_var] = {"chunks": (n_sample,)}
+
     if is_first_batch:
         ds_batch.to_zarr(store_path, mode="w", encoding=encoding, zarr_format=2)
     else:
@@ -312,6 +407,12 @@ def main() -> None:
         "--save-metrics-csv",
         default=None,
         help="Output CSV path (overrides eval.save_metrics_csv_path or eval.save_forecast/output_metrics_name)",
+    )
+    parser.add_argument(
+        "--save-physical",
+        default=None,
+        help="Output physical-space Zarr store path (overrides eval.save_physical_zarr_path). "
+             "Defaults to <save-inference path with _physical suffix>.",
     )
     args = parser.parse_args()
 
@@ -351,6 +452,15 @@ def main() -> None:
     if str(save_netcdf).endswith(".nc"):
         save_netcdf = f"{save_netcdf[:-3]}.zarr"
         logger.info("Samples store path ends with .nc; using Zarr store path %s", save_netcdf)
+
+    # Physical-space Zarr: derive default from normalized-store path
+    _physical_default = str(save_netcdf).removesuffix(".zarr") + "_physical.zarr"
+    save_physical = (
+        args.save_physical
+        if args.save_physical
+        else eval_conf.get("save_physical_zarr_path", _physical_default)
+    )
+    save_physical_enabled = bool(eval_conf.get("save_physical", True))
 
     seed_everything(conf["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -431,6 +541,7 @@ def main() -> None:
 
     residual_prediction = bool(conf["trainer"].get("residual_prediction", False))
     varnum_diag = len(conf["data"].get("diagnostic_variables", []))
+    n_prog_channels = len(conf["data"]["variables"]) * int(conf["model"]["param_interior"]["levels"])
 
     save_netcdf_enabled = bool(eval_conf.get("save_netcdf", True))
     overwrite_samples_store = bool(eval_conf.get("overwrite_samples_store", True))
@@ -440,6 +551,12 @@ def main() -> None:
             shutil.rmtree(save_netcdf)
         else:
             os.remove(save_netcdf)
+
+    if save_physical_enabled and overwrite_samples_store and os.path.exists(save_physical):
+        if os.path.isdir(save_physical):
+            shutil.rmtree(save_physical)
+        else:
+            os.remove(save_physical)
 
     metrics_dir = os.path.dirname(save_metrics_csv)
     if metrics_dir:
@@ -457,6 +574,7 @@ def main() -> None:
     sum_mae = 0.0
 
     first_zarr_batch = True
+    first_physical_batch = True
 
     try:
         with torch.no_grad():
@@ -543,6 +661,23 @@ def main() -> None:
                     _append_batch_to_zarr(save_netcdf, ds_batch, is_first_batch=first_zarr_batch)
                     first_zarr_batch = False
 
+                if save_physical_enabled:
+                    x_prog_np = x_np[:, :n_prog_channels, ...]
+                    y_true_phys_np = _denormalize_prog_increments(dataset, y_true_np, x_prog_np)
+                    y_pred_phys_np = _denormalize_prog_increments(dataset, y_pred_np, x_prog_np)
+                    ds_phys = _build_batch_physical_dataset_for_zarr(
+                        conf=conf,
+                        sample_offset=processed_samples,
+                        y_true_phys=y_true_phys_np,
+                        y_pred_phys=y_pred_phys_np,
+                        sample_indices=[int(i) for i in index_values],
+                        case_names=batch_case_names,
+                        case_paths=batch_case_paths,
+                        valid_times=batch_valid_times,
+                    )
+                    _append_batch_to_zarr(save_physical, ds_phys, is_first_batch=first_physical_batch)
+                    first_physical_batch = False
+
                 processed_samples += take_n
 
                 if (batch_id + 1) % 20 == 0:
@@ -568,6 +703,8 @@ def main() -> None:
 
     if save_netcdf_enabled:
         logger.info("Saved plotting Zarr store to %s", save_netcdf)
+    if save_physical_enabled:
+        logger.info("Saved physical-space Zarr store to %s", save_physical)
     logger.info("Saved trainer-like test metrics CSV to %s", save_metrics_csv)
     logger.info(
         "Aggregate normalized-space metrics: acc=%.6f rmse=%.6f mse=%.6f mae=%.6f",

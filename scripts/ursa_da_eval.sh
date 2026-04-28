@@ -23,7 +23,7 @@
 #SBATCH --gpus-per-node=h100:2                # 2 H100 GPUs per node
 #SBATCH --cpus-per-task=192                    # CPU cores per task (for data loading workers)
 #SBATCH --mem=0                               # Use all available memory on the node
-#SBATCH --time=23:59:00                       # Wall time limit
+#SBATCH --time=08:59:00                       # Wall time limit
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out                   # stdout: <job-name>-<job-id>.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err                     # stderr: <job-name>-<job-id>.err
 #SBATCH --exclusive                           # Exclusive node access for best GPU performance
@@ -39,6 +39,10 @@ CONDA_ENV="credit-wofs"                       # Name or path of your conda envir
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
 CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423/model.yml"
 EVAL_SCRIPT="applications/eval_wrf_wofs_da_trainer_like.py"   # Evaluation script
+SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_wofs_da_example/wofs_da_increment_experiment_0423/test2/eval_physical.zarr"                              # Path for physical-space Zarr store.
+                                              # Leave empty to auto-derive from eval.save_zarr_path
+                                              # (appends _physical.zarr suffix). Example:
+                                              # SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423/eval_physical.zarr"
 
 #----- Load Modules ------------------------------------------------------------
 # Source the module system so module commands work inside batch scripts
@@ -91,6 +95,7 @@ echo "CONFIG            = ${CONFIG}"
 echo "EVAL_SCRIPT       = ${EVAL_SCRIPT}"
 echo "CONDA_ENV         = ${CONDA_ENV}"
 echo "CUDA_VISIBLE_DEVICES = ${CUDA_VISIBLE_DEVICES}"
+echo "SAVE_PHYSICAL         = ${SAVE_PHYSICAL:-<auto-derived>}"
 echo "============================================================"
 
 #----- CUDA/NCCL preflight ----------------------------------------------------
@@ -110,6 +115,7 @@ PY
 
 cd ${PROJECT_DIR}
 
-srun --cpu-bind=none python ${EVAL_SCRIPT} ${CONFIG}
+srun --cpu-bind=none python ${EVAL_SCRIPT} ${CONFIG} \
+    ${SAVE_PHYSICAL:+--save-physical "${SAVE_PHYSICAL}"}
 
 echo "Evaluation finished with exit code: $?"

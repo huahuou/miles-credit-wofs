@@ -192,6 +192,9 @@ class WoFSMAEDataset(Dataset):
         self._concentration_params: dict = {v: dict(_DEFAULT_CONCENTRATION_PARAMS) for v in CONCENTRATION_VARS}
         self._mean_values: dict = {}
         self._std_values: dict = {}
+        # Files that failed to open during training are blacklisted so workers
+        # don't waste retries on them again.
+        self._bad_file_indices: set = set()
 
         # Determine which vars have levels in the zarr (upper-air = 3D)
         self._upper_air_set = set(self._upper_air_vars)
@@ -314,13 +317,26 @@ class WoFSMAEDataset(Dataset):
             self._safe_close_dataset(ds)
 
     def _get_upper_ds(self, file_idx: int):
+        if file_idx in self._bad_file_indices:
+            raise RuntimeError(
+                f"File index {file_idx} ({self.filenames[file_idx]}) is blacklisted "
+                "after previous open failure."
+            )
         cached = self.upper_ds_cache.get(file_idx)
         if cached is not None:
             self.upper_ds_cache.move_to_end(file_idx)
             return cached
-        ds = self._open_filtered_dataset(
-            self.filenames[file_idx], self._upper_air_vars, self.max_dataset_open_retries
-        )
+        try:
+            ds = self._open_filtered_dataset(
+                self.filenames[file_idx], self._upper_air_vars, self.max_dataset_open_retries
+            )
+        except Exception as exc:
+            self._bad_file_indices.add(file_idx)
+            logger.warning(
+                "Blacklisting file %s after repeated open failures: %s",
+                self.filenames[file_idx], exc,
+            )
+            raise
         self.upper_ds_cache[file_idx] = ds
         self._evict_if_needed(self.upper_ds_cache)
         return ds
@@ -428,10 +444,8 @@ class WoFSMAEDataset(Dataset):
     # ------------------------------------------------------------------ #
     # __getitem__
     # ------------------------------------------------------------------ #
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        if not self._opened:
-            self._open_datasets()
-
+    def _load_sample(self, index: int) -> Dict[str, torch.Tensor]:
+        """Load a single sample by global index.  Raises on any failure."""
         file_idx, ind_in_file = self._locate_index(index)
         t0 = ind_in_file
         t1 = ind_in_file + 1
@@ -478,6 +492,28 @@ class WoFSMAEDataset(Dataset):
             "forcing":      torch.as_tensor(forcing_arr, dtype=self.output_dtype),
             "index":        index,
         }
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        if not self._opened:
+            self._open_datasets()
+
+        _max_retries = 5
+        _last_exc: Optional[Exception] = None
+        for _attempt in range(_max_retries):
+            try:
+                return self._load_sample(index)
+            except Exception as exc:
+                _last_exc = exc
+                logger.warning(
+                    "Sample index=%d failed (attempt %d/%d): %s — picking a random replacement.",
+                    index, _attempt + 1, _max_retries, exc,
+                )
+                # Pick a different random index to avoid looping on the same bad file.
+                index = int(self.rng.integers(0, max(1, self.total_length)))
+
+        raise RuntimeError(
+            f"WoFSMAEDataset: all {_max_retries} sample retries exhausted"
+        ) from _last_exc
 
     # ------------------------------------------------------------------ #
     # Forcing channel computation

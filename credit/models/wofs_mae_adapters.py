@@ -93,10 +93,10 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Flash Attention: O(N) memory vs O(N²) for the explicit softmax path
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj_drop(self.proj(x))
 
 
@@ -119,10 +119,10 @@ class CrossAttention(nn.Module):
         q = self.q(query).reshape(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)
         kv = self.kv(context).reshape(B, Nk, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv.unbind(0)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, Nq, C)
+        # Flash Attention: O(N) memory vs O(N²) for the explicit softmax path
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        x = x.transpose(1, 2).reshape(B, Nq, C)
         return self.proj_drop(self.proj(x))
 
 
@@ -267,33 +267,48 @@ class WoFSInputAdapter(nn.Module):
 
 class WoFSOutputAdapter(nn.Module):
     """
-    Per-modality cross-attention output adapter.
+    Per-modality cross-attention output adapter with overlapping decode.
 
-    Decodes (B, N_vis, embed_dim) encoder output → (B, C, H, W) reconstruction:
+    Decodes (B, N_vis, embed_dim) encoder output → (B, C, H, W) reconstruction
+    using a dense sliding-window query grid at stride = patch_size // 2.  Each
+    query token predicts a full patch_size × patch_size pixel block; overlapping
+    predictions are averaged via F.fold, eliminating the 8-pixel checkerboard
+    discontinuity produced by non-overlapping tiling.
+
+    Encoding grid  (stride = patch_size)      : N_H × N_W = 38 × 38 = 1 444 tokens
+    Decode query grid (stride = decode_stride): N_H_dense × N_W_dense            = 75 × 75 = 5 625 tokens  (at default decode_stride = 4)
+
+    Decode pipeline:
         1. Project encoder tokens: embed_dim → decoder_dim
-        2. Build spatial query tokens (positional + modality + task embeddings)
-           Fill unobserved query positions with mask_token
-        3. One cross-attention block: queries attend to all encoder tokens
-        4. depth self-attention blocks on query side
-        5. Linear out_proj: decoder_dim → C * P_H * P_W
-        6. Rearrange patches → (B, C, H_pad, W_pad); crop to original H, W
+        2. Add per-task context embeddings to distinguish modality origin
+        3. Build 5 625 spatial query tokens (dense pos emb + modality emb)
+        4. Bilinear-upsample encoder context from 38×38 → 75×75 and add to queries
+        5. Cross-attention: queries attend to all encoder tokens
+        6. Self-attention refinement (decoder_depth blocks)
+        7. out_proj: decoder_dim → C × P × P  per query token
+        8. F.fold with stride = decode_stride to assemble overlapping patches
+        9. Divide by overlap count → averaged reconstruction
+       10. Crop padded size back to original H × W
 
     Args:
         num_channels    : int          — output channels C
-        patch_size      : int          — spatial patch size P
+        patch_size      : int          — spatial patch size P (default 8)
+        decode_stride   : int | None   — decode query stride (default patch_size // 2 = 4)
         embed_dim       : int          — encoder token dimension
         decoder_dim     : int          — decoder internal dimension
-        decoder_depth   : int          — extra self-attention blocks after cross-attn
+        decoder_depth   : int          — self-attention blocks after cross-attn
         num_heads       : int          — decoder attention heads
         image_size      : tuple        — (H_pad, W_pad) after padding
-        context_tasks   : list[str]    — all modality keys for per-task context embeddings
-        task            : str | None   — which task this adapter reconstructs
+        context_tasks   : list[str]    — modality keys for per-task context embeddings
+        task            : str | None   — which modality this adapter reconstructs
+        use_task_queries: bool         — blend upsampled encoder context into queries
     """
 
     def __init__(
         self,
         num_channels: int,
         patch_size: int = 8,
+        decode_stride: Optional[int] = None,
         embed_dim: int = 768,
         decoder_dim: int = 384,
         decoder_depth: int = 6,
@@ -307,26 +322,36 @@ class WoFSOutputAdapter(nn.Module):
         super().__init__()
         self.num_channels = num_channels
         self.patch_size = patch_size
+        self.decode_stride = decode_stride if decode_stride is not None else max(1, patch_size // 2)
         self.embed_dim = embed_dim
         self.decoder_dim = decoder_dim
         self.image_size = image_size
         self.task = task
         self.use_task_queries = use_task_queries
 
+        # Encoder patch grid (stride = patch_size) — used for ctx indexing
         N_H = image_size[0] // patch_size
         N_W = image_size[1] // patch_size
         self.N_H = N_H
         self.N_W = N_W
-        self.num_patches = N_H * N_W
+        self.num_patches = N_H * N_W  # 1 444 — must match WoFSInputAdapter.num_patches
+
+        # Dense decode query grid (stride = decode_stride)
+        # Number of sliding-window positions: (size - kernel) // stride + 1
+        N_H_dense = (image_size[0] - patch_size) // self.decode_stride + 1
+        N_W_dense = (image_size[1] - patch_size) // self.decode_stride + 1
+        self.N_H_dense = N_H_dense
+        self.N_W_dense = N_W_dense
+        self.num_queries = N_H_dense * N_W_dense  # 5 625 at stride=4, P=8, 304×304
 
         # Project encoder tokens to decoder_dim
         self.proj_context = nn.Linear(embed_dim, decoder_dim)
 
-        # Learnable mask token (used for unobserved/masked positions in query)
+        # Learnable mask token for unobserved encoder positions
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         trunc_normal_(self.mask_token, std=0.02)
 
-        # Per-context-task learned embeddings (added to context before cross-attn)
+        # Per-context-task embeddings added to context before cross-attn
         if context_tasks:
             self.task_embeddings = nn.ParameterDict({
                 t: nn.Parameter(torch.zeros(1, 1, decoder_dim)) for t in context_tasks
@@ -336,11 +361,11 @@ class WoFSOutputAdapter(nn.Module):
         else:
             self.task_embeddings = None
 
-        # Fixed sin-cos positional embedding for query tokens
-        pos_emb = build_2d_sincos_posemb(N_H, N_W, decoder_dim)
-        self.register_buffer("pos_emb", pos_emb)
+        # Fixed sin-cos positional embedding for the DENSE query grid (75×75)
+        pos_emb = build_2d_sincos_posemb(N_H_dense, N_W_dense, decoder_dim)
+        self.register_buffer("pos_emb", pos_emb)  # (1, decoder_dim, N_H_dense, N_W_dense)
 
-        # Learnable modality embedding for this adapter's queries
+        # Learnable modality embedding broadcast over all query tokens
         self.modality_emb = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         trunc_normal_(self.modality_emb, std=0.02)
 
@@ -351,7 +376,7 @@ class WoFSOutputAdapter(nn.Module):
         self.cross_out_norm = nn.LayerNorm(decoder_dim)
         self.cross_mlp = Mlp(decoder_dim, hidden_features=int(decoder_dim * mlp_ratio))
 
-        # Self-attention blocks
+        # Self-attention refinement blocks
         if decoder_depth > 0:
             dpr = [x.item() for x in torch.linspace(0, 0.0, decoder_depth)]
             self.decoder_blocks = nn.Sequential(*[
@@ -361,9 +386,22 @@ class WoFSOutputAdapter(nn.Module):
         else:
             self.decoder_blocks = nn.Identity()
 
-        # Output projection: decoder_dim → C * P * P
+        # Output projection: decoder_dim → C * P * P  (same as before)
         self.out_norm = nn.LayerNorm(decoder_dim)
         self.out_proj = nn.Linear(decoder_dim, num_channels * patch_size * patch_size)
+
+        # Precompute the per-pixel overlap count for fold normalization.
+        # fold sums overlapping patches; dividing by fold_count gives the average.
+        # Shape: (1, 1, H_pad, W_pad) — broadcast over B and C.
+        with torch.no_grad():
+            ones = torch.ones(1, patch_size * patch_size, N_H_dense * N_W_dense)
+            fold_count = F.fold(
+                ones,
+                output_size=image_size,
+                kernel_size=patch_size,
+                stride=self.decode_stride,
+            )  # (1, 1, H_pad, W_pad)
+        self.register_buffer("fold_count", fold_count)
 
         self._init_weights()
 
@@ -383,21 +421,21 @@ class WoFSOutputAdapter(nn.Module):
         """
         Args:
             encoder_tokens : (B, N_vis, embed_dim)  — visible encoder output
-            ids_keep       : (B, num_encoded_tokens) — token indices that were kept
-            ids_restore    : (B, total_tokens)       — inverse permutation
-            num_task_tokens: int  — total maskable tokens (all 3 maskable modalities)
-            task_start_idx : int  — where this modality's tokens start in the full sequence
-            input_info     : dict — modality info (for context task embeddings)
+            ids_keep       : (B, num_encoded_tokens) — indices of kept maskable tokens
+            ids_restore    : (B, total_maskable)     — inverse permutation
+            num_task_tokens: int  — total maskable tokens across all modalities
+            task_start_idx : int  — offset of this modality in the maskable pool
+            input_info     : dict — modality metadata (orig_h, orig_w, tasks)
 
         Returns:
-            out : (B, C, H, W)  — reconstructed field (cropped from padded size)
+            out : (B, C, H, W)  — reconstructed field cropped to original size
         """
         B = encoder_tokens.shape[0]
 
-        # 1. Project encoder tokens
+        # 1. Project encoder tokens to decoder_dim
         ctx = self.proj_context(encoder_tokens)
 
-        # 2. Add per-task context embeddings (identify origin modality in context)
+        # 2. Add per-task context embeddings so cross-attn knows each token's modality
         if self.task_embeddings is not None and input_info.get("tasks"):
             ctx_parts = []
             cursor = 0
@@ -410,33 +448,43 @@ class WoFSOutputAdapter(nn.Module):
                 cursor += n
             ctx = torch.cat(ctx_parts, dim=1)
 
-        # 3. Build decoder query tokens (one per output patch)
-        pos = F.interpolate(
-            self.pos_emb, size=(self.N_H, self.N_W), mode="bicubic", align_corners=False
-        ).to(encoder_tokens.dtype)
-        pos = rearrange(pos, "b d nh nw -> b (nh nw) d").expand(B, -1, -1)
-        queries = pos + self.modality_emb  # (B, N_tok, decoder_dim)
+        # 3. Build DENSE query tokens at stride = decode_stride (75×75 = 5 625)
+        pos = rearrange(
+            self.pos_emb.to(encoder_tokens.dtype), "b d nh nw -> b (nh nw) d"
+        ).expand(B, -1, -1)                                    # (B, num_queries, decoder_dim)
+        queries = pos + self.modality_emb
 
-        # 4. Fill mask tokens for positions that were not kept
-        #    ids_restore is over num_task_tokens (the maskable token pool)
-        #    We need to reconstruct this modality's patch from the decoder tokens
-        mask_tokens = self.mask_token.expand(B, num_task_tokens - ids_keep.shape[1], -1)
-        # embed all visible tokens (in encoder order) and pad with mask tokens
-        ctx_no_global = ctx[:, : ids_keep.shape[1], :]  # strip global tokens if any
-        ctx_with_mask = torch.cat([ctx_no_global, mask_tokens], dim=1)  # (B, num_task_tokens, decoder_dim)
-        # unshuffle
-        ctx_with_mask = torch.gather(
-            ctx_with_mask, 1,
-            ids_restore.unsqueeze(-1).expand(-1, -1, self.decoder_dim)
-        )
-        # Take only this modality's slice
-        this_ctx = ctx_with_mask[:, task_start_idx: task_start_idx + self.num_patches, :]
-
-        # Override query positions where we have observed data with the context
+        # 4. Reconstruct per-token encoder context, then bilinear-upsample
+        #    from the encoder grid (38×38) to the dense query grid (75×75).
+        #    This injects "was this position masked/visible?" as a spatial prior.
         if self.use_task_queries:
-            queries = queries + this_ctx
+            n_kept = ids_keep.shape[1]
+            mask_tokens = self.mask_token.expand(B, num_task_tokens - n_kept, -1)
+            ctx_no_global = ctx[:, :n_kept, :]
+            ctx_with_mask = torch.cat([ctx_no_global, mask_tokens], dim=1)
+            ctx_with_mask = torch.gather(
+                ctx_with_mask, 1,
+                ids_restore.unsqueeze(-1).expand(-1, -1, self.decoder_dim),
+            )  # (B, num_task_tokens, decoder_dim) — unshuffled
 
-        # 5. Cross attention: queries attend to full encoder context
+            # Slice this modality's encoder patches: (B, num_patches, decoder_dim)
+            this_ctx = ctx_with_mask[
+                :, task_start_idx: task_start_idx + self.num_patches, :
+            ]
+            # Upsample 38×38 → 75×75 via bilinear interpolation
+            this_ctx = rearrange(
+                this_ctx, "b (nh nw) d -> b d nh nw", nh=self.N_H, nw=self.N_W
+            )
+            this_ctx = F.interpolate(
+                this_ctx,
+                size=(self.N_H_dense, self.N_W_dense),
+                mode="bilinear",
+                align_corners=False,
+            )
+            this_ctx = rearrange(this_ctx, "b d nh nw -> b (nh nw) d")
+            queries = queries + this_ctx                        # (B, num_queries, decoder_dim)
+
+        # 5. Cross-attention: dense queries attend to all encoder context tokens
         x = queries + self.cross_mlp(
             self.cross_out_norm(
                 self.cross_attn(self.cross_norm_q(queries), self.cross_norm_ctx(ctx))
@@ -446,15 +494,19 @@ class WoFSOutputAdapter(nn.Module):
         # 6. Self-attention refinement
         x = self.decoder_blocks(x)
 
-        # 7. Project to pixel space
-        x = self.out_proj(self.out_norm(x))  # (B, N_tok, C*P*P)
+        # 7. Project each query to a full P×P pixel block
+        x = self.out_proj(self.out_norm(x))                    # (B, num_queries, C*P*P)
 
-        # 8. Reshape to image
-        x = rearrange(
-            x, "b (nh nw) (c ph pw) -> b c (nh ph) (nw pw)",
-            nh=self.N_H, nw=self.N_W, ph=self.patch_size, pw=self.patch_size,
-            c=self.num_channels,
-        )
+        # 8. Overlap-add via F.fold, then normalize by per-pixel overlap count
+        #    fold expects (B, C*P*P, L) and produces (B, C, H_pad, W_pad)
+        x = x.permute(0, 2, 1)                                 # (B, C*P*P, num_queries)
+        x = F.fold(
+            x,
+            output_size=self.image_size,
+            kernel_size=self.patch_size,
+            stride=self.decode_stride,
+        )                                                       # (B, C, H_pad, W_pad)
+        x = x / self.fold_count                                # average overlapping patches
 
         # 9. Crop padded size back to original
         orig_h = input_info.get("orig_h", self.image_size[0])
