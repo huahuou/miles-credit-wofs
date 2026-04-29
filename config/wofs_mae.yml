@@ -7,7 +7,7 @@
 #   torchrun --standalone --nnodes=1 --nproc-per-node=4 \
 #       applications/train_wrf_wofs_mae.py -c config/wofs_mae.yml
 
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v2'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1'
 seed: 1000
 
 # ===========================================================================
@@ -75,7 +75,7 @@ data:
   # DataLoader tuning
   zarr_time_chunk: 2
   max_open_files_per_worker: 8
-  max_dataset_open_retries: 3
+  max_dataset_open_retries: 4
 
   # Fields required by credit_main_parser (unused by MAE but must exist)
   scaler_type: 'std-wrf'
@@ -184,7 +184,7 @@ trainer:
 
   # Per-modality MAE loss weights
   loss_weights:
-    background: 0.5
+    background: 0.75
     precip: 2.0
     reflectivity: 1.0
 

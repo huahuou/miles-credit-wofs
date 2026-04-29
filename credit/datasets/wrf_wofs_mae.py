@@ -110,6 +110,10 @@ def _coerce_concentration_params(params: Optional[dict]) -> dict:
 
 
 def _forward_concentration_numpy(arr: np.ndarray, params: dict) -> np.ndarray:
+    """Concentration transform matching WoFSDAIncrementDataset._forward_concentration_numpy.
+
+    f(x) = c1 * min(x, conc_max) + c2 * (log(max(x, conc_eps)) - log(conc_eps)) / (-log(conc_eps))
+    """
     c1 = float(params["c1"])
     c2 = float(params["c2"])
     eps = float(params["conc_eps"])
@@ -117,12 +121,15 @@ def _forward_concentration_numpy(arr: np.ndarray, params: dict) -> np.ndarray:
     clip_min = params.get("value_clip_min")
     clip_max = params.get("value_clip_max")
 
-    x = arr.astype(np.float32, copy=True)
-    if clip_min is not None or clip_max is not None:
-        x = np.clip(x, clip_min, clip_max)
-    x = np.clip(x, 0.0, None)
-    x = np.arctan(c1 * np.log(x / eps + 1.0)) / np.arctan(c2 * np.log(cmax / eps + 1.0))
-    return x
+    x = arr.astype(np.float64, copy=True)
+    if clip_min is not None:
+        x = np.maximum(x, float(clip_min))
+    if clip_max is not None:
+        x = np.minimum(x, float(clip_max))
+    log_eps = float(np.log(eps))
+    neg_log_eps = float(-log_eps)
+    transformed = c1 * np.minimum(x, cmax) + c2 * (np.log(np.maximum(x, eps)) - log_eps) / neg_log_eps
+    return transformed.astype(np.float32, copy=False)
 
 
 class WoFSMAEDataset(Dataset):

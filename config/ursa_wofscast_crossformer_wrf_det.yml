@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_crossformer_wrf_det_v1'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_crossformer_wrf_det_fullpred'
 seed: 1000
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -143,16 +143,16 @@ trainer:
   thread_workers: 8
   valid_thread_workers: 8
   prefetch_factor: 1
-  residual_prediction: True
+  residual_prediction: False
   update_learning_rate: False
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   amp: True
   start_epoch: 0
-  load_weights: True
-  load_optimizer: True
-  load_scheduler: True
-  load_scaler: True
+  load_weights: False
+  load_optimizer: False
+  load_scheduler: False
+  load_scaler: False
   skip_validation: True
   use_scheduler: True
   reload_epoch: True
@@ -162,7 +162,7 @@ trainer:
     first_cycle_steps: 1000
     cycle_mult: 2.0
     max_lr: 1.0e-03
-    min_lr: 1.0e-04
+    min_lr: 8.0e-05
     warmup_steps: 999
     gamma: 0.8
   grad_max_norm: 1.0
@@ -220,8 +220,8 @@ loss:
   # contribute little useful learning signal while potentially biasing the loss.
   # 16 px × 3 km = 48 km, matching the pad_lat/pad_lon ring in padding_conf.
   # Set to 0 to disable. Compatible with padding_conf.activate: True/False.
-  interior_crop_pixels: 16
-  use_spectral_loss: True
+  interior_crop_pixels: 0
+  use_spectral_loss: False
   spectral_lambda_reg: 0.05
   spectral_wavenum_init: 10
 

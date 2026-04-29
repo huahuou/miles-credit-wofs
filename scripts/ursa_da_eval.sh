@@ -39,7 +39,7 @@ CONDA_ENV="credit-wofs"                       # Name or path of your conda envir
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
 CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423/model.yml"
 EVAL_SCRIPT="applications/eval_wrf_wofs_da_trainer_like.py"   # Evaluation script
-SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_wofs_da_example/wofs_da_increment_experiment_0423/test3/eval_physical.zarr"                              # Path for physical-space Zarr store.
+SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_wofs_da_example/wofs_da_increment_experiment_0423/test4/eval_physical.zarr"                              # Path for physical-space Zarr store.
                                               # Leave empty to auto-derive from eval.save_zarr_path
                                               # (appends _physical.zarr suffix). Example:
                                               # SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423/eval_physical.zarr"

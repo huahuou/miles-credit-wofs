@@ -369,32 +369,49 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         conc_max = float(params["conc_max"])
         clip_min = params.get("value_clip_min")
         clip_max = params.get("value_clip_max")
-        log_eps = float(np.log(conc_eps))
-        neg_log_eps = float(-log_eps)
+        log_eps = float(np.log(conc_eps))           # ln(conc_eps) < 0
+        neg_log_eps = float(-log_eps)               # ln(1/conc_eps) > 0
 
-        def forward(v: np.ndarray) -> np.ndarray:
-            return c1 * np.minimum(v, conc_max) + c2 * (np.log(np.maximum(v, conc_eps)) - log_eps) / neg_log_eps
+        # --- Piecewise boundary values in transform (y) space ----------------
+        # y1 = f(conc_eps): log term is exactly 0 at x=conc_eps, so f = c1*conc_eps
+        y1 = c1 * conc_eps
+        # y2 = f(conc_max): last point where x appears linearly in the log term
+        y2 = c1 * conc_max + c2 * (np.log(conc_max) - log_eps) / neg_log_eps
 
-        lo = np.zeros_like(target)
-        hi = np.full_like(target, max(conc_max * 2.0, conc_eps * 2.0))
-        hi_val = forward(hi)
+        out = np.empty_like(target)
 
-        for _ in range(40):
-            need_expand = hi_val < target
-            if not np.any(need_expand):
-                break
-            hi = np.where(need_expand, hi * 2.0, hi)
-            hi_val = forward(hi)
+        # --- Region 1: target <= y1 (x < conc_eps) ---------------------------
+        # f(x) = c1 * x  (log term clamps to 0 for all x < conc_eps)
+        # Closed-form inverse: x = target / c1
+        mask1 = target <= y1
+        if np.any(mask1):
+            out[mask1] = target[mask1] / c1
 
-        # 25 steps give ~1e-7 relative precision — sufficient for float32 output.
-        for _ in range(25):
-            mid = 0.5 * (lo + hi)
-            f_mid = forward(mid)
-            go_right = f_mid < target
-            lo = np.where(go_right, mid, lo)
-            hi = np.where(go_right, hi, mid)
+        # --- Region 3: target >= y2 (x >= conc_max) --------------------------
+        # f(x) = c1*conc_max + c2*(ln(x) - ln(eps)) / neg_log_eps
+        # Closed-form inverse: x = conc_eps * exp((target - c1*conc_max) * neg_log_eps / c2)
+        mask3 = target >= y2
+        if np.any(mask3):
+            out[mask3] = conc_eps * np.exp((target[mask3] - c1 * conc_max) * neg_log_eps / c2)
 
-        out = 0.5 * (lo + hi)
+        # --- Region 2: y1 < target < y2 (conc_eps <= x < conc_max) ----------
+        # f(x) = c1*x + c2*(ln(x) - ln(eps)) / neg_log_eps — no closed form.
+        # Bisect over tight bracket [conc_eps, conc_max].
+        # Width = conc_max - conc_eps ≈ 2.5; after 40 steps → ~2e-12, within float32 ULP.
+        # Inside the bracket min/max clamps are always inactive, so forward simplifies.
+        mask2 = ~mask1 & ~mask3
+        if np.any(mask2):
+            t2 = target[mask2]
+            lo = np.full_like(t2, conc_eps)
+            hi = np.full_like(t2, conc_max)
+            for _ in range(40):
+                mid = 0.5 * (lo + hi)
+                f_mid = c1 * mid + c2 * (np.log(mid) - log_eps) / neg_log_eps
+                go_right = f_mid < t2
+                lo = np.where(go_right, mid, lo)
+                hi = np.where(go_right, hi, mid)
+            out[mask2] = 0.5 * (lo + hi)
+
         if clip_min is not None:
             out = np.maximum(out, float(clip_min))
         if clip_max is not None:

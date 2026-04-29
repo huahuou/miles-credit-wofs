@@ -62,27 +62,62 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _inverse_concentration_numpy(arr: np.ndarray, params: dict) -> np.ndarray:
-    """Inverse of the forward concentration transform."""
+    """Piecewise inverse of the concentration transform used in WoFSDAIncrementDataset.
+
+    Forward: f(x) = c1*min(x, cmax) + c2*(log(max(x,eps)) - log(eps)) / (-log(eps))
+
+    Regions:
+        1  x < eps   : f(x) = c1*x               → x = y / c1  (closed-form)
+        2  eps<=x<cmax: mixed linear+log term      → bisection on [eps, cmax]
+        3  x >= cmax : c1*cmax + c2*log(x/eps)/L  → x = eps*exp((y-c1*cmax)*L/c2)  (closed-form)
+    """
+    target = np.asarray(arr, dtype=np.float64)
+    target = np.maximum(target, 0.0)
+
     c1 = float(params["c1"])
     c2 = float(params["c2"])
     eps = float(params["conc_eps"])
     cmax = float(params["conc_max"])
-
-    x = arr.astype(np.float64, copy=True)
-    scale = np.arctan(c2 * np.log(cmax / eps + 1.0))
-    x_ang = x * scale
-    x_ang = np.clip(x_ang, -np.pi / 2 + 1e-7, np.pi / 2 - 1e-7)
-    exp_arg = np.clip(np.tan(x_ang) / c1, None, 709.0)  # prevent float64 overflow in exp
-    x_out = eps * (np.exp(exp_arg) - 1.0)
-    x_out = np.clip(x_out, 0.0, None)
-
     clip_min = params.get("value_clip_min")
     clip_max = params.get("value_clip_max")
+    log_eps = float(np.log(eps))
+    neg_log_eps = float(-log_eps)
+
+    # Boundary values in transform space
+    y1 = c1 * eps                                                           # f(eps) with log term = 0
+    y2 = c1 * cmax + c2 * (np.log(cmax) - log_eps) / neg_log_eps           # f(cmax)
+
+    out = np.empty_like(target)
+
+    # Region 1: target <= y1  →  x = target / c1
+    mask1 = target <= y1
+    if np.any(mask1):
+        out[mask1] = target[mask1] / c1
+
+    # Region 3: target >= y2  →  x = eps * exp((target - c1*cmax) * neg_log_eps / c2)
+    mask3 = target >= y2
+    if np.any(mask3):
+        out[mask3] = eps * np.exp((target[mask3] - c1 * cmax) * neg_log_eps / c2)
+
+    # Region 2: y1 < target < y2  →  bisect on [eps, cmax] (width ~2.5, 40 steps → ~2e-12)
+    mask2 = ~mask1 & ~mask3
+    if np.any(mask2):
+        t2 = target[mask2]
+        lo = np.full_like(t2, eps)
+        hi = np.full_like(t2, cmax)
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            f_mid = c1 * mid + c2 * (np.log(mid) - log_eps) / neg_log_eps
+            go_right = f_mid < t2
+            lo = np.where(go_right, mid, lo)
+            hi = np.where(go_right, hi, mid)
+        out[mask2] = 0.5 * (lo + hi)
+
     if clip_min is not None:
-        x_out = np.clip(x_out, a_min=clip_min, a_max=None)
+        out = np.maximum(out, float(clip_min))
     if clip_max is not None:
-        x_out = np.clip(x_out, a_min=None, a_max=clip_max)
-    return x_out.astype(np.float32)
+        out = np.minimum(out, float(clip_max))
+    return out.astype(np.float32)
 
 
 def _denormalize_array(
