@@ -355,12 +355,18 @@ def rollout_case_ensemble(case_path: str, conf: dict, model: torch.nn.Module, de
     save_step_netcdf = bool(conf.get("predict", {}).get("save_step_netcdf", False))
     save_ensemble_members = bool(conf.get("predict", {}).get("save_ensemble_members", True))
     compute_crps = bool(conf.get("predict", {}).get("compute_crps", True))
+    tendency_boundary = bool(conf["trainer"].get("tendency_boundary", False))
+    n_tendency_chans = (
+        len(conf["data"]["variables"]) * conf["data"]["levels"]
+        + len(conf["data"]["surface_variables"])
+    ) if tendency_boundary else 0
 
     case_results: list[dict] = []
     case_pred_steps: list[xr.Dataset] = []
     case_lead_steps: list[int] = []
     case_lead_periods: list[int] = []
     x_state = None
+    x_boundary_tendency: torch.Tensor | None = None
     case_name = _case_name(case_path)
     y_coord = None
     x_coord = None
@@ -382,6 +388,9 @@ def rollout_case_ensemble(case_path: str, conf: dict, model: torch.nn.Module, de
             x_model = _repeat_to_batch(x_model, ensemble_size)
             x_boundary = _repeat_to_batch(x_boundary, ensemble_size)
             x_time_encode = _repeat_to_batch(x_time_encode, ensemble_size)
+            if tendency_boundary:
+                B, _, T, H, W = x_model.shape
+                x_boundary = torch.zeros(B, n_tendency_chans, T, H, W, device=device, dtype=x_model.dtype)
 
             if "x_surf" in sample:
                 x_state = concat_and_reshape(sample["x"].unsqueeze(0), sample["x_surf"].unsqueeze(0))
@@ -390,6 +399,8 @@ def rollout_case_ensemble(case_path: str, conf: dict, model: torch.nn.Module, de
             x_state = _repeat_to_batch(x_state, ensemble_size)
         else:
             x_model, x_boundary, x_time_encode = _compose_autoregressive_input(x_state, sample, device)
+            if tendency_boundary:
+                x_boundary = x_boundary_tendency.to(device)
 
         y_true = _target_tensor(sample, device)
 
@@ -402,6 +413,10 @@ def rollout_case_ensemble(case_path: str, conf: dict, model: torch.nn.Module, de
                 ensemble_size=ensemble_size,
             )
             y_pred = _apply_residual_prediction(y_pred, x_model, residual_prediction, varnum_diag)
+        if tendency_boundary:
+            x_boundary_tendency = (
+                y_pred[:, :n_tendency_chans, ...] - x_model[:, :n_tendency_chans, -1:, ...]
+            ).detach().cpu()
 
         y_pred_denorm = state_transformer.inverse_transform(y_pred.cpu())
         y_true_denorm = state_transformer.inverse_transform(y_true.cpu())

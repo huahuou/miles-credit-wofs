@@ -7,7 +7,7 @@
 #   torchrun --standalone --nnodes=1 --nproc-per-node=4 \
 #       applications/train_wrf_wofs_mae.py -c config/wofs_mae.yml
 
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v2'
 seed: 1000
 
 # ===========================================================================
@@ -110,6 +110,7 @@ model:
   non_masked_modalities:
     - surface
     - forcing
+    - reflectivity   # observation — always visible; never masked
 
   # Patch / image config
   patch_size: 8
@@ -183,10 +184,10 @@ trainer:
   grad_accum_every: 2    # effective batch = 2 * 4 * 2 GPUs = 16 (same as before)
 
   # Per-modality MAE loss weights
+  # (reflectivity is now always visible, so it has no reconstruction loss)
   loss_weights:
-    background: 0.75
+    background: 1.0
     precip: 2.0
-    reflectivity: 1.0
 
   # Masking config (overrides model.num_encoded_tokens if set)
   num_encoded_tokens: 512
@@ -207,9 +208,8 @@ trainer:
 
   skip_validation: false
 
-  # Modality loss keys logged to training_log.csv (must match keys returned by TrainerMAE:
-  # train_background_loss, train_precip_loss, train_reflectivity_loss)
-  save_metric_vars: ['background', 'precip', 'reflectivity']
+  # Modality loss keys logged to training_log.csv
+  save_metric_vars: ['background', 'precip']
 
   # LR scheduler
   use_scheduler: true

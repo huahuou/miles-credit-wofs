@@ -21,6 +21,7 @@ from credit.diffusion import ModifiedGaussianDiffusion
 from credit.models.swin_wrf import WRFTransformer
 from credit.models.dscale_wrf import DscaleTransformer
 from credit.models.wxformer.crossformer_wrf_ensemble import CrossFormerWRFEnsemble
+from credit.models.wxformer.aurora_crossformer_wrf import AuroraCrossFormerWRF
 from credit.models.wofs_mae import WoFSMultiModalMAE
 
 
@@ -62,6 +63,10 @@ model_types = {
     "crossformer_wrf_ensemble": (
         CrossFormerWRFEnsemble,
         "Loading CrossFormerWRFEnsemble – variable-flexible, resolution-flexible ensemble model",
+    ),
+    "aurora_crossformer_wrf": (
+        AuroraCrossFormerWRF,
+        "Loading AuroraCrossFormerWRF – Aurora per-(var,level) embedder + CrossFormer UNet backbone",
     ),
     "dscale": (DscaleTransformer, "Loading downscaling Transformer"),
     "crossformer_downscaling": (

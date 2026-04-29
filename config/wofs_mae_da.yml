@@ -9,7 +9,7 @@
 #       --start-date 20230501 --end-date 20230531 \
 #       --out-dir /work2/zhanxianghua/wofs_mae_analysis
 
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v1'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_mae_pretrain_v2'
 seed: 1000
 
 # ===========================================================================
@@ -62,7 +62,7 @@ data:
 
   levels: 17
   mae_pad_to: 304
-  mae_include_t1_refl: false   # rollout: t0 REFL is the observation
+  mae_include_t1_refl: true   # rollout: t0 REFL is the observation
 
   zarr_time_chunk: 2
   max_open_files_per_worker: 4
@@ -100,6 +100,7 @@ model:
   non_masked_modalities:
     - surface
     - forcing
+    - reflectivity
 
   patch_size: 8
   surface_forcing_stride: 16
@@ -115,7 +116,7 @@ model:
   decoder_num_heads: 8
 
   num_global_tokens: 2
-  num_encoded_tokens: 256
+  num_encoded_tokens: 512
   drop_path_rate: 0.0   # no dropout during inference
 
 # ===========================================================================
@@ -148,14 +149,14 @@ rollout:
 trainer:
   type: 'standard-wrf-mae'
   mode: 'none'
-  train_batch_size: 1
-  valid_batch_size: 1
+  train_batch_size: 8
+  valid_batch_size: 8
   epochs: 1
   start_epoch: 0
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 0
-  valid_thread_workers: 0
+  thread_workers: 8
+  valid_thread_workers: 8
   amp: false
   load_weights: false
   load_optimizer: false

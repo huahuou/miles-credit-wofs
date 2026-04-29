@@ -142,6 +142,19 @@ class Trainer(BaseTrainer):
         # number of diagnostic variables
         varnum_diag = len(conf["data"]["diagnostic_variables"])
 
+        # Tendency boundary: use (y_pred_t - x_t) as boundary input for step t+1.
+        # At step 1 (t=0) the tendency is zero.  No external data needed.
+        # Requires model.varname_boundary_upper == data.variables and
+        # model.varname_boundary_surface == data.surface_variables.
+        tendency_boundary = bool(conf["trainer"].get("tendency_boundary", False))
+        if tendency_boundary:
+            # Number of prognostic (non-diagnostic) output channels = the tendency size.
+            n_tendency_chans = (
+                len(conf["data"]["variables"]) * conf["data"]["levels"]
+                + len(conf["data"]["surface_variables"])
+            )
+            logger.info("tendency_boundary enabled: n_tendency_chans=%d", n_tendency_chans)
+
         # number of dynamic forcing + forcing + static
         static_dim_size = (
             len(conf["data"]["dynamic_forcing_variables"])
@@ -191,6 +204,7 @@ class Trainer(BaseTrainer):
             logs = {}
             loss = 0
             y_pred = None  # Place holder that gets updated after first roll-out
+            x_boundary_tendency = None  # used when tendency_boundary=True
 
             batch = next(dl)
             rollout_len = _rollout_length(batch)
@@ -224,11 +238,25 @@ class Trainer(BaseTrainer):
 
                 # --------------------------------------------------------------------------------- #
                 # boundary conditions
-                if "x_surf_boundary" in step_batch:
-                    x_boundary = concat_and_reshape(step_batch["x_boundary"], step_batch["x_surf_boundary"]).to(self.device, non_blocking=True)
+                if tendency_boundary:
+                    # tendency = (predicted state at t) - (input state at t).
+                    # Zero at the first step; filled in-loop after each forward pass.
+                    if x_boundary_tendency is None:
+                        B_ens = x.shape[0]
+                        H, W = x.shape[-2], x.shape[-1]
+                        T_dim = x.shape[2]
+                        x_boundary = torch.zeros(
+                            B_ens, n_tendency_chans, T_dim, H, W,
+                            device=x.device, dtype=x.dtype,
+                        )
+                    else:
+                        x_boundary = x_boundary_tendency
                 else:
-                    x_boundary = reshape_only(step_batch["x_boundary"]).to(self.device, non_blocking=True)
-                x_boundary = _repeat_for_ensemble(x_boundary, ensemble_size)
+                    if "x_surf_boundary" in step_batch:
+                        x_boundary = concat_and_reshape(step_batch["x_boundary"], step_batch["x_surf_boundary"]).to(self.device, non_blocking=True)
+                    else:
+                        x_boundary = reshape_only(step_batch["x_boundary"]).to(self.device, non_blocking=True)
+                    x_boundary = _repeat_for_ensemble(x_boundary, ensemble_size)
 
                 # --------------------------------------------------------------------------------- #
                 # time encoding
@@ -296,6 +324,16 @@ class Trainer(BaseTrainer):
 
 
                 # Note: DDP synchronizes gradients during backward(); no per-step barrier needed.
+
+                # Compute tendency for next step's boundary BEFORE updating x.
+                # Tendency = full predicted state - current input state (prognostic channels).
+                # With residual_prediction=True, y_pred at this point is the full state
+                # (residual already added above), so tendency == the model residual output.
+                if tendency_boundary:
+                    x_boundary_tendency = (
+                        y_pred[:, :n_tendency_chans, ...]
+                        - x[:, :n_tendency_chans, -1:, ...]
+                    ).detach()
 
                 # stop after X steps
                 stop_forecast = bool(step_batch["stop_forecast"][0].item())
@@ -408,6 +446,13 @@ class Trainer(BaseTrainer):
         # number of diagnostic variables
         varnum_diag = len(conf["data"]["diagnostic_variables"])
 
+        tendency_boundary = bool(conf["trainer"].get("tendency_boundary", False))
+        if tendency_boundary:
+            n_tendency_chans = (
+                len(conf["data"]["variables"]) * conf["data"]["levels"]
+                + len(conf["data"]["surface_variables"])
+            )
+
         # number of dynamic forcing + forcing + static
         static_dim_size = (
             len(conf["data"]["dynamic_forcing_variables"])
@@ -453,6 +498,7 @@ class Trainer(BaseTrainer):
             for steps in range(valid_batches_per_epoch):
                 loss = 0
                 y_pred = None  # Place holder that gets updated after first roll-out
+                x_boundary_tendency = None  # used when tendency_boundary=True
                 batch = next(dl)
                 rollout_len = _rollout_length(batch)
 
@@ -486,11 +532,23 @@ class Trainer(BaseTrainer):
 
                     # --------------------------------------------------------------------------------- #
                     # boundary conditions
-                    if "x_surf_boundary" in step_batch:
-                        x_boundary = concat_and_reshape(step_batch["x_boundary"], step_batch["x_surf_boundary"]).to(self.device, non_blocking=True)
+                    if tendency_boundary:
+                        if x_boundary_tendency is None:
+                            B_ens = x.shape[0]
+                            H, W = x.shape[-2], x.shape[-1]
+                            T_dim = x.shape[2]
+                            x_boundary = torch.zeros(
+                                B_ens, n_tendency_chans, T_dim, H, W,
+                                device=x.device, dtype=x.dtype,
+                            )
+                        else:
+                            x_boundary = x_boundary_tendency
                     else:
-                        x_boundary = reshape_only(step_batch["x_boundary"]).to(self.device, non_blocking=True)
-                    x_boundary = _repeat_for_ensemble(x_boundary, ensemble_size)
+                        if "x_surf_boundary" in step_batch:
+                            x_boundary = concat_and_reshape(step_batch["x_boundary"], step_batch["x_surf_boundary"]).to(self.device, non_blocking=True)
+                        else:
+                            x_boundary = reshape_only(step_batch["x_boundary"]).to(self.device, non_blocking=True)
+                        x_boundary = _repeat_for_ensemble(x_boundary, ensemble_size)
 
                     # --------------------------------------------------------------------------------- #
                     # time encoding
@@ -563,8 +621,15 @@ class Trainer(BaseTrainer):
                     # ================================================================================== #
                     # scope of keep rolling out
 
+                    # Compute tendency for next step's boundary BEFORE updating x.
+                    if tendency_boundary:
+                        x_boundary_tendency = (
+                            y_pred[:, :n_tendency_chans, ...]
+                            - x[:, :n_tendency_chans, -1:, ...]
+                        ).detach()
+
                     # step-in-step-out
-                    elif history_len == 1:
+                    if history_len == 1:
                         # cut diagnostic vars from y_pred, they are not inputs
                         if "y_diag" in step_batch:
                             x = y_pred[:, :-varnum_diag, ...].detach()

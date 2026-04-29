@@ -238,16 +238,19 @@ class WoFSMultiModalMAE(BaseModel):
         alpha_vec = torch.full((n_mods,), alphas, dtype=torch.float32)
         samples_per_mod = Dirichlet(alpha_vec).sample((B,)).to(device)  # (B, n_mods)
         samples_per_mod = (samples_per_mod * num_encoded_tokens).round().long()
-        # Fix rounding
+        # Fix rounding: ensure sum == num_encoded_tokens
         diff = num_encoded_tokens - samples_per_mod.sum(dim=1, keepdim=True)
         samples_per_mod[:, 0] = samples_per_mod[:, 0] + diff.squeeze(1)
         # Clamp to [0, n_per_mod]
         for i, n in enumerate(n_per_mod):
             samples_per_mod[:, i] = samples_per_mod[:, i].clamp(0, n)
+        # Re-fix after clamping (clamp may shift the total away from num_encoded_tokens)
+        diff2 = num_encoded_tokens - samples_per_mod.sum(dim=1, keepdim=True)
+        samples_per_mod[:, 0] = (samples_per_mod[:, 0] + diff2.squeeze(1)).clamp(0, n_per_mod[0])
 
-        # Build per-modality masks and shuffle indices
+        # Build per-modality masks: for each modality, randomly shuffle and mark
+        # the first keep_i tokens as visible (0) and the rest as masked (1).
         task_masks: Dict[str, torch.Tensor] = {}
-        all_keep_local = []  # list of (B, keep_i) local indices per modality
 
         offset = 0
         for i, mod in enumerate(self.maskable_modalities):
@@ -256,43 +259,34 @@ class WoFSMultiModalMAE(BaseModel):
 
             noise = torch.rand(B, n, device=device)
             ids_shuffle = torch.argsort(noise, dim=1)  # random permutation
-
-            # mask: 0=keep, 1=remove
-            mask = torch.arange(n, device=device).unsqueeze(0).expand(B, -1)
-            mask = (mask >= keep_i.unsqueeze(1)).long()
-            # unshuffle mask to original token order
             ids_restore_local = torch.argsort(ids_shuffle, dim=1)
-            mask = torch.gather(mask, 1, ids_restore_local)
-            task_masks[mod] = mask
 
-            # global keep indices (in maskable pool)
-            ids_keep_local = ids_shuffle[:, :keep_i.max().item()]
-            # Trim each row to actual keep_i
-            for b in range(B):
-                pass  # We use the shuffled indices and mask together below
-            # Store (offset, ids_shuffle) for building global ids_keep later
-            all_keep_local.append((offset, ids_shuffle, keep_i, n))
+            # mask in shuffled order: 0=keep, 1=masked
+            shuffled_mask = (torch.arange(n, device=device).unsqueeze(0) >= keep_i.unsqueeze(1)).long()
+            # unshuffle back to original token order
+            task_masks[mod] = torch.gather(shuffled_mask, 1, ids_restore_local)
+
             offset += n
 
-        # Build global ids_keep and ids_restore over full maskable pool
-        global_keep_parts = []
-        for (off, ids_sh, keep_i, n) in all_keep_local:
-            global_ids = ids_sh + off  # (B, n) global indices
-            # We need to select keep_i[b] tokens per sample — take max and zero-pad
-            max_keep = keep_i.max().item()
-            global_ids_keep = global_ids[:, :max_keep]  # (B, max_keep) – may include extras
-            global_keep_parts.append(global_ids_keep)
-
-        # Concatenate and sort so ids_keep is in ascending order per sample
-        ids_keep_raw = torch.cat(global_keep_parts, dim=1)  # (B, sum_max_keep)
-        ids_keep = torch.sort(ids_keep_raw, dim=1)[0][:, :num_encoded_tokens]
-
-        # ids_restore: inverse permutation over total maskable tokens
-        # Build a combined mask over all maskable tokens
+        # Build combined mask over the full maskable pool and derive ids_keep / ids_restore.
+        # Visible tokens (mask=0) sort before masked tokens (mask=1); stable=True preserves
+        # relative order within each group so the convention matches forward().
         combined_mask = torch.cat([task_masks[m] for m in self.maskable_modalities], dim=1)  # (B, total)
-        ids_shuffle_combined = torch.argsort(combined_mask.float() + torch.rand_like(combined_mask.float()) * 0.001, dim=1)
+        ids_shuffle_combined = torch.argsort(
+            combined_mask.float() + torch.rand_like(combined_mask.float()) * 1e-6, dim=1
+        )
         ids_restore = torch.argsort(ids_shuffle_combined, dim=1)
         ids_keep = ids_shuffle_combined[:, :num_encoded_tokens]
+
+        # Recompute task_masks directly from ids_keep so they are EXACTLY consistent
+        # (Dirichlet rounding + double-clamp can cause off-by-one mismatches otherwise).
+        final_mask = torch.ones(B, total, device=device, dtype=torch.long)
+        final_mask.scatter_(1, ids_keep, 0)  # 0 = visible
+        task_masks = {}
+        off = 0
+        for mod, n in zip(self.maskable_modalities, n_per_mod):
+            task_masks[mod] = final_mask[:, off: off + n]
+            off += n
 
         return ids_keep, ids_restore, task_masks
 
@@ -391,6 +385,8 @@ class WoFSMultiModalMAE(BaseModel):
             }
             cursor += n
         input_info["num_global_tokens"] = self.num_global_tokens
+        input_info["non_masked_modalities"] = self.non_masked_modalities
+        input_info["num_visible_maskable"] = ids_keep.shape[1]
 
         # 7. Decode each maskable modality
         recon_dict: Dict[str, torch.Tensor] = {}
@@ -599,6 +595,8 @@ class WoFSMultiModalMAE(BaseModel):
             }
             cursor += n
         input_info["num_global_tokens"] = self.num_global_tokens
+        input_info["non_masked_modalities"] = self.non_masked_modalities
+        input_info["num_visible_maskable"] = ids_keep.shape[1]
 
         # 10. Decode precip only
         maskable_token_counts = self._maskable_token_counts()

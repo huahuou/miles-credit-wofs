@@ -435,18 +435,58 @@ class WoFSOutputAdapter(nn.Module):
         # 1. Project encoder tokens to decoder_dim
         ctx = self.proj_context(encoder_tokens)
 
-        # 2. Add per-task context embeddings so cross-attn knows each token's modality
+        # 2. Add per-task context embeddings so cross-attn knows each token's modality.
+        #
+        # ctx layout after masking:
+        #   [visible_maskable (n_kept) | surface (n_sf) | forcing (n_fo) | global (n_g)]
+        #
+        # We CANNOT slice ctx by the original full token counts stored in input_info["tasks"]
+        # because the maskable portion is compressed to only the kept tokens.  Instead we:
+        #   (a) Use ids_keep to determine which maskable modality each kept token belongs to.
+        #   (b) Slice the always-visible tokens (surface, forcing) at their known positions.
         if self.task_embeddings is not None and input_info.get("tasks"):
-            ctx_parts = []
-            cursor = 0
-            for mod_key, info in input_info["tasks"].items():
+            n_kept = input_info.get("num_visible_maskable", ids_keep.shape[1])
+            non_masked = set(input_info.get("non_masked_modalities", []))
+            task_info = input_info["tasks"]
+
+            # Build cumulative offset ranges for maskable modalities in the pool
+            pool_off = 0
+            maskable_ranges: Dict[str, Tuple[int, int]] = {}
+            for mod_key, info in task_info.items():
+                if mod_key in non_masked:
+                    continue
+                n = info["num_tokens"]
+                maskable_ranges[mod_key] = (pool_off, pool_off + n)
+                pool_off += n
+
+            # Apply per-modality embeddings to the n_kept visible maskable tokens
+            # by broadcasting over positions that belong to each modality.
+            ctx_maskable = ctx[:, :n_kept, :].clone()
+            for mod_key, (lo, hi) in maskable_ranges.items():
+                if mod_key not in self.task_embeddings:
+                    continue
+                belongs = ((ids_keep >= lo) & (ids_keep < hi)).float()  # (B, n_kept)
+                ctx_maskable = ctx_maskable + self.task_embeddings[mod_key] * belongs.unsqueeze(-1)
+
+            # Apply task embeddings to always-visible tokens at their fixed positions.
+            ctx_parts: List[torch.Tensor] = [ctx_maskable]
+            cursor = n_kept
+            for mod_key, info in task_info.items():
+                if mod_key in maskable_ranges:
+                    continue  # already handled above
                 n = info["num_tokens"]
                 part = ctx[:, cursor: cursor + n, :]
                 if mod_key in self.task_embeddings:
                     part = part + self.task_embeddings[mod_key]
                 ctx_parts.append(part)
                 cursor += n
-            ctx = torch.cat(ctx_parts, dim=1)
+
+            # Global tokens (no modality embedding)
+            n_global = input_info.get("num_global_tokens", 0)
+            if n_global > 0:
+                ctx_parts.append(ctx[:, cursor: cursor + n_global, :])
+
+            ctx = torch.cat(ctx_parts, dim=1) if len(ctx_parts) > 1 else ctx_parts[0]
 
         # 3. Build DENSE query tokens at stride = decode_stride (75×75 = 5 625)
         pos = rearrange(
@@ -471,10 +511,14 @@ class WoFSOutputAdapter(nn.Module):
             this_ctx = ctx_with_mask[
                 :, task_start_idx: task_start_idx + self.num_patches, :
             ]
-            # Upsample 38×38 → 75×75 via bilinear interpolation
+            # Upsample 38×38 → 75×75 via bilinear interpolation.
+            # Apply a 3×3 average pool FIRST to soften the hard boundary between
+            # real-encoder-context patches and mask_token patches; without this the
+            # bilinear upsample produces ramp artifacts at every 8-pixel patch edge.
             this_ctx = rearrange(
                 this_ctx, "b (nh nw) d -> b d nh nw", nh=self.N_H, nw=self.N_W
             )
+            this_ctx = F.avg_pool2d(this_ctx, kernel_size=3, stride=1, padding=1)
             this_ctx = F.interpolate(
                 this_ctx,
                 size=(self.N_H_dense, self.N_W_dense),

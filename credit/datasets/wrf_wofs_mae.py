@@ -236,6 +236,44 @@ class WoFSMAEDataset(Dataset):
             except Exception as exc:
                 logger.warning("Failed to load concentration params JSON: %s", exc)
 
+        # Fallback 2: global JSON string embedded in mean.nc attrs
+        attr_payload = mean_ds.attrs.get("concentration_transform_params_json")
+        if isinstance(attr_payload, str) and attr_payload.strip():
+            try:
+                payload = json.loads(attr_payload)
+                params_dict = payload.get("parameters", {}) if isinstance(payload, dict) else {}
+                if isinstance(params_dict, dict):
+                    for var, params in params_dict.items():
+                        if var in CONCENTRATION_VARS and isinstance(params, dict):
+                            self._concentration_params[var] = _coerce_concentration_params(params)
+                logger.info("Loaded concentration params from mean/std NetCDF attrs")
+            except Exception as exc:
+                logger.warning("Failed to parse concentration params from stats attrs: %s", exc)
+
+        # Fallback 3: per-variable NetCDF variable attrs (concentration_transform_c1, …)
+        for var in CONCENTRATION_VARS:
+            if var in mean_ds:
+                var_attrs = mean_ds[var].attrs
+                if any(
+                    key in var_attrs
+                    for key in (
+                        "concentration_transform_c1",
+                        "concentration_transform_c2",
+                        "concentration_transform_conc_eps",
+                        "concentration_transform_conc_max",
+                    )
+                ):
+                    self._concentration_params[var] = _coerce_concentration_params(
+                        {
+                            "c1": var_attrs.get("concentration_transform_c1", self._concentration_params[var]["c1"]),
+                            "c2": var_attrs.get("concentration_transform_c2", self._concentration_params[var]["c2"]),
+                            "conc_eps": var_attrs.get("concentration_transform_conc_eps", self._concentration_params[var]["conc_eps"]),
+                            "conc_max": var_attrs.get("concentration_transform_conc_max", self._concentration_params[var]["conc_max"]),
+                            "value_clip_min": var_attrs.get("concentration_transform_clip_min", self._concentration_params[var]["value_clip_min"]),
+                            "value_clip_max": var_attrs.get("concentration_transform_clip_max", self._concentration_params[var]["value_clip_max"]),
+                        }
+                    )
+
         # Load mean/std arrays for all needed vars
         all_vars = self._upper_air_vars + [v for v in self._surface_2d_vars if v in mean_ds]
         for var in all_vars:
@@ -466,17 +504,23 @@ class WoFSMAEDataset(Dataset):
         try:
             target_size = self.mae_pad_to
 
-            # ---- background (t0) -----------------------------------------
-            bg = self._load_upper_air_group(chunk, self.background_vars, time_idx=0)
+            # ---- all physics modalities at the same snapshot ----------------
+            # When mae_include_t1_refl=True, use t1 for background, precip, AND
+            # reflectivity so they are all self-consistent at one analysis time.
+            # The model is then trained to inpaint (masked) background/precip tokens
+            # conditioned on the (always-visible) reflectivity at the same time.
+            snap_t = 1 if self.mae_include_t1_refl else 0
+
+            # ---- background ----------------------------------------------
+            bg = self._load_upper_air_group(chunk, self.background_vars, time_idx=snap_t)
             bg = self._pad_to_size(bg, target_size)
 
-            # ---- precip (t0) ---------------------------------------------
-            pr = self._load_upper_air_group(chunk, self.precip_vars, time_idx=0)
+            # ---- precip (matching snapshot) ------------------------------
+            pr = self._load_upper_air_group(chunk, self.precip_vars, time_idx=snap_t)
             pr = self._pad_to_size(pr, target_size)
 
-            # ---- reflectivity (t0 or t1) ---------------------------------
-            refl_t = 1 if self.mae_include_t1_refl else 0
-            rf = self._load_upper_air_group(chunk, self.reflectivity_vars, time_idx=refl_t)
+            # ---- reflectivity (matching snapshot) ------------------------
+            rf = self._load_upper_air_group(chunk, self.reflectivity_vars, time_idx=snap_t)
             rf = self._pad_to_size(rf, target_size)
 
             # ---- surface (t0) --------------------------------------------

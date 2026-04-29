@@ -217,6 +217,7 @@ class VariableTokenDecoder(nn.Module):
     def __init__(self, output_spec: List[Tuple[str, int]], feat_dim: int):
         super().__init__()
         self.output_spec: List[Tuple[str, int]] = list(output_spec)
+        self.feat_dim = feat_dim
         self.de_projectors = nn.ModuleDict(
             {name: nn.Conv2d(feat_dim, n_chans, kernel_size=1)
              for name, n_chans in output_spec}
@@ -227,6 +228,16 @@ class VariableTokenDecoder(nn.Module):
             [self.de_projectors[name](x) for name, _ in self.output_spec],
             dim=1,
         )  # (B, C_total_out, H, W)
+
+    def add_output_variable(self, name: str, n_chans: int) -> None:
+        """Register a new output variable (zero-init so it starts with zero contribution)."""
+        if name in self.de_projectors:
+            return
+        proj = nn.Conv2d(self.feat_dim, n_chans, kernel_size=1)
+        nn.init.zeros_(proj.weight)
+        nn.init.zeros_(proj.bias)
+        self.de_projectors[name] = proj
+        self.output_spec.append((name, n_chans))
 
 
 # ---------------------------------------------------------------------------

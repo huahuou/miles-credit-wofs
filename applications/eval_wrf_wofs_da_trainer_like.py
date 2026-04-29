@@ -397,6 +397,12 @@ def main() -> None:
     parser.add_argument("--test-path", default=None, help="Glob path for test files (overrides eval.test_path)")
     parser.add_argument("--test-dyn-path", default=None, help="Optional glob path for test dynamic forcing files")
     parser.add_argument("--test-date-range", nargs=2, default=None, help="Optional YYYYMMDD YYYYMMDD range for test selection")
+    parser.add_argument(
+        "--delta-step",
+        type=int,
+        default=None,
+        help="Fixed timestep delta for inference (1, 2, or 3). Overrides eval.delta_step in config. Defaults to 1.",
+    )
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size for evaluation (defaults to trainer.valid_batch_size)")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional max number of samples to evaluate")
     parser.add_argument(
@@ -476,6 +482,12 @@ def main() -> None:
     else:
         configured_range = eval_conf.get("test_date_range", eval_conf.get("custom_date_range", None))
         test_date_range = tuple(configured_range) if configured_range is not None else None
+
+    # Fix the delta step for evaluation (not random — use a single deterministic delta).
+    eval_delta = args.delta_step if args.delta_step is not None else int(eval_conf.get("delta_step", 1))
+    conf["data"]["delta_steps"] = [eval_delta]
+    conf["data"]["delta_probs"] = [1.0]
+    logger.info("Evaluation using fixed delta_step=%d", eval_delta)
 
     dataset = _build_test_dataset(
         conf=conf,

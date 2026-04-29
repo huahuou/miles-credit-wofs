@@ -96,6 +96,22 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.forecast_len = param_interior["forecast_len"]
         self.total_seq_len = self.history_len + self.forecast_len  # 1
 
+        # -- delta step configuration (multi-step increment learning) ------
+        raw_delta_steps = conf["data"].get("delta_steps", [1])
+        raw_delta_probs = conf["data"].get("delta_probs", None)
+        if not isinstance(raw_delta_steps, (list, tuple)) or len(raw_delta_steps) == 0:
+            raw_delta_steps = [1]
+        self._delta_steps = [int(d) for d in raw_delta_steps]
+        if raw_delta_probs is None:
+            n = len(self._delta_steps)
+            self._delta_probs = [1.0 / n] * n
+        else:
+            self._delta_probs = [float(p) for p in raw_delta_probs]
+        total_prob = sum(self._delta_probs)
+        if abs(total_prob - 1.0) > 1e-6:
+            self._delta_probs = [p / total_prob for p in self._delta_probs]
+        self._max_delta = max(self._delta_steps)
+
         # -- normalization paths -------------------------------------------
         self.mean_path = conf["data"]["mean_path"]
         self.std_path = conf["data"]["std_path"]
@@ -503,7 +519,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
 
             self.file_n_time = file_n_time
 
-        self.samples_per_file = [max(0, n_time - self.total_seq_len) for n_time in self.file_n_time]
+        self.samples_per_file = [max(0, n_time - self._max_delta) for n_time in self.file_n_time]
         self.cumulative_samples = np.cumsum(self.samples_per_file, dtype=np.int64)
         self.total_length = int(self.cumulative_samples[-1]) if len(self.cumulative_samples) > 0 else 0
 
@@ -828,13 +844,21 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         file_idx, ind_in_file = self._locate_index(index)
 
         t0 = ind_in_file
-        t1 = ind_in_file + 1
+        if len(self._delta_steps) == 1:
+            delta = self._delta_steps[0]
+        else:
+            delta = int(self.rng.choice(self._delta_steps, p=self._delta_probs))
+        t1 = t0 + delta
 
-        # -- single contiguous load for both timesteps ---------------------
+        # -- load only the two needed timesteps (t0 and t1) ---------------
+        # Using a contiguous slice for delta=1 (most common, chunk-aligned)
+        # and explicit fancy indexing for delta>1 to avoid loading wasted
+        # intermediate timesteps (which would increase zarr IO by 50-100%).
         upper_ds = self._get_upper_ds(file_idx)
-        chunk = upper_ds.isel(
-            time=slice(t0, t1 + 1)
-        ).load()
+        if delta == 1:
+            chunk = upper_ds.isel(time=slice(t0, t1 + 1)).load()
+        else:
+            chunk = upper_ds.isel(time=[t0, t1]).load()
 
         # ================================================================ #
         # 1. Prognostic variables: x (input) and y (increment target)
@@ -846,7 +870,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         y_occ_delta_thr_norm_list = []
         for var in self.varname_prognostic:
             raw_t0 = chunk[var].isel(time=0).values
-            raw_t1 = chunk[var].isel(time=1).values
+            raw_t1 = chunk[var].isel(time=-1).values
             reduced_t0 = self.reduce_levels_for_var(raw_t0, var_name=var, is_prognostic=True)
             reduced_t1 = self.reduce_levels_for_var(raw_t1, var_name=var, is_prognostic=True)
             norm_t0 = self._normalize_array(reduced_t0, var)
@@ -919,7 +943,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         # ================================================================ #
         obs_var = self.varname_observation[0]  # 'REFL_10CM'
         norm_obs_t0 = self._normalize(chunk[obs_var].isel(time=0), obs_var)
-        norm_obs_t1 = self._normalize(chunk[obs_var].isel(time=1), obs_var)
+        norm_obs_t1 = self._normalize(chunk[obs_var].isel(time=-1), obs_var)
         innovation = norm_obs_t1 - norm_obs_t0  # (level, H, W)
 
         # (time=1, num_obs_vars=1, level, H, W)
@@ -929,7 +953,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         # 5. Time encoding
         # ================================================================ #
         t0_time = chunk.time.values[0:1]
-        t1_time = chunk.time.values[1:2]
+        t1_time = chunk.time.values[-1:]
         # 3 time groups: input(t0), target(t1), boundary(t0)
         time_encode = encode_datetime64(
             np.concatenate([t0_time, t1_time, t0_time])

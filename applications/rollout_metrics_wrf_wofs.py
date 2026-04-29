@@ -223,9 +223,15 @@ def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, dev
         + len(conf["data"]["static_variables"])
     )
     lead_time_periods = int(conf["data"].get("lead_time_periods", 1))
+    tendency_boundary = bool(conf["trainer"].get("tendency_boundary", False))
+    n_tendency_chans = (
+        len(conf["data"]["variables"]) * conf["data"]["levels"]
+        + len(conf["data"]["surface_variables"])
+    ) if tendency_boundary else 0
 
     case_results: list[dict] = []
     x_state: torch.Tensor | None = None
+    x_boundary_tendency: torch.Tensor | None = None
     case_name = _case_name(case_path)
 
     for step in range(max_steps):
@@ -237,18 +243,27 @@ def rollout_case_metrics(case_path: str, conf: dict, model: torch.nn.Module, dev
 
         if step == 0:
             x_model, x_boundary, x_time_encode = _sample_to_model_inputs(sample, device)
+            if tendency_boundary:
+                B, _, T, H, W = x_model.shape
+                x_boundary = torch.zeros(B, n_tendency_chans, T, H, W, device=device, dtype=x_model.dtype)
             if "x_surf" in sample:
                 x_state = concat_and_reshape(sample["x"].unsqueeze(0), sample["x_surf"].unsqueeze(0))
             else:
                 x_state = reshape_only(sample["x"].unsqueeze(0))
         else:
             x_model, x_boundary, x_time_encode = _compose_autoregressive_input(x_state, sample, device)
+            if tendency_boundary:
+                x_boundary = x_boundary_tendency.to(device)
 
         y_true = _target_tensor(sample, device)
 
         with torch.no_grad():
             y_pred = model(x_model.float(), x_boundary.float(), x_time_encode.float())
             y_pred = _apply_residual_prediction(y_pred, x_model, residual_prediction, varnum_diag)
+        if tendency_boundary:
+            x_boundary_tendency = (
+                y_pred[:, :n_tendency_chans, ...] - x_model[:, :n_tendency_chans, -1:, ...]
+            ).detach().cpu()
 
         y_pred_denorm = state_transformer.inverse_transform(y_pred.cpu())
         y_true_denorm = state_transformer.inverse_transform(y_true.cpu())
