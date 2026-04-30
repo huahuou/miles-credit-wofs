@@ -41,8 +41,8 @@ MODE=${MODE:-ddp}
 
 CONDA_ENV="credit-wofs"
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"
-CONFIG="${PROJECT_DIR}/config/ursa_wofscast_crossformer_wrf_det.yml"
-# CONFIG="/home/Zhanxiang.Hua/miles-credit-wofs/config/ursa_wofscast_credit_wrf_latest.yml"
+### CONFIG="${PROJECT_DIR}/config/ursa_wofscast_crossformer_wrf_det.yml"
+CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_auroracrossformer_wrf_det_sm_res/model.yml"
 BACKEND=${BACKEND:-nccl}
 MAX_CASES=${MAX_CASES:-""}
 OUTPUT_NAME=${OUTPUT_NAME:-rollout_metrics.csv}

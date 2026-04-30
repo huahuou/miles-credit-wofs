@@ -166,14 +166,10 @@ def _denormalize_prog_increments(
     """Convert normalized-space prognostic increments to physical-space increments.
 
     Inverts ``norm(Q_t1) - norm(Q_t0)`` back to ``Q_t1 - Q_t0`` in original units.
-    Handles concentration transforms (QRAIN, QNRAIN, …) automatically.
-
-    Background: concentration variables (QRAIN, QNRAIN, …) use a log-linear piecewise
-    forward transform. Values larger than ``conc_max`` land in the *exponential region*
-    of the inverse, where the Jacobian dQ/dz ∝ exp(z · neg_log_eps/c2). Even a small
-    normalized prediction error can produce an astronomically large physical increment
-    in this region. Use ``phys_clip_by_var`` to apply a per-variable physical-space
-    cap and prevent these artifacts in the saved output.
+    Handles both the legacy piecewise concentration transform and the new
+    log-zscore transform (used when ``log_transform_params_json`` is set in the
+    config).  With the log-zscore transform the inverse is ``clip(exp(·), …)``,
+    which is bounded and has no exponential blow-up by construction.
 
     Args:
         dataset: An opened ``WoFSDAIncrementDataset`` providing normalization stats.
@@ -182,7 +178,8 @@ def _denormalize_prog_increments(
             shape ``(batch, n_vars*n_levels, time, H, W)``.
         phys_clip_by_var: Optional dict mapping variable name to a positive float. When
             supplied, ``q_t1`` is clipped to ``[0, clip_max]`` before computing the
-            physical increment, preventing exponential blow-up artifacts in the output.
+            physical increment.  With the log-zscore transform this is rarely needed
+            since the inverse is already bounded by ``clip_max`` from the params JSON.
             Example: ``{"QRAIN": 5e-3, "QNRAIN": 1e6}``
 
     Returns:
@@ -221,11 +218,11 @@ def _denormalize_prog_increments(
         q_t0 = dataset._inverse_var_transform(transformed_t0.astype(np.float32), var_name).astype(np.float64)
         q_t1 = dataset._inverse_var_transform(transformed_t1.astype(np.float32), var_name).astype(np.float64)
 
-        # Step 3: optional per-variable physical clip to suppress exponential-Jacobian
-        # artifacts when the model predicts out-of-training-distribution z1 values.
-        # NOTE: for concentration variables the inverse is exponential (region 3) when
-        # forward_conc(q) > y2 ≈ 1.8 (q > conc_max = 2.5).  A small normalized error
-        # at a high-z0 pixel can become hundreds of times larger in physical space.
+        # Step 3: optional per-variable physical clip to further constrain output.
+        # With the log-zscore transform the inverse is already bounded by clip_max
+        # from the params JSON, so this is mainly useful as an extra safety net or
+        # for the legacy piecewise transform path where large z1 values can produce
+        # unbounded physical values in the exponential region.
         if phys_clip_by_var and var_name in phys_clip_by_var:
             clip_max = float(phys_clip_by_var[var_name])
             q_t1 = np.clip(q_t1, 0.0, clip_max)

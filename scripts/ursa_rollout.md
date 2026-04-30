@@ -19,7 +19,7 @@ Examples:
 ```bash
 sbatch scripts/ursa_rollout.sh
 sbatch --export=ALL,APP=metrics,MODE=ddp,NPROC_PER_NODE_OVERRIDE=2 scripts/ursa_rollout.sh
-sbatch --export=ALL,APP=rollout,MODE=none,MAX_CASES=1 scripts/ursa_rollout.sh
+sbatch --export=ALL,APP=rollout,MODE=ddp,MAX_CASES=100 scripts/ursa_rollout.sh
 ```
 
 ## 2) Ensemble rollout launcher

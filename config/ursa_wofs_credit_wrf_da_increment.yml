@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0424_debug'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0429'
 seed: 1000
 
 data:
@@ -28,6 +28,14 @@ data:
   mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
   std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
   concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
+  # Simple invertible log-zscore transform for concentration variables.
+  # When set, replaces the piecewise concentration transform with:
+  #   forward:  z = (log(clip(x, clip_min, clip_max)) - log_mean) / log_std
+  #   inverse:  x = clip(exp(z * log_std + log_mean), clip_min, clip_max)
+  # Generate with: python python_scripts/build_log_transform_params.py \
+  #   --input  <stats_dir>/concentration_tuning.json \
+  #   --output <stats_dir>/log_transform_params.json
+  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/log_transform_params.json'
 
   concentration_level_ops:
     QRAIN:
@@ -71,7 +79,7 @@ data:
   valid_forecast_len: 0
   target_start_step: 1
   zarr_time_chunk: 2
-  max_open_files_per_worker: 6
+  max_open_files_per_worker: 4
   lead_time_periods: 1
   levels: 17
   prognostic_levels: 17  # effective model levels for concentration prognostic variables
@@ -127,7 +135,7 @@ model:
 
 trainer:
   type: 'standard-wrf'
-  mode: 'none'
+  mode: 'ddp'
   use_file_locality_sampler: True
   sync_batch_barrier: False
   no_hang_debug: False
@@ -138,12 +146,12 @@ trainer:
   no_hang_pin_memory: False
   no_hang_persistent_workers: True
   no_hang_timeout_s: 180
-  train_batch_size: 8
-  valid_batch_size: 8
+  train_batch_size: 24
+  valid_batch_size: 24
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 8
-  valid_thread_workers: 8
+  thread_workers: 4
+  valid_thread_workers: 4
   prefetch_factor: 1
   dataloader_timeout_s: 360
   update_learning_rate: False
@@ -153,13 +161,13 @@ trainer:
   residual_prediction: False   # output IS the increment — no residual skip needed
   epochs: &epochs 100
   start_epoch: 0
-  load_weights: False
-  load_optimizer: False
-  load_scheduler: False
-  load_scaler: False
+  load_weights: True
+  load_optimizer: True
+  load_scheduler: True
+  load_scaler: True
   skip_validation: True
   use_scheduler: True
-  reload_epoch: False
+  reload_epoch: True
   scheduler:
     scheduler_type: cosine-annealing-restarts
     first_cycle_steps: 1000
@@ -179,17 +187,19 @@ loss:
   use_latitude_weights: False
   use_variable_weights: False
   training_loss: 'mse'
+  
   occupancy:
     enabled: true
     delta_threshold: 5.0e-9
-    delta_threshold_by_var: {}
+    delta_threshold_by_var:
+      QHAIL: 1.0e-11
     variables: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
     target_source: 'delta_abs'
     use_masked_regression: true
     masked_regression_mode: 'soft'
     reg_mask_min: 0.05
-    ce_weight: 0.3
-    pos_weight: 1.0
+    ce_weight: 0.15
+    pos_weight: 5.0
     logit_temperature: 0.25
     use_focal: false
     focal_weight: 0.0
@@ -198,6 +208,14 @@ loss:
     use_dice: false
     dice_weight: 0.0
     dice_smooth: 1.0
+  use_microphysics_constraint: true
+  microphysics_constraint_weight: 0.01
+  microphysics_constraint:
+    sign_weight:    1.5
+    corr_weight:    1.0
+    coral_weight:   0.5
+    sign_threshold: 0.1
+
   variable_weights:
     QRAIN: 1.5
     QNRAIN: 1.5

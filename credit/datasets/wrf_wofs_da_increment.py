@@ -148,6 +148,9 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.dyn_ds_cache = OrderedDict()
         self._concentration_params = {var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in CONCENTRATION_VARS}
         self._concentration_level_ops = conf["data"].get("concentration_level_ops", {})
+        # log-zscore transform params (replaces piecewise concentration transform when set)
+        self._log_transform_params_json_path = conf["data"].get("log_transform_params_json")
+        self._log_transform_params: dict[str, dict] = {}
         self._occupancy_delta_threshold = float(conf["data"].get("occupancy_delta_threshold", 1.0e-10))
         if self._occupancy_delta_threshold <= 0.0:
             self._occupancy_delta_threshold = 1.0e-10
@@ -356,6 +359,44 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
 
         return np.moveaxis(norm_level_first, 0, level_axis)
 
+    # ------------------------------------------------------------------ #
+    # Log-zscore transform (simple, fully invertible, no bisection)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _forward_log_numpy(x: np.ndarray, params: dict) -> np.ndarray:
+        """Forward log transform: log(clip(x, clip_min, clip_max)).
+
+        The result is in log space; z-scoring (subtract log_mean, divide by
+        log_std) is applied separately by _normalize_array via _mean_values
+        and _std_values which are overridden to the pooled log statistics when
+        log_transform_params_json is provided.
+        """
+        x64 = np.asarray(x, dtype=np.float64)
+        clip_min = float(params["clip_min"])
+        clip_max = float(params["clip_max"])
+        return np.log(np.clip(x64, clip_min, clip_max)).astype(
+            x.dtype if hasattr(x, "dtype") else np.float32
+        )
+
+    @staticmethod
+    def _inverse_log_numpy(x: np.ndarray, params: dict) -> np.ndarray:
+        """Inverse log transform: clip(exp(x), clip_min, clip_max).
+
+        Exact closed-form inverse of _forward_log_numpy.  The input x is the
+        log-space value *before* z-scoring (i.e. after un-z-scoring).
+        """
+        x64 = np.asarray(x, dtype=np.float64)
+        clip_min = float(params["clip_min"])
+        clip_max = float(params["clip_max"])
+        return np.clip(np.exp(x64), clip_min, clip_max).astype(
+            x.dtype if hasattr(x, "dtype") else np.float32
+        )
+
+    # ------------------------------------------------------------------ #
+    # Piecewise concentration transform (legacy, used when log params absent)
+    # ------------------------------------------------------------------ #
+
     @staticmethod
     def _forward_concentration_numpy(x: np.ndarray, params: dict[str, float]) -> np.ndarray:
         x64 = np.asarray(x, dtype=np.float64)
@@ -436,11 +477,15 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
 
     def _forward_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
+            if var_name in self._log_transform_params:
+                return self._forward_log_numpy(var_values, self._log_transform_params[var_name])
             return self._forward_concentration_numpy(var_values, self._get_concentration_params(var_name))
         return var_values
 
     def _inverse_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
+            if var_name in self._log_transform_params:
+                return self._inverse_log_numpy(var_values, self._log_transform_params[var_name])
             return self._inverse_concentration_numpy(var_values, self._get_concentration_params(var_name))
         return var_values
 
@@ -710,6 +755,50 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
                 std_values = np.where(np.isnan(std_values), 1.0, std_values)
             self._mean_values[var] = mean_values
             self._std_values[var] = std_values
+
+        # --- Load log-zscore transform params (overrides piecewise transform) ---
+        if self._log_transform_params_json_path:
+            try:
+                with open(self._log_transform_params_json_path, "r", encoding="utf-8") as f:
+                    log_payload = json.load(f)
+                log_vars = log_payload.get("variables", log_payload) if isinstance(log_payload, dict) else {}
+                if isinstance(log_vars, dict):
+                    for var, lp in log_vars.items():
+                        if var not in CONCENTRATION_VARS or not isinstance(lp, dict):
+                            continue
+                        if "log_mean" not in lp or "log_std" not in lp:
+                            logger.warning(
+                                "log_transform_params_json entry for %s missing log_mean/log_std; skipping", var
+                            )
+                            continue
+                        self._log_transform_params[var] = {
+                            "clip_min": float(lp.get("clip_min", 1e-12)),
+                            "clip_max": float(lp.get("clip_max", 1.0)),
+                            "log_mean": float(lp["log_mean"]),
+                            "log_std":  float(lp["log_std"]),
+                        }
+                logger.info(
+                    "Loaded log-zscore transform for %d variable(s) from %s",
+                    len(self._log_transform_params),
+                    self._log_transform_params_json_path,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load log_transform_params_json %s: %s; falling back to piecewise transform",
+                    self._log_transform_params_json_path,
+                    exc,
+                )
+
+        # Override mean/std for concentration vars that use the log transform.
+        # We store level-replicated scalars (shape = (n_levels,)) so that all
+        # existing reshape/broadcast code in the training and eval pipelines
+        # continues to work without modification.
+        for var, lp in self._log_transform_params.items():
+            if var not in self._mean_values:
+                continue
+            n_lev = int(np.asarray(self._mean_values[var]).shape[0]) if np.asarray(self._mean_values[var]).ndim >= 1 else 1
+            self._mean_values[var] = np.full(n_lev, lp["log_mean"], dtype=np.float64)
+            self._std_values[var]  = np.full(n_lev, lp["log_std"],  dtype=np.float64)
 
         # Dynamic forcing path checks
         if self.varname_dyn_forcing and self.filename_dyn_forcing:
