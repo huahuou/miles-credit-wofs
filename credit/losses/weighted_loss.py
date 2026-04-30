@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from credit.losses.base_losses import base_losses
 from credit.losses.spectral import SpectralLoss2D
 from credit.losses.power import PSDLoss
+from credit.losses.microphysics_constraint import MicrophysicsConsistencyLoss
 
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,27 @@ class VariableTotalLoss2D(torch.nn.Module):
             self.power_lambda_reg = conf["loss"]["spectral_lambda_reg"]
             self.power_loss = PSDLoss(wavenum_init=conf["loss"]["spectral_wavenum_init"])
 
+        # ------------------------------------------------------------- #
+        # Microphysics physical consistency constraint (Tier-1)
+        self.use_microphysics_constraint = (
+            not validation
+            and bool(conf["loss"].get("use_microphysics_constraint", False))
+        )
+        if self.use_microphysics_constraint:
+            mc_conf = conf["loss"].get("microphysics_constraint", {})
+            self.micro_constraint_weight = float(
+                conf["loss"].get("microphysics_constraint_weight", 0.05)
+            )
+            self.micro_constraint_loss = MicrophysicsConsistencyLoss(
+                variables=conf["data"]["variables"],
+                levels=levels,
+                sign_weight=float(mc_conf.get("sign_weight", 1.0)),
+                corr_weight=float(mc_conf.get("corr_weight", 1.0)),
+                coral_weight=float(mc_conf.get("coral_weight", 0.5)),
+                sign_threshold=float(mc_conf.get("sign_threshold", 0.1)),
+            )
+        # ------------------------------------------------------------- #
+
         self.validation = validation
         if conf["loss"]["training_loss"] == "KCRPS":  # for ensembles, load same loss for train and valid
             self.loss_fn = base_losses(conf, reduction="none", validation=False)
@@ -282,5 +304,8 @@ class VariableTotalLoss2D(torch.nn.Module):
 
         if not self.validation and self.use_spectral_loss:
             loss += self.spectral_lambda_reg * self.spectral_loss_surface(target, pred, weights=self.lat_weights).mean()
+
+        if self.use_microphysics_constraint:
+            loss += self.micro_constraint_weight * self.micro_constraint_loss(pred, target)
 
         return loss

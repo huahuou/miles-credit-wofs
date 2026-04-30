@@ -176,6 +176,20 @@ loss:
   use_latitude_weights: False
   use_variable_weights: True
   training_loss: 'mse'
+
+  # ── Tier-1 microphysics physical consistency constraint ──────────────
+  # Adds three auxiliary loss terms for (Q, N) hydrometeor pairs:
+  #   sign_consistency : penalise sign-discordant predicted increments
+  #   corr_alignment   : align per-level Q–N Pearson correlation to batch target
+  #   coral_cov        : 2×2 CORAL covariance matching (pred vs batch target)
+  # Set to false to disable entirely (no overhead).
+  use_microphysics_constraint: true
+  microphysics_constraint_weight: 0.05   # overall scale relative to main MSE loss
+  microphysics_constraint:
+    sign_weight:    1.0    # sign-consistency term weight (within the aux loss)
+    corr_weight:    1.0    # per-level Pearson alignment weight
+    coral_weight:   0.5    # 2×2 CORAL covariance matching weight
+    sign_threshold: 0.1    # suppress sign penalty below this |Δz| magnitude
   occupancy:
     enabled: true
     use_masked_regression: true

@@ -161,17 +161,29 @@ def _denormalize_prog_increments(
     dataset: "WoFSDAIncrementDataset",
     y_norm_incr: np.ndarray,
     x_norm_z0: np.ndarray,
+    phys_clip_by_var: "dict[str, float] | None" = None,
 ) -> np.ndarray:
     """Convert normalized-space prognostic increments to physical-space increments.
 
     Inverts ``norm(Q_t1) - norm(Q_t0)`` back to ``Q_t1 - Q_t0`` in original units.
     Handles concentration transforms (QRAIN, QNRAIN, …) automatically.
 
+    Background: concentration variables (QRAIN, QNRAIN, …) use a log-linear piecewise
+    forward transform. Values larger than ``conc_max`` land in the *exponential region*
+    of the inverse, where the Jacobian dQ/dz ∝ exp(z · neg_log_eps/c2). Even a small
+    normalized prediction error can produce an astronomically large physical increment
+    in this region. Use ``phys_clip_by_var`` to apply a per-variable physical-space
+    cap and prevent these artifacts in the saved output.
+
     Args:
         dataset: An opened ``WoFSDAIncrementDataset`` providing normalization stats.
         y_norm_incr: Normalized increments, shape ``(batch, n_vars*n_levels, time, H, W)``.
         x_norm_z0: Normalized prognostic-only state at t0,
             shape ``(batch, n_vars*n_levels, time, H, W)``.
+        phys_clip_by_var: Optional dict mapping variable name to a positive float. When
+            supplied, ``q_t1`` is clipped to ``[0, clip_max]`` before computing the
+            physical increment, preventing exponential blow-up artifacts in the output.
+            Example: ``{"QRAIN": 5e-3, "QNRAIN": 1e6}``
 
     Returns:
         Physical increments in original variable units, same shape as inputs.
@@ -201,11 +213,23 @@ def _denormalize_prog_increments(
         std_bc = std.reshape(1, -1, 1, 1, 1)
         mean_bc = mean.reshape(1, -1, 1, 1, 1)
 
-        transformed_t0 = (z0 * std_bc + mean_bc).astype(np.float32)
-        transformed_t1 = (z1 * std_bc + mean_bc).astype(np.float32)
+        # Step 1: un-z-score → this recovers forward_conc(Q_t0) and forward_conc(Q_t1)
+        transformed_t0 = (z0 * std_bc + mean_bc)
+        transformed_t1 = (z1 * std_bc + mean_bc)
 
-        q_t0 = dataset._inverse_var_transform(transformed_t0, var_name)
-        q_t1 = dataset._inverse_var_transform(transformed_t1, var_name)
+        # Step 2: inverse concentration transform → physical Q values
+        q_t0 = dataset._inverse_var_transform(transformed_t0.astype(np.float32), var_name).astype(np.float64)
+        q_t1 = dataset._inverse_var_transform(transformed_t1.astype(np.float32), var_name).astype(np.float64)
+
+        # Step 3: optional per-variable physical clip to suppress exponential-Jacobian
+        # artifacts when the model predicts out-of-training-distribution z1 values.
+        # NOTE: for concentration variables the inverse is exponential (region 3) when
+        # forward_conc(q) > y2 ≈ 1.8 (q > conc_max = 2.5).  A small normalized error
+        # at a high-z0 pixel can become hundreds of times larger in physical space.
+        if phys_clip_by_var and var_name in phys_clip_by_var:
+            clip_max = float(phys_clip_by_var[var_name])
+            q_t1 = np.clip(q_t1, 0.0, clip_max)
+
         phys[:, ch0:ch1, ...] = (q_t1 - q_t0).astype(np.float32)
 
     return phys
@@ -469,6 +493,14 @@ def main() -> None:
     )
     save_physical_enabled = bool(eval_conf.get("save_physical", True))
 
+    # Per-variable physical-space clip for the denormalized output.
+    # Suppresses exponential-Jacobian artifacts for concentration vars (QRAIN, QNRAIN, …).
+    # Config key: eval.phys_clip_by_var: {QRAIN: 5.0e-3, QNRAIN: 1.0e6}
+    raw_phys_clip = eval_conf.get("phys_clip_by_var", {})
+    phys_clip_by_var: dict[str, float] | None = (
+        {k: float(v) for k, v in raw_phys_clip.items()} if isinstance(raw_phys_clip, dict) and raw_phys_clip else None
+    )
+
     seed_everything(conf["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -695,10 +727,8 @@ def main() -> None:
 
                 if save_physical_enabled:
                     x_prog_np = x_np[:, :n_prog_channels, ...]
-                    t0 = time.monotonic()
-                    y_true_phys_np = _denormalize_prog_increments(dataset, y_true_np, x_prog_np)
-                    y_pred_phys_np = _denormalize_prog_increments(dataset, y_pred_np, x_prog_np)
-                    logger.info("  denormalization done in %.2fs", time.monotonic() - t0)
+                    y_true_phys_np = _denormalize_prog_increments(dataset, y_true_np, x_prog_np, phys_clip_by_var=phys_clip_by_var)
+                    y_pred_phys_np = _denormalize_prog_increments(dataset, y_pred_np, x_prog_np, phys_clip_by_var=phys_clip_by_var)
                     t0 = time.monotonic()
                     ds_phys = _build_batch_physical_dataset_for_zarr(
                         conf=conf,
