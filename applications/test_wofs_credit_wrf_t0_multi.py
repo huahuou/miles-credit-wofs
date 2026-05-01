@@ -59,7 +59,9 @@ def _select_files(
 def _build_params(conf: dict, split: str, target_start_step: int | None) -> tuple[dict, dict]:
     years_range = conf["data"]["train_years"] if split == "train" else conf["data"]["valid_years"]
     date_range = conf["data"].get("train_date_range") if split == "train" else conf["data"].get("valid_date_range")
-    effective_target_start = target_start_step or conf["data"].get("target_start_step", 1)
+    effective_target_start = (
+        target_start_step if target_start_step is not None else conf["data"].get("target_start_step", 1)
+    )
 
     param_interior = {
         "varname_upper_air": conf["data"]["variables"],

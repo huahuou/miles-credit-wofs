@@ -53,6 +53,7 @@ class WoFSMultiStep(torch.utils.data.Dataset):
     same WoFS case/member file and remain fixed across a rollout.
 
     `target_start_step` controls the first forecast lead included in learning:
+    - 0 -> start from the earliest valid rollout window for the chosen history
     - 1 -> first supervised step is `t0 -> t1`
     - 2 -> first supervised step is `t1 -> t2`
     """
@@ -89,8 +90,8 @@ class WoFSMultiStep(torch.utils.data.Dataset):
         self.world_size = world_size
         self.max_forecast_len = max_forecast_len
         self.target_start_step = int(param_interior.get("target_start_step", 1))
-        if self.target_start_step < 1:
-            raise ValueError("target_start_step must be >= 1")
+        if self.target_start_step < 0:
+            raise ValueError("target_start_step must be >= 0")
         self.start_index_offset = max(0, self.target_start_step - self.history_len)
         self.zarr_time_chunk = int(param_interior.get("zarr_time_chunk", 0))
         if self.zarr_time_chunk <= 0:
