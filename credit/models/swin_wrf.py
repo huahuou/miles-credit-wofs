@@ -199,18 +199,13 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """PixelShuffle stride-2 upsampling + residual path."""
+    """ConvTranspose2d stride-2 upsampling + residual path."""
 
     def __init__(self, in_chans: int, out_chans: int,
                  num_groups: int, num_residuals: int = 2):
         super().__init__()
-        
-        # Expand channels by 4x, then shuffle them into a 2x2 spatial expansion
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_chans, out_chans * 4, kernel_size=3, stride=1, padding=1),
-            nn.PixelShuffle(upscale_factor=2)
-        )
-        
+        self.conv = nn.ConvTranspose2d(in_chans, out_chans,
+                                       kernel_size=2, stride=2)
         blk = []
         for _ in range(num_residuals):
             blk += [
@@ -599,9 +594,7 @@ class WRFTransformer(BaseModel):
                 logger.info("Base model weights are frozen; training noise injection layers only")
         else:
             self.flow_noise = None
-                
-        # ADD THIS: A final blending convolution
-        self.final_smooth_conv = nn.Conv2d(self.out_chans, self.out_chans, kernel_size=3, padding=1)
+
     # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
@@ -681,9 +674,7 @@ class WRFTransformer(BaseModel):
         # is always correct and does not need a fallback to interpolation.
         x = x[:, :, :orig_H, :orig_W].contiguous()
         # ------------------------------------------------------------------
-        # ADD THIS: Apply the blending convolution to remove the final sub-pixel artifacts
-        x = self.final_smooth_conv(x)
-        
+
         x = x.unsqueeze(2)                           # restore time dim
 
         # ── optional post-block ───────────────────────────────────────────

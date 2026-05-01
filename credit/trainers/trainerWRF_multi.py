@@ -225,6 +225,13 @@ class Trainer(BaseTrainer):
                         # concat on var dimension
                         y = torch.cat((y, y_diag_batch), dim=1)
 
+                    # Provide batch context to criterion for auxiliary losses that need inputs
+                    if hasattr(criterion, "set_batch_context") and callable(getattr(criterion, "set_batch_context")):
+                        try:
+                            criterion.set_batch_context(step_batch)
+                        except Exception:
+                            pass
+
                     with autocast(enabled=amp):
                         if interior_crop > 0:
                             n = interior_crop

@@ -260,6 +260,12 @@ class Trainer(BaseTrainer):
                 y = y.to(device=self.device, dtype=y_pred.dtype, non_blocking=True)
 
                 # loss compute
+                # Provide batch context to criterion for auxiliary losses that need inputs (e.g., H-operator)
+                if hasattr(criterion, "set_batch_context") and callable(getattr(criterion, "set_batch_context")):
+                    try:
+                        criterion.set_batch_context(batch)
+                    except Exception:
+                        pass
                 loss, reg_loss, occ_ce, gate_mean = self._compute_loss_with_occupancy(
                     conf,
                     batch,
@@ -478,6 +484,12 @@ class Trainer(BaseTrainer):
                         y_pred = y_pred + residual
 
                 y = y.to(device=self.device, dtype=y_pred.dtype, non_blocking=True)
+                # Provide batch context to criterion for auxiliary losses that need inputs (e.g., H-operator)
+                if hasattr(criterion, "set_batch_context") and callable(getattr(criterion, "set_batch_context")):
+                    try:
+                        criterion.set_batch_context(batch)
+                    except Exception:
+                        pass
                 loss, reg_loss, occ_ce, gate_mean = self._compute_loss_with_occupancy(
                     conf,
                     batch,

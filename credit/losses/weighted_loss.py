@@ -8,6 +8,7 @@ from credit.losses.base_losses import base_losses
 from credit.losses.spectral import SpectralLoss2D
 from credit.losses.power import PSDLoss
 from credit.losses.microphysics_constraint import MicrophysicsConsistencyLoss
+from credit.losses.refl_operator_constraint import ReflOperatorConstraintLoss
 
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,18 @@ class VariableTotalLoss2D(torch.nn.Module):
             )
         # ------------------------------------------------------------- #
 
+        # ------------------------------------------------------------- #
+        # H-operator reflectivity constraint (configurable)
+        self.use_refl_operator_constraint = (
+            not validation and bool(conf["loss"].get("use_refl_operator_constraint", False))
+        )
+        if self.use_refl_operator_constraint:
+            self.refl_constraint_weight = float(
+                conf["loss"].get("refl_operator_constraint_weight", 0.02)
+            )
+            self.refl_constraint = ReflOperatorConstraintLoss(conf)
+        # ------------------------------------------------------------- #
+
         self.validation = validation
         if conf["loss"]["training_loss"] == "KCRPS":  # for ensembles, load same loss for train and valid
             self.loss_fn = base_losses(conf, reduction="none", validation=False)
@@ -308,4 +321,31 @@ class VariableTotalLoss2D(torch.nn.Module):
         if self.use_microphysics_constraint:
             loss += self.micro_constraint_weight * self.micro_constraint_loss(pred, target)
 
+        if self.use_refl_operator_constraint:
+            # The reflectivity constraint requires batch context; if not set, it returns 0
+            loss += self.refl_constraint_weight * self.refl_constraint(pred, target)
+
         return loss
+
+    # Optional: allow trainer to provide batch context needed by reflectivity constraint
+    def set_batch_context(self, step_batch: dict):
+        if not self.use_refl_operator_constraint:
+            return
+        try:
+            # step_batch["x"]: (B, time=1, var, level, H, W) — we need t0 background for prognostic vars
+            x = step_batch["x"]
+            z0 = x[:, 0]  # (B, Vp, L, H, W)
+
+            # step_batch["x_forcing_static"]: (B, time=1, C, H, W) or absent
+            forcing_static = step_batch.get("x_forcing_static")
+
+            # step_batch["x_boundary"]: (B, time=1, num_obs=1, L, H, W)
+            xb = step_batch.get("x_boundary")
+            innov_norm = None
+            if xb is not None:
+                innov_norm = xb[:, 0, 0]  # (B, L, H, W)
+
+            self.refl_constraint.set_batch_context(z0_norm=z0, forcing_static=forcing_static, boundary_innov_norm=innov_norm)
+        except Exception:
+            # Swallow errors; constraint forward will safely return 0 without context
+            pass

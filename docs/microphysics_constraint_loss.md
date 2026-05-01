@@ -226,6 +226,143 @@ mid-range but gain full differentiability.
 If $q_{r,\mathrm{pred}} \leq \varepsilon_{q}$ then $N_{r,\mathrm{pred}}$
 should also be near zero, and vice versa.  This can be enforced as:
 
+---
+
+## Phase 2 — H-Operator Reflectivity Constraint (dBZ)
+
+### Motivation
+
+Tier-1 constraints keep the $(\Delta q, \Delta N)$ pairs coherent in normalized space, but they do not directly tie the predicted hydrometeor increments to the observed reflectivity innovations that drive the DA task. This phase introduces a forward observation operator, $\mathcal{H}$, that maps physical hydrometeor states to S-band reflectivity (REFL_10CM), and a corresponding loss that aligns predicted reflectivity changes with the observed reflectivity innovation.
+
+The operator $\mathcal{H}$ follows the NSSL 2-moment microphysics reflectivity diagnosis (as implemented in diag_nssl_refl.py), adapted for torch-efficient, batched computation. With the new closed-form log-zscore inverse transform, we can cheaply and stably convert normalized predictions back to physical $(q, N)$ prior to applying $\mathcal{H}$.
+
+### High-Level Idea
+
+- Given normalized background state $z_0$ (for each concentration variable) and the model-predicted normalized increment $\Delta \hat{z}$, form the predicted post-increment normalized state: $z_1^{\mathrm{pred}} = z_0 + \Delta \hat{z}$.
+- Use the log-zscore inverse transform (see build_log_transform_params.py and test_log_transform.py) to recover physical-space hydrometeor fields $(q, N)$ at $t_0$ and $t_1$:
+  - $q_{t0} = \exp(z_{Q,t0} \cdot \sigma_{\log,Q} + \mu_{\log,Q})$ clamped to $[\text{clip}_\min, \text{clip}_\max]$
+  - $q_{t1}^{\mathrm{pred}} = \exp(z_{Q,t1}^{\mathrm{pred}} \cdot \sigma_{\log,Q} + \mu_{\log,Q})$ (same for $N$)
+- Apply the forward operator $\mathcal{H}$ to obtain reflectivity in dBZ at $t_0$ and $t_1$ (predicted):
+  - $\mathrm{dBZ}_{t0} = \mathcal{H}(q_{\cdot,t0}, N_{\cdot,t0}; \rho, T, \ldots)$
+  - $\mathrm{dBZ}_{t1}^{\mathrm{pred}} = \mathcal{H}(q_{\cdot,t1}^{\mathrm{pred}}, N_{\cdot,t1}^{\mathrm{pred}}; \rho, T, \ldots)$
+- Compare the predicted reflectivity innovation $\Delta \mathrm{dBZ}^{\mathrm{pred}} = \mathrm{dBZ}_{t1}^{\mathrm{pred}} - \mathrm{dBZ}_{t0}$ to the observed innovation (from the dataset boundary input) either in physical dBZ space or in the dataset’s normalized REFL_10CM space.
+
+This closes the loop from predicted microphysics increments → reflectivity change, adding a physically grounded, observation-space regularizer.
+
+### Forward Operator $\mathcal{H}$ (NSSL 2-Moment)
+
+The operator sums the linear reflectivity contributions from species present in the training set:
+
+- Rain: $Z_r \propto (\rho\, q_r)^2 / N_r$ with gamma-diameter shape factor $g_1(\alpha_r)$ and water density constants (as in diag_nssl_refl.py).
+- Snow: Dry-snow (Cox 1988) formulation with optional bright-band enhancement when $T > T_f + 1\,\mathrm{K}$ and rain is present; depends on $q_s$, $N_s$, $\rho$, $T$, and $q_r$.
+- Graupel and Hail: $Z \propto (\rho\, q)^2 / N$ with effective density treatment and mean-volume clamping, recomputing $N$ when clamped (matching radardd02 logic).
+- Ice crystals: optional; if not provided, treated as zero contribution.
+
+Then $Z_{\text{total}} = Z_r + Z_s + Z_g + Z_h + Z_i$ and $\mathrm{dBZ} = 10\log_{10}(\max(Z_{\text{total}}, \epsilon))$ with a configurable floor.
+
+Implementation notes:
+- We will provide a torch implementation, vectorized over batch/levels/spatial dimensions, and numerically aligned to python_scripts/diag_nssl_refl.py (Numpy reference).
+- Inputs required by $\mathcal{H}$:
+  - $q$ and $N$ for the species present: QRAIN/QNRAIN, QSNOW/QNSNOW, QGRAUP/QNGRAUPEL, QHAIL/QNHAIL.
+  - Optional temperature $T$ (from context variable `T`) for bright-band logic; if unavailable, bright-band is disabled.
+  - Dry-air density $\rho$ per level; when not directly available, we will provide an approximation path:
+    - Preferred: dataset-provided $\rho$ (if added later to context).
+    - Fallback: standard-atmosphere profile from `GEOPOT` height; final scale largely cancels in innovation mode.
+
+### Loss Definition
+
+Two operation modes are supported:
+
+1) Innovation mode (default):
+   - Predict $\Delta \mathrm{dBZ}^{\mathrm{pred}} = \mathcal{H}(\cdot)\big|_{t1} - \mathcal{H}(\cdot)\big|_{t0}$.
+   - Compute target innovation from boundary REFL_10CM: either
+     - physical dBZ difference (requires inverse-normalization of REFL_10CM), or
+     - normalized-space difference if we normalize our diagnosed $\mathrm{dBZ}$ with the same mean/std per level.
+   - Loss: masked mean-squared error (or Huber) over levels and spatial domain, with optional gating by reflectivity magnitude (e.g., only where either $\ge$ 5 dBZ).
+
+2) Absolute mode:
+   - Compare $\mathrm{dBZ}_{t1}^{\mathrm{pred}}$ directly to dataset REFL_10CM at $t_1$ (inverse-normalized), optionally also aligning $t_0$.
+
+Masking and weighting:
+- Reuse the occupancy gating already configured for concentrations; only evaluate where microphysics changes occur or where observed reflectivity is non-trivial.
+- Optional latitude weights are supported consistently with other losses.
+
+### Configuration (YAML)
+
+Add a separate, opt-in loss block so it’s independently tunable:
+
+```yaml
+loss:
+  use_refl_operator_constraint: true
+  refl_operator_constraint_weight: 0.02
+  refl_operator_constraint:
+    mode: innovation           # innovation | absolute
+    compare_space: dbz         # dbz | normalized
+    dbz_floor: 0.0             # dBZ lower bound in H
+    threshold_dbz: 5.0         # mask below this magnitude (either t0 or pred)
+    include_species: [rain, snow, graupel, hail]   # ice optional
+    rho_source: approx         # dataset | approx
+    temp_source: context       # context | none
+    level_reduction: none      # none | max | mean (if needed)
+```
+
+Dependencies and prerequisites:
+- The closed-form log-zscore transform must be enabled via `data.log_transform_params_json` (present in the current config).
+- For `compare_space: normalized`, we will read REFL_10CM per-level mean/std from the same stats files already configured (`mean_path`/`std_path`) to place both diagnosed and target reflectivity in the same normalized space.
+
+### API Placement
+
+- `credit/physics/refl_operator.py` — torch $\mathcal{H}$ implementation (species kernels + combiner).
+- `credit/losses/refl_operator_constraint.py` — loss module that:
+  - Takes predicted normalized increments and background normalized state for concentrations.
+  - Inverts to physical $(q, N)$ using log-zscore parameters.
+  - Calls $\mathcal{H}$ at $t_0$ and $t_1$ (predicted), forms innovation or absolute target, applies masks, and computes MSE/Huber.
+- `credit/losses/weighted_loss.py` — wire-up like the existing `MicrophysicsConsistencyLoss` with `use_refl_operator_constraint` and a separate weight.
+
+### Numerical Alignment and Validation
+
+We will keep the torch implementation numerically aligned with the Numpy reference in python_scripts/diag_nssl_refl.py:
+- Unit conversions, density constants, gamma-function shape factors, mean-volume clamping, and bright-band logic are mirrored.
+- We will include tolerances in tests (e.g., |dBZ| differences < 0.2–0.5 dB on typical ranges) acknowledging small differences from float32 vs float64 and batched epsilons.
+
+### Test Plan and Script
+
+We will add a self-contained test under python_scripts to exercise both components — the forward operator and the training-style constraint:
+
+- File: python_scripts/test_refl_operator_constraint.py
+- Tests:
+  1) Torch vs Numpy operator parity: generate random-but-physical $(q,N,\rho,T)$ fields and assert dBZ differences < tolerance per species and total.
+  2) Round-trip with dataset normalization: sample a few tiles/levels from one WoFS case; compute $\mathrm{dBZ}_{t0}, \mathrm{dBZ}_{t1}$ from raw $(q,N)$ using torch $\mathcal{H}$; compare to dataset REFL_10CM in dBZ (after inverse-normalization) — report MAE/RMSE/correlation per level.
+  3) Training mimic (innovation mode):
+     - Build $z_0$ from raw $(q,N)$ with the forward log-zscore; build $z_1$ from $t_1$; form $\Delta z = z_1 - z_0$.
+     - Reconstruct $q_1$ by inverting $z_0 + \Delta z$; ensure reconstruction error is < 1e-5 (as in test_log_transform.py).
+     - Compute $\Delta \mathrm{dBZ}^{\mathrm{pred}}$ and compare to observed REFL_10CM innovation (either physical or normalized per config) — report metrics.
+
+Example run on Ursa (CPU node is fine for tests):
+
+```
+srun -A gpu-ai4wp -p u1-compute --mem=128g -N 1 -t 1:20:00 --pty bash -il
+source $MODULESHOME/init/bash
+module load rdhpcs-conda
+module load cuda/12.8
+conda activate credit-wofs
+python python_scripts/test_refl_operator_constraint.py \
+  --stats-mean /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc \
+  --stats-std  /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc \
+  --log-params /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/log_transform_params.json \
+  --case /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_20190429_0000_mem01.zarr.zip
+```
+
+### Risks and Mitigations
+
+- Density/temperature availability: if high-fidelity $\rho$ and $T$ are unavailable from context, use innovation mode and approximate profiles — most multiplicative biases cancel in the difference. We gate the loss by reflectivity magnitude to avoid clear-air noise.
+- Cost: The torch operator is elementwise/outer-product heavy but memory-bandwidth bound; cost is modest vs the model forward. We can disable species to trade accuracy for speed.
+- Stability: All transforms are monotone and bounded; we clamp to physical ranges, apply small epsilons in denominators, and compute logs only on strictly positive Z.
+
+### Summary
+
+The H-operator reflectivity constraint ties predicted $(\Delta q, \Delta N)$ to observation-space innovations using a physically principled forward map. It complements Tier-1 normalized-space consistency terms and is fully compatible with the new closed-form log-zscore normalization, enabling stable gradients and low overhead.
+
 $$\mathcal{L}_\mathrm{zero} = \left\|
   \mathbf{1}[q_r < \varepsilon_q] \cdot N_{r,\mathrm{pred}}
 \right\|_2^2
