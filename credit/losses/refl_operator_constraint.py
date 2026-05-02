@@ -5,6 +5,12 @@ import torch
 import xarray as xr
 
 from credit.physics.refl_operator import ze_rain, ze_snow, ze_graupel, ze_hail, ze_ice, combine_to_dbz
+from credit.transforms.concentration import (
+    CONCENTRATION_VARS,
+    concentration_transform_overrides_stats,
+    inverse_concentration_transform_torch,
+    load_concentration_transform_json,
+)
 
 
 class ReflOperatorConstraintLoss(torch.nn.Module):
@@ -51,15 +57,20 @@ class ReflOperatorConstraintLoss(torch.nn.Module):
                         self._mean[v] = torch.from_numpy(ds_m[v].values).float()
                         self._std[v] = torch.from_numpy(ds_s[v].values).float()
 
-        # Load log transform params for concentrations
+        # Load generalized concentration transform params.
         log_json = data_conf.get("log_transform_params_json")
+        self._concentration_transform_specs: Dict[str, dict] = {}
         self._log_params: Dict[str, dict] = {}
         if log_json:
-            with open(log_json, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-            vars_dict = raw.get("variables", raw)
-            for var, p in vars_dict.items():
-                self._log_params[var] = dict(p)
+            _, self._concentration_transform_specs = load_concentration_transform_json(
+                log_json,
+                variables=CONCENTRATION_VARS,
+            )
+            self._log_params = {
+                var: spec
+                for var, spec in self._concentration_transform_specs.items()
+                if concentration_transform_overrides_stats(spec)
+            }
 
         self._batch_ctx = None
 
@@ -81,8 +92,8 @@ class ReflOperatorConstraintLoss(torch.nn.Module):
 
     # ----------------- Helpers ----------------- #
     def _inverse_log(self, z: torch.Tensor, var: str) -> torch.Tensor:
-        p = self._log_params.get(var)
-        if p is None:
+        spec = self._concentration_transform_specs.get(var)
+        if spec is None:
             # Fallback: treat as standard z-score
             mu = self._mean[var].to(z.device)
             sd = self._std[var].to(z.device)
@@ -91,17 +102,20 @@ class ReflOperatorConstraintLoss(torch.nn.Module):
             if sd.ndim == 1:
                 sd = sd[:, None, None]
             return (z * sd + mu)
-        clip_min = float(p["clip_min"])
-        clip_max = float(p["clip_max"])
-        log_mean = torch.as_tensor(p["log_mean"], dtype=z.dtype, device=z.device)
-        log_std = torch.as_tensor(p["log_std"], dtype=z.dtype, device=z.device)
-        if log_mean.ndim == 1:
-            log_mean = log_mean[:, None, None]
-        if log_std.ndim == 1:
-            log_std = log_std[:, None, None]
-        log_x = z * log_std + log_mean
-        x = torch.exp(log_x)
-        return torch.clamp(x, min=clip_min, max=clip_max)
+        level_axis = 1 if z.ndim >= 4 else 0
+        if concentration_transform_overrides_stats(spec):
+            log_mean = torch.as_tensor(spec["log_mean"], dtype=z.dtype, device=z.device)
+            log_std = torch.as_tensor(spec["log_std"], dtype=z.dtype, device=z.device)
+            log_x = z * log_std + log_mean
+            return inverse_concentration_transform_torch(log_x, spec, level_axis=level_axis)
+        mu = self._mean[var].to(z.device)
+        sd = self._std[var].to(z.device)
+        if mu.ndim == 1:
+            mu = mu[:, None, None]
+        if sd.ndim == 1:
+            sd = sd[:, None, None]
+        latent = z * sd + mu
+        return inverse_concentration_transform_torch(latent, spec, level_axis=level_axis)
 
     def _inverse_standard(self, z: torch.Tensor, var: str) -> torch.Tensor:
         mu = self._mean[var].to(z.device)
@@ -240,7 +254,7 @@ class ReflOperatorConstraintLoss(torch.nn.Module):
         for vi, var in enumerate(var_list):
             z0_v = z0[:, vi]
             z1_v = z1[:, vi]
-            if var in self._log_params:
+            if var in self._concentration_transform_specs:
                 q0[var] = self._inverse_log(z0_v, var)
                 q1[var] = self._inverse_log(z1_v, var)
             else:

@@ -9,6 +9,10 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+from credit.transforms.concentration import (
+    forward_concentration_transform_numpy,
+    load_concentration_transform_json,
+)
 
 def _zarr_open(file_path: str, **kwargs):
     file_path = str(file_path)
@@ -157,6 +161,14 @@ def _transform_concentration(da: xr.DataArray, params: dict[str, float] | None =
     """Apply the CREDIT concentration-variable transform before statistics."""
 
     arr = np.asarray(da.values, dtype=np.float64)
+    level_axis = da.dims.index("level") if "level" in da.dims else None
+    transform_spec = None
+    if params is not None and "transform_type" in params:
+        transform_spec = params
+    if transform_spec is not None:
+        transformed = forward_concentration_transform_numpy(arr, transform_spec, level_axis=level_axis)
+        return xr.DataArray(transformed, dims=da.dims, coords=da.coords)
+
     merged = dict(_DEFAULT_CONCENTRATION_PARAMS)
     if params is not None:
         merged.update(params)
@@ -174,6 +186,18 @@ def _transform_concentration(da: xr.DataArray, params: dict[str, float] | None =
     neg_log_eps = -log_eps
     transformed = c1 * np.minimum(arr, conc_max) + c2 * (np.log(np.maximum(arr, conc_eps)) - log_eps) / neg_log_eps
     return xr.DataArray(transformed, dims=da.dims, coords=da.coords)
+
+
+def _get_transform_clip_bounds(params: dict[str, float] | None) -> tuple[float | None, float | None]:
+    if not isinstance(params, dict):
+        return None, None
+    if "transform_type" in params:
+        transform_type = str(params.get("transform_type", "")).strip()
+        if transform_type == "zero_inflated_lognormal_probit":
+            return float(params.get("zero_floor", 0.0)), float(params.get("clip_max", np.inf))
+        if transform_type == "log_zscore":
+            return float(params.get("clip_min", 0.0)), float(params.get("clip_max", np.inf))
+    return params.get("value_clip_min"), params.get("value_clip_max")
 
 
 def _score_concentration_candidate(
@@ -392,6 +416,7 @@ def _compute_partial_stats(
     file_batch: list[str],
     data_vars: list[str],
     concentration_params: dict[str, dict[str, float]],
+    concentration_transform_specs: dict[str, dict],
     exclude_clipped_boundary_samples: bool,
     clip_boundary_tolerance: float,
 ) -> dict[str, dict[str, np.ndarray]]:
@@ -411,10 +436,11 @@ def _compute_partial_stats(
                 da = ds[var]
                 valid_mask = None
                 if var in _CONCENTRATION_VARS:
-                    params = concentration_params.get(var)
+                    params = concentration_transform_specs.get(var)
+                    if params is None:
+                        params = concentration_params.get(var)
                     if exclude_clipped_boundary_samples and params is not None:
-                        clip_min = params.get("value_clip_min")
-                        clip_max = params.get("value_clip_max")
+                        clip_min, clip_max = _get_transform_clip_bounds(params)
                         if clip_min is not None or clip_max is not None:
                             raw = np.asarray(da.values, dtype=np.float64)
                             valid_mask = np.isfinite(raw)
@@ -454,6 +480,12 @@ def main():
     parser.add_argument(
         "--latweights-out",
         help="Optional output path for a placeholder latitude-weights file. Use with `use_latitude_weights: False` in CREDIT.",
+    )
+    parser.add_argument(
+        "--transform-params-json",
+        "--log-transform-params-json",
+        dest="transform_params_json",
+        help="Optional generalized concentration transform JSON path (e.g. zero-inflated probit or log-zscore)",
     )
     parser.add_argument(
         "--concentration-params-json",
@@ -522,8 +554,20 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.auto_tune_concentration and args.concentration_params_json:
-        raise SystemExit("Use only one of --auto-tune-concentration or --concentration-params-json")
+    selected_transform_opts = sum(
+        1
+        for enabled in (
+            bool(args.transform_params_json),
+            bool(args.concentration_params_json),
+            bool(args.auto_tune_concentration),
+        )
+        if enabled
+    )
+    if selected_transform_opts > 1:
+        raise SystemExit(
+            "Use only one of --transform-params-json/--log-transform-params-json, "
+            "--concentration-params-json, or --auto-tune-concentration"
+        )
 
     files = sorted(glob.glob(args.glob))
     start_date = _parse_yyyymmdd(args.start_date)
@@ -541,7 +585,19 @@ def main():
     concentration_params: dict[str, dict[str, float]] = {
         var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in _CONCENTRATION_VARS
     }
+    concentration_transform_specs: dict[str, dict] = {}
     concentration_params_source = "default"
+    raw_transform_payload: dict | None = None
+    if args.transform_params_json:
+        raw_transform_payload, concentration_transform_specs = load_concentration_transform_json(
+            args.transform_params_json,
+            variables=_CONCENTRATION_VARS,
+        )
+        concentration_params_source = f"transform_json:{args.transform_params_json}"
+        print(
+            f"[transform] loaded generalized transform specs for "
+            f"{len(concentration_transform_specs)} variables from {args.transform_params_json}"
+        )
     if args.concentration_params_json:
         loaded = _load_concentration_params_json(args.concentration_params_json)
         for var, params in loaded.items():
@@ -593,6 +649,7 @@ def main():
                     file_batch,
                     data_vars,
                     concentration_params,
+                    concentration_transform_specs,
                     exclude_clipped_boundary_samples=args.exclude_clipped_boundary_samples,
                     clip_boundary_tolerance=args.clip_boundary_tolerance,
                 )
@@ -613,6 +670,7 @@ def main():
                         file_batch,
                         data_vars,
                         concentration_params,
+                        concentration_transform_specs,
                         args.exclude_clipped_boundary_samples,
                         args.clip_boundary_tolerance,
                         pure=False,
@@ -640,6 +698,7 @@ def main():
     transform_metadata = {
         "source": concentration_params_source,
         "parameters": concentration_params,
+        "transform_specs_count": len(concentration_transform_specs),
         "exclude_clipped_boundary_samples": bool(args.exclude_clipped_boundary_samples),
         "clip_boundary_tolerance": float(args.clip_boundary_tolerance),
     }
@@ -648,6 +707,10 @@ def main():
     std_ds.attrs["concentration_transform_params_json"] = transform_metadata_str
     mean_ds.attrs["concentration_transform_source"] = concentration_params_source
     std_ds.attrs["concentration_transform_source"] = concentration_params_source
+    if raw_transform_payload is not None:
+        raw_transform_str = json.dumps(raw_transform_payload, sort_keys=True)
+        mean_ds.attrs["concentration_transform_spec_json"] = raw_transform_str
+        std_ds.attrs["concentration_transform_spec_json"] = raw_transform_str
 
     for var in data_vars:
         count = accum[var]["count"]
@@ -682,18 +745,30 @@ def main():
             std_da = xr.DataArray(np.float32(std))
 
         if var in _CONCENTRATION_VARS:
-            params = concentration_params.get(var, _DEFAULT_CONCENTRATION_PARAMS)
-            for da in (mean_da, std_da):
-                da.attrs["concentration_transform_c1"] = float(params["c1"])
-                da.attrs["concentration_transform_c2"] = float(params["c2"])
-                da.attrs["concentration_transform_conc_eps"] = float(params["conc_eps"])
-                da.attrs["concentration_transform_conc_max"] = float(params["conc_max"])
-                clip_min = params.get("value_clip_min")
-                clip_max = params.get("value_clip_max")
-                if clip_min is not None:
-                    da.attrs["concentration_transform_clip_min"] = float(clip_min)
-                if clip_max is not None:
-                    da.attrs["concentration_transform_clip_max"] = float(clip_max)
+            transform_spec = concentration_transform_specs.get(var)
+            if transform_spec is not None:
+                for da in (mean_da, std_da):
+                    da.attrs["concentration_transform_type"] = str(transform_spec["transform_type"])
+                    if str(transform_spec["transform_type"]) == "zero_inflated_lognormal_probit":
+                        da.attrs["concentration_transform_zero_floor"] = float(transform_spec["zero_floor"])
+                        da.attrs["concentration_transform_probit_eps"] = float(transform_spec["probit_eps"])
+                        da.attrs["concentration_transform_clip_max"] = float(transform_spec["clip_max"])
+                    elif str(transform_spec["transform_type"]) == "log_zscore":
+                        da.attrs["concentration_transform_clip_min"] = float(transform_spec["clip_min"])
+                        da.attrs["concentration_transform_clip_max"] = float(transform_spec["clip_max"])
+            else:
+                params = concentration_params.get(var, _DEFAULT_CONCENTRATION_PARAMS)
+                for da in (mean_da, std_da):
+                    da.attrs["concentration_transform_c1"] = float(params["c1"])
+                    da.attrs["concentration_transform_c2"] = float(params["c2"])
+                    da.attrs["concentration_transform_conc_eps"] = float(params["conc_eps"])
+                    da.attrs["concentration_transform_conc_max"] = float(params["conc_max"])
+                    clip_min = params.get("value_clip_min")
+                    clip_max = params.get("value_clip_max")
+                    if clip_min is not None:
+                        da.attrs["concentration_transform_clip_min"] = float(clip_min)
+                    if clip_max is not None:
+                        da.attrs["concentration_transform_clip_max"] = float(clip_max)
 
         mean_ds[var] = mean_da
         std_ds[var] = std_da

@@ -102,7 +102,7 @@ def _build_params_from_conf(conf: dict, split: str = "train") -> Tuple[dict, dic
 def _inverse_concentration_log(
     ds: WoFSDAIncrementDataset, z: np.ndarray, var: str
 ) -> np.ndarray:
-    """Inverse from normalized z to physical using the dataset's log-zscore params.
+    """Inverse from normalized z to physical using the dataset transform spec.
 
     Shapes: z: (L,H,W) → returns physical (L,H,W).
     """
@@ -113,9 +113,8 @@ def _inverse_concentration_log(
         mean = mean[:, None, None]
     if std.ndim == 1:
         std = std[:, None, None]
-    log_x = z.astype(np.float64) * std + mean
-    params = ds._log_transform_params[var]
-    return ds._inverse_log_numpy(log_x, params).astype(np.float32)
+    latent = z.astype(np.float64) * std + mean
+    return ds._inverse_var_transform(latent, var).astype(np.float32)
 
 
 def _inverse_standard(

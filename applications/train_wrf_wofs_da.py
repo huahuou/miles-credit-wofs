@@ -254,6 +254,11 @@ def main(rank, world_size, conf, backend, trial=False):
 
         if conf["data"]["scaler_type"] != "std-wrf":
             raise ValueError("WoFS DA increment app currently supports scaler_type='std-wrf' only")
+        if conf["data"].get("log_transform_params_json"):
+            logging.info(
+                "Using concentration transform spec from %s",
+                conf["data"]["log_transform_params_json"],
+            )
 
         param_interior_train, param_outside_train = _build_params(conf, "train")
         skip_validation = conf["trainer"].get("skip_validation", False)

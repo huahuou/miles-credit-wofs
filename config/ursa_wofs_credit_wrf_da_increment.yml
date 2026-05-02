@@ -27,15 +27,16 @@ data:
 
   mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
   std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
+  # Legacy piecewise concentration transform fallback only.
   concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
-  # Simple invertible log-zscore transform for concentration variables.
-  # When set, replaces the piecewise concentration transform with:
-  #   forward:  z = (log(clip(x, clip_min, clip_max)) - log_mean) / log_std
-  #   inverse:  x = clip(exp(z * log_std + log_mean), clip_min, clip_max)
-  # Generate with: python python_scripts/build_log_transform_params.py \
-  #   --input  <stats_dir>/concentration_tuning.json \
-  #   --output <stats_dir>/log_transform_params.json
-  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/log_transform_params.json'
+  # Generalized concentration transform spec.
+  # Recommended workflow:
+  #   1. python python_scripts/build_zero_inflated_transform_params.py \
+  #        --glob <cases_glob> --output <stats_dir>/zero_inflated_transform_params.json
+  #   2. python python_scripts/compute_credit_stats.py \
+  #        --glob <cases_glob> --transform-params-json <stats_dir>/zero_inflated_transform_params.json ...
+  #   3. Train with the same transform JSON path below.
+  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/zero_inflated_transform_params.json'
 
   concentration_level_ops:
     QRAIN:

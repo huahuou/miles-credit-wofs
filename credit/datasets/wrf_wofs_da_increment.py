@@ -38,6 +38,14 @@ from credit.data import (
     filter_ds,
     get_forward_data,
 )
+from credit.transforms.concentration import (
+    CONCENTRATION_VARS,
+    build_log_zscore_stats_override,
+    concentration_transform_overrides_stats,
+    forward_concentration_transform_numpy,
+    inverse_concentration_transform_numpy,
+    load_concentration_transform_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,22 +57,6 @@ _DEFAULT_CONCENTRATION_PARAMS = {
     "value_clip_min": None,
     "value_clip_max": None,
 }
-
-CONCENTRATION_VARS = {
-    "QRAIN",
-    "QNRAIN",
-    "QSNOW",
-    "QNSNOW",
-    "QGRAUP",
-    "QNGRAUPEL",
-    "QVGRAUPEL",
-    "QHAIL",
-    "QNHAIL",
-    "QVHAIL",
-    "QICE",
-    "QNICE",
-}
-
 
 class WoFSDAIncrementDataset(torch.utils.data.Dataset):
     """
@@ -148,8 +140,9 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.dyn_ds_cache = OrderedDict()
         self._concentration_params = {var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in CONCENTRATION_VARS}
         self._concentration_level_ops = conf["data"].get("concentration_level_ops", {})
-        # log-zscore transform params (replaces piecewise concentration transform when set)
-        self._log_transform_params_json_path = conf["data"].get("log_transform_params_json")
+        # Generalized concentration transform params (replaces piecewise transform when set)
+        self._transform_params_json_path = conf["data"].get("log_transform_params_json")
+        self._concentration_transform_specs: dict[str, dict] = {}
         self._log_transform_params: dict[str, dict] = {}
         self._occupancy_delta_threshold = float(conf["data"].get("occupancy_delta_threshold", 1.0e-10))
         if self._occupancy_delta_threshold <= 0.0:
@@ -360,7 +353,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         return np.moveaxis(norm_level_first, 0, level_axis)
 
     # ------------------------------------------------------------------ #
-    # Log-zscore transform (simple, fully invertible, no bisection)
+    # Log-zscore transform (legacy compatibility helpers)
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -477,15 +470,25 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
 
     def _forward_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
-            if var_name in self._log_transform_params:
-                return self._forward_log_numpy(var_values, self._log_transform_params[var_name])
+            spec = self._concentration_transform_specs.get(var_name)
+            if spec is not None:
+                return forward_concentration_transform_numpy(
+                    var_values,
+                    spec,
+                    level_axis=self._find_level_axis(np.asarray(var_values), var_name),
+                )
             return self._forward_concentration_numpy(var_values, self._get_concentration_params(var_name))
         return var_values
 
     def _inverse_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
-            if var_name in self._log_transform_params:
-                return self._inverse_log_numpy(var_values, self._log_transform_params[var_name])
+            spec = self._concentration_transform_specs.get(var_name)
+            if spec is not None:
+                return inverse_concentration_transform_numpy(
+                    var_values,
+                    spec,
+                    level_axis=self._find_level_axis(np.asarray(var_values), var_name),
+                )
             return self._inverse_concentration_numpy(var_values, self._get_concentration_params(var_name))
         return var_values
 
@@ -756,49 +759,43 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             self._mean_values[var] = mean_values
             self._std_values[var] = std_values
 
-        # --- Load log-zscore transform params (overrides piecewise transform) ---
-        if self._log_transform_params_json_path:
+        # --- Load generalized concentration transform params (overrides piecewise transform) ---
+        if self._transform_params_json_path:
             try:
-                with open(self._log_transform_params_json_path, "r", encoding="utf-8") as f:
-                    log_payload = json.load(f)
-                log_vars = log_payload.get("variables", log_payload) if isinstance(log_payload, dict) else {}
-                if isinstance(log_vars, dict):
-                    for var, lp in log_vars.items():
-                        if var not in CONCENTRATION_VARS or not isinstance(lp, dict):
-                            continue
-                        if "log_mean" not in lp or "log_std" not in lp:
-                            logger.warning(
-                                "log_transform_params_json entry for %s missing log_mean/log_std; skipping", var
-                            )
-                            continue
-                        self._log_transform_params[var] = {
-                            "clip_min": float(lp.get("clip_min", 1e-12)),
-                            "clip_max": float(lp.get("clip_max", 1.0)),
-                            "log_mean": float(lp["log_mean"]),
-                            "log_std":  float(lp["log_std"]),
-                        }
+                _, self._concentration_transform_specs = load_concentration_transform_json(
+                    self._transform_params_json_path,
+                    variables=CONCENTRATION_VARS,
+                )
+                self._log_transform_params = {
+                    var: spec
+                    for var, spec in self._concentration_transform_specs.items()
+                    if concentration_transform_overrides_stats(spec)
+                }
                 logger.info(
-                    "Loaded log-zscore transform for %d variable(s) from %s",
-                    len(self._log_transform_params),
-                    self._log_transform_params_json_path,
+                    "Loaded concentration transform specs for %d variable(s) from %s",
+                    len(self._concentration_transform_specs),
+                    self._transform_params_json_path,
                 )
             except Exception as exc:
                 logger.warning(
                     "Failed to load log_transform_params_json %s: %s; falling back to piecewise transform",
-                    self._log_transform_params_json_path,
+                    self._transform_params_json_path,
                     exc,
                 )
+                self._concentration_transform_specs = {}
+                self._log_transform_params = {}
 
-        # Override mean/std for concentration vars that use the log transform.
-        # We store level-replicated scalars (shape = (n_levels,)) so that all
-        # existing reshape/broadcast code in the training and eval pipelines
-        # continues to work without modification.
-        for var, lp in self._log_transform_params.items():
+        # Override mean/std only for the legacy log-zscore path. Newer
+        # generalized transforms expect mean/std to come from compute_credit_stats.py.
+        for var, spec in self._concentration_transform_specs.items():
+            if not concentration_transform_overrides_stats(spec):
+                continue
             if var not in self._mean_values:
                 continue
             n_lev = int(np.asarray(self._mean_values[var]).shape[0]) if np.asarray(self._mean_values[var]).ndim >= 1 else 1
-            self._mean_values[var] = np.full(n_lev, lp["log_mean"], dtype=np.float64)
-            self._std_values[var]  = np.full(n_lev, lp["log_std"],  dtype=np.float64)
+            mean_override, std_override = build_log_zscore_stats_override(spec, n_lev)
+            self._mean_values[var] = mean_override
+            self._std_values[var] = std_override
 
         # Dynamic forcing path checks
         if self.varname_dyn_forcing and self.filename_dyn_forcing:
