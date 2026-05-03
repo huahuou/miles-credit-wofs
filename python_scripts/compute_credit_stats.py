@@ -9,38 +9,23 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+from credit.data import get_forward_data
 from credit.transforms.concentration import (
     forward_concentration_transform_numpy,
     load_concentration_transform_json,
 )
 
 def _zarr_open(file_path: str, **kwargs):
-    file_path = str(file_path)
-    if file_path.endswith(".zarr.zip") or file_path.endswith(".zarr.zip/"):
-        zip_file = file_path.rstrip("/")
-        zip_basename = Path(zip_file).stem
-        zip_roots = [f"zip://{zip_basename}::{zip_file}", f"zip://{zip_basename}/::{zip_file}"]
-
-        last_exc = None
-        for uri in zip_roots:
-            try:
-                return xr.open_zarr(uri, consolidated=True, zarr_format=2, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-
-        for uri in zip_roots:
-            try:
-                return xr.open_zarr(uri, consolidated=False, zarr_format=2, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-
-        raise last_exc
-    return xr.open_zarr(file_path, consolidated=True, zarr_format=2, **kwargs)
+    if kwargs:
+        raise TypeError(f"_zarr_open does not accept extra keyword arguments, got: {sorted(kwargs)}")
+    return get_forward_data(str(file_path), zarr_chunks=None)
 
 from dask.distributed import Client, LocalCluster, as_completed
 
 
-_CASE_DATE_RE = re.compile(r"wofs_(?:boundary_)?(\d{8})_.+_mem\d+\.zarr(?:\.zip)?/?$")
+_CASE_INFO_RE = re.compile(
+    r"wofs_(?:boundary_)?(?P<date>\d{8})_(?:.+_)?(?P<init>\d{4})_mem\d+\.zarr(?:\.zip)?/?$"
+)
 _CONCENTRATION_VARS = {
     "QRAIN",
     "QNRAIN",
@@ -76,14 +61,20 @@ def _parse_yyyymmdd(value: str | None) -> int | None:
     return int(value)
 
 
-def _extract_case_date(file_path: str) -> int:
-    match = _CASE_DATE_RE.search(file_path)
+def _extract_case_info(file_path: str) -> tuple[int, str]:
+    match = _CASE_INFO_RE.search(file_path)
     if match is None:
         raise ValueError(
             "Could not infer case date from file path. Expected names like "
-            f"'wofs_YYYYMMDD_<init_slug>_memNN.zarr(.zip)' or 'wofs_boundary_YYYYMMDD_<init_slug>_memNN.zarr(.zip)', got: {file_path}"
+            f"'wofs_YYYYMMDD_<slug_>HHMM_memNN.zarr(.zip)' or "
+            f"'wofs_boundary_YYYYMMDD_<slug_>HHMM_memNN.zarr(.zip)', got: {file_path}"
         )
-    return int(match.group(1))
+    return int(match.group("date")), match.group("init")
+
+
+def _extract_case_date(file_path: str) -> int:
+    case_date, _ = _extract_case_info(file_path)
+    return case_date
 
 
 def _filter_files_by_date(files: list[str], start_date: int | None, end_date: int | None) -> list[str]:
@@ -96,6 +87,50 @@ def _filter_files_by_date(files: list[str], start_date: int | None, end_date: in
             continue
         filtered.append(file_path)
     return filtered
+
+
+def _select_spread_indices(init_minutes: np.ndarray, target_size: int, rng: np.random.Generator) -> list[int]:
+    if target_size <= 0 or init_minutes.size <= target_size:
+        return list(range(int(init_minutes.size)))
+
+    selected = [int(rng.integers(init_minutes.size))]
+    min_distance = np.abs(init_minutes - init_minutes[selected[0]])
+
+    while len(selected) < target_size:
+        remaining = np.array([idx for idx in range(init_minutes.size) if idx not in selected], dtype=np.int64)
+        farthest_distance = np.max(min_distance[remaining])
+        candidates = remaining[min_distance[remaining] == farthest_distance]
+        chosen = int(rng.choice(candidates))
+        selected.append(chosen)
+        min_distance = np.minimum(min_distance, np.abs(init_minutes - init_minutes[chosen]))
+
+    selected.sort()
+    return selected
+
+
+def _select_cases_per_day(files: list[str], num_cases_per_day: int, seed: int) -> list[str]:
+    if num_cases_per_day <= 0:
+        return files
+
+    files_by_day: dict[int, list[tuple[int, str]]] = {}
+    for file_path in files:
+        case_date, init_hhmm = _extract_case_info(file_path)
+        init_minutes = int(init_hhmm[:2]) * 60 + int(init_hhmm[2:])
+        files_by_day.setdefault(case_date, []).append((init_minutes, file_path))
+
+    selected_files: list[str] = []
+    for case_date in sorted(files_by_day):
+        entries = sorted(files_by_day[case_date], key=lambda item: (item[0], item[1]))
+        if len(entries) <= num_cases_per_day:
+            selected_files.extend(file_path for _, file_path in entries)
+            continue
+
+        day_rng = np.random.default_rng(int(seed + case_date))
+        init_minutes = np.asarray([item[0] for item in entries], dtype=np.int64)
+        chosen_indices = _select_spread_indices(init_minutes, num_cases_per_day, day_rng)
+        selected_files.extend(entries[idx][1] for idx in chosen_indices)
+
+    return selected_files
 
 
 def _chunk_files(files: list[str], files_per_task: int) -> list[list[str]]:
@@ -145,6 +180,17 @@ def _build_accumulator_schema(ds: xr.Dataset, data_vars: list[str]) -> dict[str,
             "sum_sq": np.zeros(shape, dtype=np.float64),
         }
     return accum
+
+
+def _clone_accumulator_schema(accum: dict[str, dict[str, np.ndarray]]) -> dict[str, dict[str, np.ndarray]]:
+    return {
+        var: {
+            "count": np.zeros_like(stats["count"]),
+            "sum": np.zeros_like(stats["sum"]),
+            "sum_sq": np.zeros_like(stats["sum_sq"]),
+        }
+        for var, stats in accum.items()
+    }
 
 
 def _merge_accumulators(
@@ -414,7 +460,7 @@ def _accumulate(stats, da: xr.DataArray, valid_mask: np.ndarray | None = None):
 
 def _compute_partial_stats(
     file_batch: list[str],
-    data_vars: list[str],
+    accum_template: dict[str, dict[str, np.ndarray]],
     concentration_params: dict[str, dict[str, float]],
     concentration_transform_specs: dict[str, dict],
     exclude_clipped_boundary_samples: bool,
@@ -423,16 +469,19 @@ def _compute_partial_stats(
     if not file_batch:
         raise ValueError("Received empty file batch")
 
-    first = _zarr_open(file_batch[0])
-    try:
-        accum = _build_accumulator_schema(first, data_vars)
-    finally:
-        first.close()
+    accum = _clone_accumulator_schema(accum_template)
+    data_vars = list(accum.keys())
 
     for file_path in file_batch:
         ds = _zarr_open(file_path)
         try:
+            available_vars = set(ds.data_vars)
+            if not available_vars:
+                print(f"[warn] skipping empty dataset: {Path(file_path).name}")
+                continue
             for var in data_vars:
+                if var not in available_vars:
+                    continue
                 da = ds[var]
                 valid_mask = None
                 if var in _CONCENTRATION_VARS:
@@ -462,6 +511,18 @@ def main():
     parser.add_argument("--glob", required=True, help="Glob matching converted WoFS CREDIT-WRF zarr files")
     parser.add_argument("--start-date", help="Inclusive lower date bound in YYYYMMDD format")
     parser.add_argument("--end-date", help="Inclusive upper date bound in YYYYMMDD format")
+    parser.add_argument(
+        "--num-cases-per-day",
+        type=int,
+        default=0,
+        help="Optional max number of init times kept per day after date filtering; 0 means keep all cases",
+    )
+    parser.add_argument(
+        "--case-selection-seed",
+        type=int,
+        default=1234,
+        help="Random seed used when subsampling init times within each day",
+    )
     parser.add_argument("--mean-out", required=True, help="Output path for mean NetCDF")
     parser.add_argument("--std-out", required=True, help="Output path for std NetCDF")
     parser.add_argument("--n-workers", type=int, default=1, help="Number of Dask worker processes to use")
@@ -576,10 +637,19 @@ def main():
         raise SystemExit("--start-date must be <= --end-date")
 
     files = _filter_files_by_date(files, start_date, end_date)
+    files_before_day_sampling = len(files)
+    files = _select_cases_per_day(files, args.num_cases_per_day, args.case_selection_seed)
     if not files:
         raise SystemExit(
             f"No files matched: {args.glob} after applying date filter "
             f"start={args.start_date!r} end={args.end_date!r}"
+        )
+    if args.num_cases_per_day > 0:
+        selected_days = len({_extract_case_date(file_path) for file_path in files})
+        print(
+            f"[stats] day_sampling days={selected_days} "
+            f"num_cases_per_day={args.num_cases_per_day} "
+            f"selected_files={len(files)}/{files_before_day_sampling}"
         )
 
     concentration_params: dict[str, dict[str, float]] = {
@@ -628,12 +698,23 @@ def main():
                 json.dump({"variables": tuned}, f, indent=2)
             print(f"[tune] wrote tuned concentration params to {tune_path}")
 
-    first = _zarr_open(files[0])
+    first = None
+    for file_path in files:
+        candidate = _zarr_open(file_path)
+        candidate_data_vars = [str(v) for v in candidate.data_vars if v not in {"trajectory_id"}]
+        if candidate_data_vars:
+            first = candidate
+            data_vars = candidate_data_vars
+            break
+        candidate.close()
+
+    if first is None:
+        raise SystemExit("No usable variables found in any selected file")
+
     try:
         level_coord = first["level"].copy() if "level" in first.coords else None
         latitude = first["latitude"].values.copy() if args.latweights_out else None
         longitude = first["longitude"].values.copy() if args.latweights_out else None
-        data_vars = [str(v) for v in first.data_vars if v not in {"trajectory_id"}]
         accum = _build_accumulator_schema(first, data_vars)
 
         file_batches = _chunk_files(files, args.files_per_task)
@@ -647,7 +728,7 @@ def main():
                 print(f"[stats] processing batch {index}/{len(file_batches)}")
                 partial = _compute_partial_stats(
                     file_batch,
-                    data_vars,
+                    accum,
                     concentration_params,
                     concentration_transform_specs,
                     exclude_clipped_boundary_samples=args.exclude_clipped_boundary_samples,
@@ -668,7 +749,7 @@ def main():
                     client.submit(
                         _compute_partial_stats,
                         file_batch,
-                        data_vars,
+                        accum,
                         concentration_params,
                         concentration_transform_specs,
                         args.exclude_clipped_boundary_samples,

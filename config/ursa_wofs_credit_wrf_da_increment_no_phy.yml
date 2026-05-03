@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0431'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0502'
 seed: 1000
 
 data:
@@ -27,7 +27,7 @@ data:
 
   mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
   std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
-  concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
+  ## concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
   # Simple invertible log-zscore transform for concentration variables.
   # When set, replaces the piecewise concentration transform with:
   #   forward:  z = (log(clip(x, clip_min, clip_max)) - log_mean) / log_std
@@ -35,7 +35,7 @@ data:
   # Generate with: python python_scripts/build_log_transform_params.py \
   #   --input  <stats_dir>/concentration_tuning.json \
   #   --output <stats_dir>/log_transform_params.json
-  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/log_transform_params.json'
+  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/zero_inflated_transform_params.json'
 
   concentration_level_ops:
     QRAIN:
@@ -173,7 +173,7 @@ trainer:
     first_cycle_steps: 1000
     cycle_mult: 2.0
     max_lr: 1.0e-03
-    min_lr: 1.0e-04
+    min_lr: 7.0e-05
     warmup_steps: 999
     gamma: 0.8
   grad_max_norm: 1.0
@@ -209,7 +209,7 @@ loss:
     use_dice: false
     dice_weight: 0.0
     dice_smooth: 1.0
-  use_microphysics_constraint: true
+  use_microphysics_constraint: false
   microphysics_constraint_weight: 0.001
   microphysics_constraint:
     sign_weight:    0.5

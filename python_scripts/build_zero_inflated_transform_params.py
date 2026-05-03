@@ -6,13 +6,16 @@ import json
 import logging
 import math
 import re
+import time
+from collections import Counter
 from pathlib import Path
+from builtins import TimeoutError as BuiltinTimeoutError
 
 import matplotlib
 import numpy as np
-import xarray as xr
-from dask.distributed import Client, LocalCluster, as_completed
+from dask.distributed import Client, LocalCluster, wait
 
+from credit.data import get_forward_data
 from credit.transforms.concentration import (
     CONCENTRATION_VARS,
     DEFAULT_PROBIT_EPS,
@@ -27,30 +30,14 @@ import matplotlib.pyplot as plt
 
 
 def _zarr_open(file_path: str, **kwargs):
-    file_path = str(file_path)
-    if file_path.endswith(".zarr.zip") or file_path.endswith(".zarr.zip/"):
-        zip_file = file_path.rstrip("/")
-        zip_basename = Path(zip_file).stem
-        zip_roots = [f"zip://{zip_basename}::{zip_file}", f"zip://{zip_basename}/::{zip_file}"]
-
-        last_exc = None
-        for uri in zip_roots:
-            try:
-                return xr.open_zarr(uri, consolidated=True, zarr_format=2, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-
-        for uri in zip_roots:
-            try:
-                return xr.open_zarr(uri, consolidated=False, zarr_format=2, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-
-        raise last_exc
-    return xr.open_zarr(file_path, consolidated=True, zarr_format=2, **kwargs)
+    if kwargs:
+        raise TypeError(f"_zarr_open does not accept extra keyword arguments, got: {sorted(kwargs)}")
+    return get_forward_data(str(file_path), zarr_chunks=None)
 
 
-_CASE_DATE_RE = re.compile(r"wofs_(?:boundary_)?(\d{8})_.+_mem\d+\.zarr(?:\.zip)?/?$")
+_CASE_INFO_RE = re.compile(
+    r"wofs_(?:boundary_)?(?P<date>\d{8})_(?:.+_)?(?P<init>\d{4})_mem\d+\.zarr(?:\.zip)?/?$"
+)
 
 
 def _parse_yyyymmdd(value: str | None) -> int | None:
@@ -64,14 +51,19 @@ def _parse_yyyymmdd(value: str | None) -> int | None:
     return int(value)
 
 
-def _extract_case_date(file_path: str) -> int:
-    match = _CASE_DATE_RE.search(file_path)
+def _extract_case_info(file_path: str) -> tuple[int, str]:
+    match = _CASE_INFO_RE.search(file_path)
     if match is None:
         raise ValueError(
             "Could not infer case date from file path. Expected names like "
-            f"'wofs_YYYYMMDD_<init_slug>_memNN.zarr(.zip)', got: {file_path}"
+            f"'wofs_YYYYMMDD_<slug_>HHMM_memNN.zarr(.zip)', got: {file_path}"
         )
-    return int(match.group(1))
+    return int(match.group("date")), match.group("init")
+
+
+def _extract_case_date(file_path: str) -> int:
+    case_date, _ = _extract_case_info(file_path)
+    return case_date
 
 
 def _filter_files_by_date(files: list[str], start_date: int | None, end_date: int | None) -> list[str]:
@@ -84,6 +76,50 @@ def _filter_files_by_date(files: list[str], start_date: int | None, end_date: in
             continue
         filtered.append(file_path)
     return filtered
+
+
+def _select_spread_indices(init_minutes: np.ndarray, target_size: int, rng: np.random.Generator) -> list[int]:
+    if target_size <= 0 or init_minutes.size <= target_size:
+        return list(range(int(init_minutes.size)))
+
+    selected = [int(rng.integers(init_minutes.size))]
+    min_distance = np.abs(init_minutes - init_minutes[selected[0]])
+
+    while len(selected) < target_size:
+        remaining = np.array([idx for idx in range(init_minutes.size) if idx not in selected], dtype=np.int64)
+        farthest_distance = np.max(min_distance[remaining])
+        candidates = remaining[min_distance[remaining] == farthest_distance]
+        chosen = int(rng.choice(candidates))
+        selected.append(chosen)
+        min_distance = np.minimum(min_distance, np.abs(init_minutes - init_minutes[chosen]))
+
+    selected.sort()
+    return selected
+
+
+def _select_cases_per_day(files: list[str], num_cases_per_day: int, seed: int) -> list[str]:
+    if num_cases_per_day <= 0:
+        return files
+
+    files_by_day: dict[int, list[tuple[int, str]]] = {}
+    for file_path in files:
+        case_date, init_hhmm = _extract_case_info(file_path)
+        init_minutes = int(init_hhmm[:2]) * 60 + int(init_hhmm[2:])
+        files_by_day.setdefault(case_date, []).append((init_minutes, file_path))
+
+    selected_files: list[str] = []
+    for case_date in sorted(files_by_day):
+        entries = sorted(files_by_day[case_date], key=lambda item: (item[0], item[1]))
+        if len(entries) <= num_cases_per_day:
+            selected_files.extend(file_path for _, file_path in entries)
+            continue
+
+        day_rng = np.random.default_rng(int(seed + case_date))
+        init_minutes = np.asarray([item[0] for item in entries], dtype=np.int64)
+        chosen_indices = _select_spread_indices(init_minutes, num_cases_per_day, day_rng)
+        selected_files.extend(entries[idx][1] for idx in chosen_indices)
+
+    return selected_files
 
 
 def _select_files(files: list[str], max_files: int, seed: int) -> list[str]:
@@ -167,6 +203,85 @@ def _parse_clip_max_overrides(value: str | None) -> dict[str, float]:
         name, raw_max = token.split(":", 1)
         out[name.strip()] = float(raw_max)
     return out
+
+
+def _log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"{timestamp} {message}", flush=True)
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _summarize_file_batch(file_batch: list[str], max_files_to_list: int = 4) -> str:
+    names = [Path(file_path).name for file_path in file_batch]
+    if len(names) <= max_files_to_list:
+        return ", ".join(names)
+    return f"{names[0]} ... {names[-1]}"
+
+
+def _pending_state_summary(client: Client, pending_futures: set, future_meta: dict, max_items: int = 3) -> tuple[str, list[str]]:
+    try:
+        processing = client.processing()
+    except Exception:
+        processing = {}
+
+    running_keys = set()
+    for task_keys in processing.values():
+        running_keys.update(task_keys)
+
+    counts = Counter()
+    for future in pending_futures:
+        if future.key in running_keys or future.status == "running":
+            counts["running"] += 1
+        else:
+            counts["waiting"] += 1
+
+    now = time.monotonic()
+    slowest = sorted(pending_futures, key=lambda future: future_meta[future]["submitted_at"])[:max_items]
+    details = []
+    for future in slowest:
+        meta = future_meta[future]
+        age = _format_elapsed(now - meta["submitted_at"])
+        state = "running" if future.key in running_keys else future.status
+        details.append(
+            f"batch {meta['batch_number']}/{meta['batch_total']} age={age} "
+            f"state={state} files={meta['file_count']} [{meta['label']}]"
+        )
+
+    summary = f"running={counts['running']} waiting={counts['waiting']}"
+    return summary, details
+
+
+def _emit_dask_heartbeat(
+    client: Client,
+    pending_futures: set,
+    future_meta: dict,
+    completed: int,
+    total: int,
+    started_at: float,
+    last_progress_at: float,
+    stalled_warning_seconds: float,
+) -> None:
+    pending_summary, oldest_pending = _pending_state_summary(client, pending_futures, future_meta)
+    now = time.monotonic()
+    idle_for = now - last_progress_at
+    warning = " stalled_warning=yes" if idle_for >= stalled_warning_seconds else ""
+    _log(
+        f"[dask] heartbeat elapsed={_format_elapsed(now - started_at)} "
+        f"completed={completed}/{total} {pending_summary} "
+        f"idle_since_last_complete={_format_elapsed(idle_for)}{warning}"
+    )
+    for item in oldest_pending:
+        _log(f"[dask] oldest_pending {item}")
 
 
 def _fit_positive_lognormal(sample: np.ndarray, zero_floor: float, winsorize_upper_quantile: float) -> dict[str, float]:
@@ -460,6 +575,18 @@ def main() -> None:
     parser.add_argument("--end-date", help="Inclusive upper date bound in YYYYMMDD format")
     parser.add_argument("--variables", help="Comma-separated concentration variables to fit")
     parser.add_argument("--max-files", type=int, default=0, help="Optional max number of files to sample; 0 means all matched files")
+    parser.add_argument(
+        "--num-cases-per-day",
+        type=int,
+        default=0,
+        help="Optional max number of init times kept per day after date filtering; 0 means keep all cases",
+    )
+    parser.add_argument(
+        "--case-selection-seed",
+        type=int,
+        default=1234,
+        help="Random seed used when subsampling init times within each day",
+    )
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     parser.add_argument("--zero-floor", type=float, default=DEFAULT_ZERO_FLOOR, help="Values below this are treated as exact zero")
     parser.add_argument("--probit-eps", type=float, default=DEFAULT_PROBIT_EPS, help="Probability clipping used before probit")
@@ -526,6 +653,18 @@ def main() -> None:
         default=8,
         help="Number of zarr files processed sequentially in each submitted task",
     )
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=60.0,
+        help="Heartbeat interval for progress logs while Dask batches are still running",
+    )
+    parser.add_argument(
+        "--stalled-warning-seconds",
+        type=float,
+        default=900.0,
+        help="Emit a stalled warning when no batch completes for this long",
+    )
     args = parser.parse_args()
 
     variables = _parse_variables(args.variables)
@@ -537,9 +676,18 @@ def main() -> None:
 
     files = sorted(glob.glob(args.glob))
     files = _filter_files_by_date(files, start_date, end_date)
+    files_before_day_sampling = len(files)
+    files = _select_cases_per_day(files, num_cases_per_day=args.num_cases_per_day, seed=args.case_selection_seed)
     files = _select_files(files, max_files=args.max_files, seed=args.seed)
     if not files:
         raise SystemExit("No files matched after applying filters")
+    if args.num_cases_per_day > 0:
+        selected_days = len({_extract_case_date(file_path) for file_path in files})
+        _log(
+            f"[fit] day_sampling days={selected_days} "
+            f"num_cases_per_day={args.num_cases_per_day} "
+            f"selected_files={len(files)}/{files_before_day_sampling}"
+        )
 
     first = _zarr_open(files[0])
     try:
@@ -549,14 +697,17 @@ def main() -> None:
 
     merged = _empty_batch_payload(level_count, variables)
     file_batches = _chunk_files(files, args.files_per_task)
-    print(
+    _log(
         f"[fit] matched_files={len(files)} batches={len(file_batches)} "
         f"workers={args.n_workers} files_per_task={args.files_per_task}"
     )
 
     if args.n_workers <= 1:
         for batch_idx, file_batch in enumerate(file_batches, start=1):
-            print(f"[fit] processing batch {batch_idx}/{len(file_batches)}")
+            _log(
+                f"[fit] processing batch {batch_idx}/{len(file_batches)} "
+                f"files={len(file_batch)} [{_summarize_file_batch(file_batch)}]"
+            )
             partial = _collect_batch_statistics(
                 file_batch=file_batch,
                 variables=variables,
@@ -587,41 +738,95 @@ def main() -> None:
             silence_logs=logging.ERROR,
         )
         client = Client(cluster)
-        print(f"[dask] dashboard={client.dashboard_link}")
+        heartbeat_interval = max(float(args.progress_interval_seconds), 1.0)
+        stalled_warning_seconds = max(float(args.stalled_warning_seconds), heartbeat_interval)
+        _log(f"[dask] dashboard={client.dashboard_link}")
+        _log(
+            f"[dask] heartbeat_interval={_format_elapsed(heartbeat_interval)} "
+            f"stalled_warning_after={_format_elapsed(stalled_warning_seconds)}"
+        )
         try:
             futures = []
-            for batch_idx, file_batch in enumerate(file_batches):
-                batch_seed = int(args.seed + batch_idx * 7919)
-                futures.append(
-                    client.submit(
-                        _collect_batch_statistics,
-                        file_batch,
-                        variables,
-                        level_count,
-                        args.zero_floor,
-                        args.samples_per_file_per_level,
-                        args.plot_samples_per_file_per_level,
-                        args.max_level_samples,
-                        args.max_plot_samples_per_level,
-                        args.max_pooled_samples,
-                        batch_seed,
-                        pure=False,
-                    )
-                )
-            completed = 0
-            for future in as_completed(futures):
-                partial = future.result()
-                _merge_batch_payload(
-                    merged,
-                    partial,
+            future_meta = {}
+            for batch_idx, file_batch in enumerate(file_batches, start=1):
+                batch_seed = int(args.seed + (batch_idx - 1) * 7919)
+                future = client.submit(
+                    _collect_batch_statistics,
+                    file_batch,
                     variables,
                     level_count,
+                    args.zero_floor,
+                    args.samples_per_file_per_level,
+                    args.plot_samples_per_file_per_level,
                     args.max_level_samples,
                     args.max_plot_samples_per_level,
                     args.max_pooled_samples,
+                    batch_seed,
+                    pure=False,
                 )
-                completed += 1
-                print(f"[dask] completed batch {completed}/{len(file_batches)}")
+                futures.append(future)
+                future_meta[future] = {
+                    "batch_number": batch_idx,
+                    "batch_total": len(file_batches),
+                    "file_count": len(file_batch),
+                    "label": _summarize_file_batch(file_batch),
+                    "submitted_at": time.monotonic(),
+                }
+            completed = 0
+            started_at = time.monotonic()
+            last_progress_at = started_at
+            pending = set(futures)
+            while pending:
+                try:
+                    done_now, pending_after_wait = wait(
+                        pending,
+                        timeout=heartbeat_interval,
+                        return_when="FIRST_COMPLETED",
+                    )
+                    done_now = set(done_now)
+                    pending = set(pending_after_wait)
+                except BuiltinTimeoutError:
+                    done_now = set()
+                if not done_now:
+                    _emit_dask_heartbeat(
+                        client=client,
+                        pending_futures=pending,
+                        future_meta=future_meta,
+                        completed=completed,
+                        total=len(file_batches),
+                        started_at=started_at,
+                        last_progress_at=last_progress_at,
+                        stalled_warning_seconds=stalled_warning_seconds,
+                    )
+                    continue
+
+                for future in sorted(done_now, key=lambda item: future_meta[item]["batch_number"]):
+                    meta = future_meta[future]
+                    try:
+                        partial = future.result()
+                    except Exception:
+                        age = _format_elapsed(time.monotonic() - meta["submitted_at"])
+                        _log(
+                            f"[dask][error] batch {meta['batch_number']}/{meta['batch_total']} "
+                            f"failed after {age} [{meta['label']}]"
+                        )
+                        raise
+                    _merge_batch_payload(
+                        merged,
+                        partial,
+                        variables,
+                        level_count,
+                        args.max_level_samples,
+                        args.max_plot_samples_per_level,
+                        args.max_pooled_samples,
+                    )
+                    completed += 1
+                    last_progress_at = time.monotonic()
+                    age = _format_elapsed(last_progress_at - meta["submitted_at"])
+                    _log(
+                        f"[dask] completed batch {completed}/{len(file_batches)} "
+                        f"in {age} files={meta['file_count']} [{meta['label']}]"
+                    )
         finally:
             try:
                 client.shutdown()
@@ -714,7 +919,7 @@ def main() -> None:
         nondeg = sum(1 for item in levels if item["status"] == "ok")
         borrowed = sum(1 for item in levels if item["status"] == "borrow_fallback")
         deg = sum(1 for item in levels if item["status"] == "degenerate_zero")
-        print(
+        _log(
             f"[fit] {var}: ok_levels={nondeg} borrow_levels={borrowed} zero_levels={deg} "
             f"pooled_mu={pooled_fit['mu']:.4f} pooled_sigma={pooled_fit['sigma']:.4f}"
         )
@@ -724,8 +929,8 @@ def main() -> None:
     plots_dir.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(output, fh, indent=2)
-    print(f"[fit] wrote transform parameters to {out_path}")
-    print(f"[fit] wrote plots to {plots_dir}")
+    _log(f"[fit] wrote transform parameters to {out_path}")
+    _log(f"[fit] wrote plots to {plots_dir}")
 
 
 if __name__ == "__main__":
