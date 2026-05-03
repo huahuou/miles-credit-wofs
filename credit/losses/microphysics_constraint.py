@@ -189,6 +189,9 @@ class MicrophysicsConsistencyLoss(nn.Module):
         if not self.pairs:
             return pred.new_zeros(())
 
+        pred = pred.float()
+        target = target.float()
+
         L = self.levels
         sign_total = pred.new_zeros(())
         corr_total = pred.new_zeros(())

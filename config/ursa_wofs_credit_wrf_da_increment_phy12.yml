@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0430'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0502_mreflconstraint2'
 seed: 1000
 
 data:
@@ -25,9 +25,9 @@ data:
   save_loc_dynamic_forcing: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
   save_loc_diagnostic: ''
 
-  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
-  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
-  concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
+  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/mean.nc'
+  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/std.nc'
+  ## concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
   # Simple invertible log-zscore transform for concentration variables.
   # When set, replaces the piecewise concentration transform with:
   #   forward:  z = (log(clip(x, clip_min, clip_max)) - log_mean) / log_std
@@ -35,7 +35,7 @@ data:
   # Generate with: python python_scripts/build_log_transform_params.py \
   #   --input  <stats_dir>/concentration_tuning.json \
   #   --output <stats_dir>/log_transform_params.json
-  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/log_transform_params.json'
+  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/zero_inflated_transform_params.json'
 
   concentration_level_ops:
     QRAIN:
@@ -78,8 +78,8 @@ data:
   forecast_len: 0
   valid_forecast_len: 0
   target_start_step: 1
-  zarr_time_chunk: 2
-  max_open_files_per_worker: 4
+  zarr_time_chunk: 4
+  max_open_files_per_worker: 3
   lead_time_periods: 1
   levels: 17
   prognostic_levels: 17  # effective model levels for concentration prognostic variables
@@ -146,12 +146,12 @@ trainer:
   no_hang_pin_memory: False
   no_hang_persistent_workers: True
   no_hang_timeout_s: 180
-  train_batch_size: 24
-  valid_batch_size: 24
+  train_batch_size: 8
+  valid_batch_size: 8
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 4
-  valid_thread_workers: 4
+  thread_workers: 8
+  valid_thread_workers: 8
   prefetch_factor: 1
   dataloader_timeout_s: 360
   update_learning_rate: False
@@ -165,7 +165,7 @@ trainer:
   load_optimizer: False
   load_scheduler: False
   load_scaler: False
-  skip_validation: False
+  skip_validation: True
   use_scheduler: True
   reload_epoch: True
   scheduler:
@@ -173,7 +173,7 @@ trainer:
     first_cycle_steps: 1000
     cycle_mult: 2.0
     max_lr: 1.0e-03
-    min_lr: 1.0e-04
+    min_lr: 8.0e-05
     warmup_steps: 999
     gamma: 0.8
   grad_max_norm: 1.0
@@ -191,17 +191,16 @@ loss:
   training_loss: 'mse'
   
   occupancy:
-    enabled: true
-    delta_threshold: 5.0e-9
-    delta_threshold_by_var:
-      QHAIL: 1.0e-11
+    enabled: false
+    delta_threshold: 1.0e-8
+    delta_threshold_by_var: {}
     variables: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
     target_source: 'delta_abs'
-    use_masked_regression: true
+    use_masked_regression: false
     masked_regression_mode: 'soft'
     reg_mask_min: 0.05
-    ce_weight: 0.15
-    pos_weight: 5.0
+    ce_weight: 0.2
+    pos_weight: 4.0
     logit_temperature: 0.25
     use_focal: false
     focal_weight: 0.0
@@ -210,34 +209,35 @@ loss:
     use_dice: false
     dice_weight: 0.0
     dice_smooth: 1.0
-  use_microphysics_constraint: true
+  use_microphysics_constraint: false
   microphysics_constraint_weight: 0.001
   microphysics_constraint:
     sign_weight:    0.5
-    corr_weight:    0.3
-    coral_weight:   0.2
+    corr_weight:    0.2
+    coral_weight:   0.15
     sign_threshold: 0.1
 
   # H-operator (reflectivity) constraint — compares diagnosed ΔdBZ to boundary innovation
   use_refl_operator_constraint: true
-  refl_operator_constraint_weight: 0.01
+  refl_operator_constraint_weight: 0.001
   refl_operator_constraint:
     mode: innovation           # innovation | absolute (innovation recommended)
     compare_space: dbz         # dbz | normalized (dbz recommended for fidelity)
-    dbz_floor: 0.0             # lower bound for diagnosed dBZ
-    threshold_dbz: 5.0         # mask magnitudes below this (clear-air noise gate)
+    dbz_floor: 0.1             # lower bound for diagnosed dBZ
+    threshold_dbz: 0.5        # mask magnitudes below this (clear-air noise gate)
     threshold_norm: 0.05       # mask for normalized mode (unused when compare_space=dbz)
     include_species: [rain, snow, graupel, hail]
 
   variable_weights:
-    QRAIN: 1.5
-    QNRAIN: 1.5
-    QHAIL: 1.4
-    QNHAIL: 1.4
-    QGRAUP: 1.3
-    QNGRAUPEL: 1.3
-    QSNOW: 1.1
-    QNSNOW: 1.1
+    QRAIN: [2.412559, 2.412284, 2.555078, 2.584206, 2.243196, 2.068756, 1.623277, 0.830359, 0.169828, 0.057489, 0.056585, 0.055757, 0.055588, 0.055945, 0.055397, 0.056074, 0.056151]
+    QNRAIN: [4.033242, 4.031722, 4.247364, 4.375604, 3.932656, 3.436322, 2.748903, 1.397155, 0.262704, 0.058547, 0.055587, 0.055370, 0.055451, 0.056590, 0.056022, 0.055593, 0.056075]
+    QHAIL: [0.389306, 0.403474, 0.457976, 0.537349, 0.634374, 0.676396, 0.568936, 0.424411, 0.320813, 0.248999, 0.188331, 0.123847, 0.071163, 0.056551, 0.055964, 0.055738, 0.055458]
+    QNHAIL: [0.868628, 0.890926, 0.993543, 1.141549, 1.307452, 1.393503, 1.251521, 1.020835, 0.848095, 0.699031, 0.527079, 0.272393, 0.092595, 0.057112, 0.055352, 0.056355, 0.056101]
+    QGRAUP: [0.782585, 0.858042, 1.120110, 1.613600, 2.001499, 2.001269, 1.608786, 1.021708, 0.735403, 0.560589, 0.423074, 0.258903, 0.105689, 0.060049, 0.055663, 0.055944, 0.055909]
+    QNGRAUPEL: [1.379448, 1.509040, 1.963846, 2.569319, 2.751276, 2.810764, 2.545410, 1.756926, 1.256289, 0.962154, 0.732617, 0.452278, 0.149285, 0.064260, 0.055639, 0.056025, 0.055795]
+    QSNOW: [0.075125, 0.082214, 0.124737, 0.338048, 1.153391, 1.821172, 1.996127, 2.148414, 2.345832, 2.290819, 1.750379, 0.929081, 0.336493, 0.096018, 0.057653, 0.056016, 0.056015]
+    QNSNOW: [0.078776, 0.089551, 0.157818, 0.495254, 1.560124, 2.346178, 2.645627, 2.900944, 3.315348, 3.456322, 2.978726, 1.849589, 0.698283, 0.144729, 0.059799, 0.056304, 0.055303]
+
 
 eval:
   mode: 'none'

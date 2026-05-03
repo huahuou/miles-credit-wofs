@@ -253,6 +253,8 @@ class VariableTotalLoss2D(torch.nn.Module):
             self.refl_constraint = ReflOperatorConstraintLoss(conf)
         # ------------------------------------------------------------- #
 
+        self._last_aux_losses = {}
+
         self.validation = validation
         if conf["loss"]["training_loss"] == "KCRPS":  # for ensembles, load same loss for train and valid
             self.loss_fn = base_losses(conf, reduction="none", validation=False)
@@ -318,14 +320,29 @@ class VariableTotalLoss2D(torch.nn.Module):
         if not self.validation and self.use_spectral_loss:
             loss += self.spectral_lambda_reg * self.spectral_loss_surface(target, pred, weights=self.lat_weights).mean()
 
+        self._last_aux_losses = {}
+
         if self.use_microphysics_constraint:
-            loss += self.micro_constraint_weight * self.micro_constraint_loss(pred, target)
+            micro_loss = self.micro_constraint_loss(pred, target)
+            self._last_aux_losses["microphysics_constraint_loss"] = micro_loss.detach()
+            self._last_aux_losses["microphysics_constraint_loss_weighted"] = (
+                self.micro_constraint_weight * micro_loss.detach()
+            )
+            loss += self.micro_constraint_weight * micro_loss
 
         if self.use_refl_operator_constraint:
             # The reflectivity constraint requires batch context; if not set, it returns 0
-            loss += self.refl_constraint_weight * self.refl_constraint(pred, target)
+            refl_loss = self.refl_constraint(pred, target)
+            self._last_aux_losses["refl_operator_constraint_loss"] = refl_loss.detach()
+            self._last_aux_losses["refl_operator_constraint_loss_weighted"] = (
+                self.refl_constraint_weight * refl_loss.detach()
+            )
+            loss += self.refl_constraint_weight * refl_loss
 
         return loss
+
+    def get_last_aux_losses(self):
+        return dict(self._last_aux_losses)
 
     # Optional: allow trainer to provide batch context needed by reflectivity constraint
     def set_batch_context(self, step_batch: dict):

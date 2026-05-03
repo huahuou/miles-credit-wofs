@@ -45,14 +45,15 @@ class ReflOperatorConstraintLoss(torch.nn.Module):
         self.prog_vars: List[str] = list(data_conf.get("variables", []))
         self.ctx_vars: List[str] = list(data_conf.get("context_upper_air_variables", []))
 
-        # Load per-level mean/std for required variables (T, GEOPOT, REFL_10CM)
+        # Load per-level mean/std for every variable that may need inverse normalization.
         self._mean = {}
         self._std = {}
         mean_path = data_conf.get("mean_path")
         std_path = data_conf.get("std_path")
         if mean_path and std_path:
             with xr.open_dataset(mean_path) as ds_m, xr.open_dataset(std_path) as ds_s:
-                for v in set(self.ctx_vars + ["REFL_10CM"]):
+                required_vars = set(self.ctx_vars + self.prog_vars + ["REFL_10CM"])
+                for v in required_vars:
                     if v in ds_m and v in ds_s:
                         self._mean[v] = torch.from_numpy(ds_m[v].values).float()
                         self._std[v] = torch.from_numpy(ds_s[v].values).float()

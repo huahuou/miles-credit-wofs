@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0502'
+save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0502_mconstraint'
 seed: 1000
 
 data:
@@ -25,8 +25,8 @@ data:
   save_loc_dynamic_forcing: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
   save_loc_diagnostic: ''
 
-  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/mean.nc'
-  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/std.nc'
+  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/mean.nc'
+  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/std.nc'
   ## concentration_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/concentration_tuning.json'
   # Simple invertible log-zscore transform for concentration variables.
   # When set, replaces the piecewise concentration transform with:
@@ -146,12 +146,12 @@ trainer:
   no_hang_pin_memory: False
   no_hang_persistent_workers: True
   no_hang_timeout_s: 180
-  train_batch_size: 4
-  valid_batch_size: 4
+  train_batch_size: 8
+  valid_batch_size: 8
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
-  thread_workers: 4
-  valid_thread_workers: 4
+  thread_workers: 8
+  valid_thread_workers: 8
   prefetch_factor: 1
   dataloader_timeout_s: 360
   update_learning_rate: False
@@ -173,7 +173,7 @@ trainer:
     first_cycle_steps: 1000
     cycle_mult: 2.0
     max_lr: 1.0e-03
-    min_lr: 7.0e-05
+    min_lr: 8.0e-05
     warmup_steps: 999
     gamma: 0.8
   grad_max_norm: 1.0
@@ -218,7 +218,7 @@ loss:
     sign_threshold: 0.1
 
   # H-operator (reflectivity) constraint — compares diagnosed ΔdBZ to boundary innovation
-  use_refl_operator_constraint: false
+  use_refl_operator_constraint: true
   refl_operator_constraint_weight: 0.01
   refl_operator_constraint:
     mode: innovation           # innovation | absolute (innovation recommended)

@@ -298,6 +298,9 @@ class Trainer(BaseTrainer):
                 accum_log(logs, {"occ_ce": occ_ce.item() / grad_accum_every})
             if gate_mean is not None:
                 accum_log(logs, {"occ_gate_mean": gate_mean.item()})
+            if hasattr(criterion, "get_last_aux_losses") and callable(getattr(criterion, "get_last_aux_losses")):
+                for aux_name, aux_value in criterion.get_last_aux_losses().items():
+                    accum_log(logs, {aux_name: aux_value.item() / grad_accum_every})
 
 
             # Note: DDP synchronizes gradients during backward(); no explicit barrier needed.
@@ -337,6 +340,18 @@ class Trainer(BaseTrainer):
                 if distributed:
                     dist.all_reduce(occ_gate_tensor, dist.ReduceOp.AVG, async_op=False)
                 results_dict["train_occ_gate_mean"].append(occ_gate_tensor[0].item())
+
+            for aux_name in (
+                "microphysics_constraint_loss",
+                "microphysics_constraint_loss_weighted",
+                "refl_operator_constraint_loss",
+                "refl_operator_constraint_loss_weighted",
+            ):
+                if aux_name in logs:
+                    aux_tensor = torch.tensor([logs[aux_name]], device=self.device)
+                    if distributed:
+                        dist.all_reduce(aux_tensor, dist.ReduceOp.AVG, async_op=False)
+                    results_dict[f"train_{aux_name}"].append(aux_tensor[0].item())
 
             if "forecast_hour" in batch:
                 forecast_hour_tensor = batch["forecast_hour"].to(self.device, non_blocking=True)
