@@ -22,6 +22,7 @@ from credit.metrics import LatWeightedMetrics
 from credit.models import load_model
 from credit.parser import credit_main_parser
 from credit.seed import seed_everything
+from credit.transforms.concentration import CONCENTRATION_VARS
 
 logger = logging.getLogger(__name__)
 
@@ -161,26 +162,18 @@ def _denormalize_prog_increments(
     dataset: "WoFSDAIncrementDataset",
     y_norm_incr: np.ndarray,
     x_norm_z0: np.ndarray,
-    phys_clip_by_var: "dict[str, float] | None" = None,
 ) -> np.ndarray:
     """Convert normalized-space prognostic increments to physical-space increments.
 
     Inverts ``norm(Q_t1) - norm(Q_t0)`` back to ``Q_t1 - Q_t0`` in original units.
-    Handles both the legacy piecewise concentration transform and the new
-    log-zscore transform (used when ``log_transform_params_json`` is set in the
-    config).  With the log-zscore transform the inverse is ``clip(exp(·), …)``,
-    which is bounded and has no exponential blow-up by construction.
+    Uses the dataset's configured inverse variable transform, which for the
+    current WoFS DA setup is driven by ``data.log_transform_params_json``.
 
     Args:
         dataset: An opened ``WoFSDAIncrementDataset`` providing normalization stats.
         y_norm_incr: Normalized increments, shape ``(batch, n_vars*n_levels, time, H, W)``.
         x_norm_z0: Normalized prognostic-only state at t0,
             shape ``(batch, n_vars*n_levels, time, H, W)``.
-        phys_clip_by_var: Optional dict mapping variable name to a positive float. When
-            supplied, ``q_t1`` is clipped to ``[0, clip_max]`` before computing the
-            physical increment.  With the log-zscore transform this is rarely needed
-            since the inverse is already bounded by ``clip_max`` from the params JSON.
-            Example: ``{"QRAIN": 5e-3, "QNRAIN": 1e6}``
 
     Returns:
         Physical increments in original variable units, same shape as inputs.
@@ -199,37 +192,39 @@ def _denormalize_prog_increments(
         z0 = x_norm_z0[:, ch0:ch1, ...].astype(np.float64)
         z1 = z0 + dz
 
-        std = np.asarray(dataset._std_values[var_name], dtype=np.float64)
-        mean = np.asarray(dataset._mean_values[var_name], dtype=np.float64)
-        # Crop to reduced levels if a ceiling_level was applied
-        if std.ndim == 1 and std.shape[0] > n_levels:
-            std = std[:n_levels]
-            mean = mean[:n_levels]
-
-        # Reshape for broadcasting over (batch, n_levels, time, H, W)
-        std_bc = std.reshape(1, -1, 1, 1, 1)
-        mean_bc = mean.reshape(1, -1, 1, 1, 1)
-
-        # Step 1: un-z-score → this recovers forward_conc(Q_t0) and forward_conc(Q_t1)
-        transformed_t0 = (z0 * std_bc + mean_bc)
-        transformed_t1 = (z1 * std_bc + mean_bc)
+        # Step 1: invert the dataset normalization mode to recover transformed-space values.
+        transformed_t0 = dataset._denormalize_transformed_values(z0, var_name).astype(np.float64)
+        transformed_t1 = dataset._denormalize_transformed_values(z1, var_name).astype(np.float64)
 
         # Step 2: inverse concentration transform → physical Q values
         q_t0 = dataset._inverse_var_transform(transformed_t0.astype(np.float32), var_name).astype(np.float64)
         q_t1 = dataset._inverse_var_transform(transformed_t1.astype(np.float32), var_name).astype(np.float64)
 
-        # Step 3: optional per-variable physical clip to further constrain output.
-        # With the log-zscore transform the inverse is already bounded by clip_max
-        # from the params JSON, so this is mainly useful as an extra safety net or
-        # for the legacy piecewise transform path where large z1 values can produce
-        # unbounded physical values in the exponential region.
-        if phys_clip_by_var and var_name in phys_clip_by_var:
-            clip_max = float(phys_clip_by_var[var_name])
-            q_t1 = np.clip(q_t1, 0.0, clip_max)
-
         phys[:, ch0:ch1, ...] = (q_t1 - q_t0).astype(np.float32)
 
     return phys
+
+
+def _strip_deprecated_concentration_config(conf: dict) -> None:
+    data_conf = conf.get("data", {})
+    deprecated_path = data_conf.pop("concentration_params_json", None)
+    if deprecated_path:
+        logger.info(
+            "Ignoring deprecated data.concentration_params_json=%s during evaluation; "
+            "using data.log_transform_params_json only.",
+            deprecated_path,
+        )
+
+
+def _validate_eval_transform_config(conf: dict) -> None:
+    data_conf = conf["data"]
+    prognostic_concentration_vars = [var for var in data_conf.get("variables", []) if var in CONCENTRATION_VARS]
+    if prognostic_concentration_vars and not data_conf.get("log_transform_params_json"):
+        raise ValueError(
+            "Evaluation for concentration prognostic variables requires data.log_transform_params_json. "
+            "The deprecated data.concentration_params_json path is ignored by this eval script. "
+            f"Missing log transform config for variables: {prognostic_concentration_vars}"
+        )
 
 
 def _make_output_channel_names(conf: dict) -> list[str]:
@@ -450,6 +445,8 @@ def main() -> None:
         conf = yaml.safe_load(f)
 
     conf = credit_main_parser(conf, parse_training=True, parse_predict=False, print_summary=False)
+    _strip_deprecated_concentration_config(conf)
+    _validate_eval_transform_config(conf)
     _sync_prognostic_levels(conf)
     eval_conf = conf.get("eval", {}) if isinstance(conf.get("eval", {}), dict) else {}
     predict_conf = conf.get("predict", {}) if isinstance(conf.get("predict", {}), dict) else {}
@@ -489,14 +486,6 @@ def main() -> None:
         else eval_conf.get("save_physical_zarr_path", _physical_default)
     )
     save_physical_enabled = bool(eval_conf.get("save_physical", True))
-
-    # Per-variable physical-space clip for the denormalized output.
-    # Suppresses exponential-Jacobian artifacts for concentration vars (QRAIN, QNRAIN, …).
-    # Config key: eval.phys_clip_by_var: {QRAIN: 5.0e-3, QNRAIN: 1.0e6}
-    raw_phys_clip = eval_conf.get("phys_clip_by_var", {})
-    phys_clip_by_var: dict[str, float] | None = (
-        {k: float(v) for k, v in raw_phys_clip.items()} if isinstance(raw_phys_clip, dict) and raw_phys_clip else None
-    )
 
     seed_everything(conf["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -724,8 +713,8 @@ def main() -> None:
 
                 if save_physical_enabled:
                     x_prog_np = x_np[:, :n_prog_channels, ...]
-                    y_true_phys_np = _denormalize_prog_increments(dataset, y_true_np, x_prog_np, phys_clip_by_var=phys_clip_by_var)
-                    y_pred_phys_np = _denormalize_prog_increments(dataset, y_pred_np, x_prog_np, phys_clip_by_var=phys_clip_by_var)
+                    y_true_phys_np = _denormalize_prog_increments(dataset, y_true_np, x_prog_np)
+                    y_pred_phys_np = _denormalize_prog_increments(dataset, y_pred_np, x_prog_np)
                     t0 = time.monotonic()
                     ds_phys = _build_batch_physical_dataset_for_zarr(
                         conf=conf,

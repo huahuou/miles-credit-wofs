@@ -36,6 +36,7 @@ data:
   #   --input  <stats_dir>/concentration_tuning.json \
   #   --output <stats_dir>/log_transform_params.json
   log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/zero_inflated_transform_params.json'
+  concentration_normalization_mode: 'zscore'  # options: zscore | transform_only | scale_only
 
   concentration_level_ops:
     QRAIN:

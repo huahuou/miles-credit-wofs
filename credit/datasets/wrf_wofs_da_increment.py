@@ -25,7 +25,6 @@ Tensor dict keys returned
 
 import logging
 from collections import OrderedDict
-import json
 import time
 import numpy as np
 import xarray as xr
@@ -48,15 +47,6 @@ from credit.transforms.concentration import (
 )
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_CONCENTRATION_PARAMS = {
-    "c1": 0.5,
-    "c2": 0.5,
-    "conc_eps": 1e-4,
-    "conc_max": 2.5,
-    "value_clip_min": None,
-    "value_clip_max": None,
-}
 
 class WoFSDAIncrementDataset(torch.utils.data.Dataset):
     """
@@ -107,7 +97,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         # -- normalization paths -------------------------------------------
         self.mean_path = conf["data"]["mean_path"]
         self.std_path = conf["data"]["std_path"]
-        self.concentration_params_json_path = conf["data"].get("concentration_params_json")
+        self._transform_params_json_path = conf["data"].get("log_transform_params_json")
 
         self.levels = conf["data"]["levels"]
         self.rng = np.random.default_rng(seed=seed)
@@ -138,12 +128,11 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         self.cumulative_samples = None
         self.upper_ds_cache = OrderedDict()
         self.dyn_ds_cache = OrderedDict()
-        self._concentration_params = {var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in CONCENTRATION_VARS}
         self._concentration_level_ops = conf["data"].get("concentration_level_ops", {})
-        # Generalized concentration transform params (replaces piecewise transform when set)
-        self._transform_params_json_path = conf["data"].get("log_transform_params_json")
         self._concentration_transform_specs: dict[str, dict] = {}
-        self._log_transform_params: dict[str, dict] = {}
+        self._concentration_normalization_mode = str(
+            conf["data"].get("concentration_normalization_mode", "zscore")
+        ).strip().lower()
         self._occupancy_delta_threshold = float(conf["data"].get("occupancy_delta_threshold", 1.0e-10))
         if self._occupancy_delta_threshold <= 0.0:
             self._occupancy_delta_threshold = 1.0e-10
@@ -171,6 +160,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             )
         )
         self._prognostic_levels = self._infer_common_prognostic_ceiling_level(default_prog_levels)
+        self._validate_transform_config()
         self._refresh_required_open_vars()
 
     def _refresh_required_open_vars(self):
@@ -215,31 +205,47 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             )
         return max(1, int(unique_levels[0]))
 
-    @staticmethod
-    def _coerce_concentration_params(params: dict | None) -> dict[str, float]:
-        merged = dict(_DEFAULT_CONCENTRATION_PARAMS)
-        if isinstance(params, dict):
-            for key in ("c1", "c2", "conc_eps", "conc_max"):
-                if key in params:
-                    merged[key] = float(params[key])
-            if "value_clip_min" in params:
-                merged["value_clip_min"] = None if params["value_clip_min"] is None else float(params["value_clip_min"])
-            if "value_clip_max" in params:
-                merged["value_clip_max"] = None if params["value_clip_max"] is None else float(params["value_clip_max"])
-        if merged["conc_eps"] <= 0.0:
-            merged["conc_eps"] = _DEFAULT_CONCENTRATION_PARAMS["conc_eps"]
-        if merged["conc_max"] <= merged["conc_eps"]:
-            merged["conc_max"] = max(_DEFAULT_CONCENTRATION_PARAMS["conc_max"], merged["conc_eps"] * 10.0)
-        clip_min = merged.get("value_clip_min")
-        clip_max = merged.get("value_clip_max")
-        if clip_min is not None and clip_max is not None and clip_min >= clip_max:
-            merged["value_clip_min"] = None
-            merged["value_clip_max"] = None
-        return merged
+    def _validate_transform_config(self) -> None:
+        concentration_vars = [var for var in self.varname_prognostic if var in CONCENTRATION_VARS]
+        if concentration_vars and not self._transform_params_json_path:
+            raise ValueError(
+                "WoFSDAIncrementDataset requires data.log_transform_params_json for concentration prognostic variables. "
+                f"Missing transform config for variables: {concentration_vars}"
+            )
+        if self._concentration_normalization_mode not in {"zscore", "transform_only", "scale_only"}:
+            raise ValueError(
+                "data.concentration_normalization_mode must be one of "
+                "'zscore', 'transform_only', or 'scale_only'. "
+                f"Got: {self._concentration_normalization_mode}"
+            )
 
-    def _get_concentration_params(self, var_name: str) -> dict[str, float]:
-        params = self._concentration_params.get(var_name, _DEFAULT_CONCENTRATION_PARAMS)
-        return self._coerce_concentration_params(params)
+    def _normalize_transformed_values(self, transformed_values: np.ndarray, var_name: str) -> np.ndarray:
+        if var_name in CONCENTRATION_VARS:
+            mode = self._concentration_normalization_mode
+            if mode == "transform_only":
+                return transformed_values
+
+            std = self._broadcast_stats_for_var(self._std_values[var_name], transformed_values, var_name)
+            if mode == "scale_only":
+                return transformed_values / std
+
+        mean = self._broadcast_stats_for_var(self._mean_values[var_name], transformed_values, var_name)
+        std = self._broadcast_stats_for_var(self._std_values[var_name], transformed_values, var_name)
+        return (transformed_values - mean) / std
+
+    def _denormalize_transformed_values(self, normalized_values: np.ndarray, var_name: str) -> np.ndarray:
+        if var_name in CONCENTRATION_VARS:
+            mode = self._concentration_normalization_mode
+            if mode == "transform_only":
+                return normalized_values
+
+            std = self._broadcast_stats_for_var(self._std_values[var_name], normalized_values, var_name)
+            if mode == "scale_only":
+                return normalized_values * std
+
+        mean = self._broadcast_stats_for_var(self._mean_values[var_name], normalized_values, var_name)
+        std = self._broadcast_stats_for_var(self._std_values[var_name], normalized_values, var_name)
+        return normalized_values * std + mean
 
     def _get_concentration_level_op(self, var_name: str, n_levels: int) -> dict | None:
         if var_name not in CONCENTRATION_VARS or not isinstance(self._concentration_level_ops, dict):
@@ -352,144 +358,28 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
 
         return np.moveaxis(norm_level_first, 0, level_axis)
 
-    # ------------------------------------------------------------------ #
-    # Log-zscore transform (legacy compatibility helpers)
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _forward_log_numpy(x: np.ndarray, params: dict) -> np.ndarray:
-        """Forward log transform: log(clip(x, clip_min, clip_max)).
-
-        The result is in log space; z-scoring (subtract log_mean, divide by
-        log_std) is applied separately by _normalize_array via _mean_values
-        and _std_values which are overridden to the pooled log statistics when
-        log_transform_params_json is provided.
-        """
-        x64 = np.asarray(x, dtype=np.float64)
-        clip_min = float(params["clip_min"])
-        clip_max = float(params["clip_max"])
-        return np.log(np.clip(x64, clip_min, clip_max)).astype(
-            x.dtype if hasattr(x, "dtype") else np.float32
-        )
-
-    @staticmethod
-    def _inverse_log_numpy(x: np.ndarray, params: dict) -> np.ndarray:
-        """Inverse log transform: clip(exp(x), clip_min, clip_max).
-
-        Exact closed-form inverse of _forward_log_numpy.  The input x is the
-        log-space value *before* z-scoring (i.e. after un-z-scoring).
-        """
-        x64 = np.asarray(x, dtype=np.float64)
-        clip_min = float(params["clip_min"])
-        clip_max = float(params["clip_max"])
-        return np.clip(np.exp(x64), clip_min, clip_max).astype(
-            x.dtype if hasattr(x, "dtype") else np.float32
-        )
-
-    # ------------------------------------------------------------------ #
-    # Piecewise concentration transform (legacy, used when log params absent)
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _forward_concentration_numpy(x: np.ndarray, params: dict[str, float]) -> np.ndarray:
-        x64 = np.asarray(x, dtype=np.float64)
-        c1 = float(params["c1"])
-        c2 = float(params["c2"])
-        conc_eps = float(params["conc_eps"])
-        conc_max = float(params["conc_max"])
-        clip_min = params.get("value_clip_min")
-        clip_max = params.get("value_clip_max")
-        if clip_min is not None:
-            x64 = np.maximum(x64, float(clip_min))
-        if clip_max is not None:
-            x64 = np.minimum(x64, float(clip_max))
-        log_eps = float(np.log(conc_eps))
-        neg_log_eps = float(-log_eps)
-        transformed = c1 * np.minimum(x64, conc_max) + c2 * (np.log(np.maximum(x64, conc_eps)) - log_eps) / neg_log_eps
-        return transformed.astype(x.dtype, copy=False)
-
-    @staticmethod
-    def _inverse_concentration_numpy(x: np.ndarray, params: dict[str, float]) -> np.ndarray:
-        target = np.asarray(x, dtype=np.float64)
-        target = np.maximum(target, 0.0)
-
-        c1 = float(params["c1"])
-        c2 = float(params["c2"])
-        conc_eps = float(params["conc_eps"])
-        conc_max = float(params["conc_max"])
-        clip_min = params.get("value_clip_min")
-        clip_max = params.get("value_clip_max")
-        log_eps = float(np.log(conc_eps))           # ln(conc_eps) < 0
-        neg_log_eps = float(-log_eps)               # ln(1/conc_eps) > 0
-
-        # --- Piecewise boundary values in transform (y) space ----------------
-        # y1 = f(conc_eps): log term is exactly 0 at x=conc_eps, so f = c1*conc_eps
-        y1 = c1 * conc_eps
-        # y2 = f(conc_max): last point where x appears linearly in the log term
-        y2 = c1 * conc_max + c2 * (np.log(conc_max) - log_eps) / neg_log_eps
-
-        out = np.empty_like(target)
-
-        # --- Region 1: target <= y1 (x < conc_eps) ---------------------------
-        # f(x) = c1 * x  (log term clamps to 0 for all x < conc_eps)
-        # Closed-form inverse: x = target / c1
-        mask1 = target <= y1
-        if np.any(mask1):
-            out[mask1] = target[mask1] / c1
-
-        # --- Region 3: target >= y2 (x >= conc_max) --------------------------
-        # f(x) = c1*conc_max + c2*(ln(x) - ln(eps)) / neg_log_eps
-        # Closed-form inverse: x = conc_eps * exp((target - c1*conc_max) * neg_log_eps / c2)
-        mask3 = target >= y2
-        if np.any(mask3):
-            out[mask3] = conc_eps * np.exp((target[mask3] - c1 * conc_max) * neg_log_eps / c2)
-
-        # --- Region 2: y1 < target < y2 (conc_eps <= x < conc_max) ----------
-        # f(x) = c1*x + c2*(ln(x) - ln(eps)) / neg_log_eps — no closed form.
-        # Bisect over tight bracket [conc_eps, conc_max].
-        # Width = conc_max - conc_eps ≈ 2.5; after 40 steps → ~2e-12, within float32 ULP.
-        # Inside the bracket min/max clamps are always inactive, so forward simplifies.
-        mask2 = ~mask1 & ~mask3
-        if np.any(mask2):
-            t2 = target[mask2]
-            lo = np.full_like(t2, conc_eps)
-            hi = np.full_like(t2, conc_max)
-            for _ in range(40):
-                mid = 0.5 * (lo + hi)
-                f_mid = c1 * mid + c2 * (np.log(mid) - log_eps) / neg_log_eps
-                go_right = f_mid < t2
-                lo = np.where(go_right, mid, lo)
-                hi = np.where(go_right, hi, mid)
-            out[mask2] = 0.5 * (lo + hi)
-
-        if clip_min is not None:
-            out = np.maximum(out, float(clip_min))
-        if clip_max is not None:
-            out = np.minimum(out, float(clip_max))
-        return out.astype(x.dtype, copy=False)
-
     def _forward_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
             spec = self._concentration_transform_specs.get(var_name)
-            if spec is not None:
-                return forward_concentration_transform_numpy(
-                    var_values,
-                    spec,
-                    level_axis=self._find_level_axis(np.asarray(var_values), var_name),
-                )
-            return self._forward_concentration_numpy(var_values, self._get_concentration_params(var_name))
+            if spec is None:
+                raise KeyError(f"Missing concentration transform spec for variable {var_name}")
+            return forward_concentration_transform_numpy(
+                var_values,
+                spec,
+                level_axis=self._find_level_axis(np.asarray(var_values), var_name),
+            )
         return var_values
 
     def _inverse_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
             spec = self._concentration_transform_specs.get(var_name)
-            if spec is not None:
-                return inverse_concentration_transform_numpy(
-                    var_values,
-                    spec,
-                    level_axis=self._find_level_axis(np.asarray(var_values), var_name),
-                )
-            return self._inverse_concentration_numpy(var_values, self._get_concentration_params(var_name))
+            if spec is None:
+                raise KeyError(f"Missing concentration transform spec for variable {var_name}")
+            return inverse_concentration_transform_numpy(
+                var_values,
+                spec,
+                level_axis=self._find_level_axis(np.asarray(var_values), var_name),
+            )
         return var_values
 
     def denormalize_increment(self, normalized_increment: np.ndarray, base_state_t0: np.ndarray, var_name: str) -> np.ndarray:
@@ -503,11 +393,9 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         Returns:
             Physical increment in original variable units.
         """
-        std = self._broadcast_stats_for_var(self._std_values[var_name], normalized_increment, var_name)
-        mean = self._broadcast_stats_for_var(self._mean_values[var_name], normalized_increment, var_name)
         z0 = self._normalize_array(base_state_t0, var_name)
         z1 = z0 + normalized_increment
-        transformed_1 = z1 * std + mean
+        transformed_1 = self._denormalize_transformed_values(z1, var_name)
         x1 = self._inverse_var_transform(transformed_1, var_name)
         return x1 - base_state_t0
 
@@ -646,9 +534,7 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
 
     def _normalize_array(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         transformed_values = self._forward_var_transform(var_values, var_name)
-        mean = self._broadcast_stats_for_var(self._mean_values[var_name], transformed_values, var_name)
-        std = self._broadcast_stats_for_var(self._std_values[var_name], transformed_values, var_name)
-        return (transformed_values - mean) / std
+        return self._normalize_transformed_values(transformed_values, var_name)
 
     def _delta_threshold_for_var(self, var_name: str) -> float:
         if var_name in self._occupancy_delta_threshold_by_var:
@@ -668,69 +554,6 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
         # Load normalization statistics
         self.mean_ds = xr.open_dataset(self.mean_path).load()
         self.std_ds = xr.open_dataset(self.std_path).load()
-
-        if self.concentration_params_json_path:
-            try:
-                with open(self.concentration_params_json_path, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                params_dict = payload.get("variables", payload) if isinstance(payload, dict) else {}
-                if isinstance(params_dict, dict):
-                    for var, info in params_dict.items():
-                        if var not in CONCENTRATION_VARS or not isinstance(info, dict):
-                            continue
-                        if "recommended" in info and isinstance(info["recommended"], dict):
-                            self._concentration_params[var] = self._coerce_concentration_params(info["recommended"])
-                        else:
-                            self._concentration_params[var] = self._coerce_concentration_params(info)
-                logger.info("Loaded concentration params from JSON: %s", self.concentration_params_json_path)
-            except Exception as exc:
-                logger.warning("Failed to load concentration params JSON %s: %s", self.concentration_params_json_path, exc)
-
-        attr_payload = self.mean_ds.attrs.get("concentration_transform_params_json")
-        if isinstance(attr_payload, str) and attr_payload.strip():
-            try:
-                payload = json.loads(attr_payload)
-                params_dict = payload.get("parameters", {}) if isinstance(payload, dict) else {}
-                if isinstance(params_dict, dict):
-                    for var, params in params_dict.items():
-                        if var in CONCENTRATION_VARS and isinstance(params, dict):
-                            self._concentration_params[var] = self._coerce_concentration_params(params)
-                logger.info("Loaded concentration params from mean/std NetCDF attrs")
-            except Exception as exc:
-                logger.warning("Failed to parse concentration params from stats attrs: %s", exc)
-
-        for var in CONCENTRATION_VARS:
-            if var in self.mean_ds:
-                var_attrs = self.mean_ds[var].attrs
-                if any(
-                    key in var_attrs
-                    for key in (
-                        "concentration_transform_c1",
-                        "concentration_transform_c2",
-                        "concentration_transform_conc_eps",
-                        "concentration_transform_conc_max",
-                        "concentration_transform_clip_min",
-                        "concentration_transform_clip_max",
-                    )
-                ):
-                    self._concentration_params[var] = self._coerce_concentration_params(
-                        {
-                            "c1": var_attrs.get("concentration_transform_c1", self._concentration_params[var]["c1"]),
-                            "c2": var_attrs.get("concentration_transform_c2", self._concentration_params[var]["c2"]),
-                            "conc_eps": var_attrs.get(
-                                "concentration_transform_conc_eps", self._concentration_params[var]["conc_eps"]
-                            ),
-                            "conc_max": var_attrs.get(
-                                "concentration_transform_conc_max", self._concentration_params[var]["conc_max"]
-                            ),
-                            "value_clip_min": var_attrs.get(
-                                "concentration_transform_clip_min", self._concentration_params[var]["value_clip_min"]
-                            ),
-                            "value_clip_max": var_attrs.get(
-                                "concentration_transform_clip_max", self._concentration_params[var]["value_clip_max"]
-                            ),
-                        }
-                    )
 
         # All upper-air variable names we need from each zarr file
         # (deduplicated, order-preserving)
@@ -759,31 +582,22 @@ class WoFSDAIncrementDataset(torch.utils.data.Dataset):
             self._mean_values[var] = mean_values
             self._std_values[var] = std_values
 
-        # --- Load generalized concentration transform params (overrides piecewise transform) ---
-        if self._transform_params_json_path:
-            try:
-                _, self._concentration_transform_specs = load_concentration_transform_json(
-                    self._transform_params_json_path,
-                    variables=CONCENTRATION_VARS,
-                )
-                self._log_transform_params = {
-                    var: spec
-                    for var, spec in self._concentration_transform_specs.items()
-                    if concentration_transform_overrides_stats(spec)
-                }
-                logger.info(
-                    "Loaded concentration transform specs for %d variable(s) from %s",
-                    len(self._concentration_transform_specs),
-                    self._transform_params_json_path,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to load log_transform_params_json %s: %s; falling back to piecewise transform",
-                    self._transform_params_json_path,
-                    exc,
-                )
-                self._concentration_transform_specs = {}
-                self._log_transform_params = {}
+        _, self._concentration_transform_specs = load_concentration_transform_json(
+            self._transform_params_json_path,
+            variables=CONCENTRATION_VARS,
+        )
+        logger.info(
+            "Loaded concentration transform specs for %d variable(s) from %s",
+            len(self._concentration_transform_specs),
+            self._transform_params_json_path,
+        )
+
+        missing_specs = [var for var in self.varname_prognostic if var in CONCENTRATION_VARS and var not in self._concentration_transform_specs]
+        if missing_specs:
+            raise KeyError(
+                "Missing concentration transform specs for prognostic variables: "
+                f"{missing_specs} in {self._transform_params_json_path}"
+            )
 
         # Override mean/std only for the legacy log-zscore path. Newer
         # generalized transforms expect mean/std to come from compute_credit_stats.py.

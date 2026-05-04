@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import glob
 import json
-import math
 import re
 from pathlib import Path
 
@@ -11,6 +10,7 @@ import numpy as np
 import xarray as xr
 from credit.data import get_forward_data
 from credit.transforms.concentration import (
+    CONCENTRATION_VARS,
     forward_concentration_transform_numpy,
     load_concentration_transform_json,
 )
@@ -26,28 +26,6 @@ from dask.distributed import Client, LocalCluster, as_completed
 _CASE_INFO_RE = re.compile(
     r"wofs_(?:boundary_)?(?P<date>\d{8})_(?:.+_)?(?P<init>\d{4})_mem\d+\.zarr(?:\.zip)?/?$"
 )
-_CONCENTRATION_VARS = {
-    "QRAIN",
-    "QNRAIN",
-    "QSNOW",
-    "QNSNOW",
-    "QGRAUP",
-    "QNGRAUPEL",
-    "QVGRAUPEL",
-    "QHAIL",
-    "QNHAIL",
-    "QVHAIL",
-    "QICE",
-    "QNICE",
-}
-_DEFAULT_CONCENTRATION_PARAMS = {
-    "c1": 0.5,
-    "c2": 0.5,
-    "conc_max": 2.5,
-    "conc_eps": 1e-4,
-    "value_clip_min": None,
-    "value_clip_max": None,
-}
 
 
 def _parse_yyyymmdd(value: str | None) -> int | None:
@@ -139,36 +117,6 @@ def _chunk_files(files: list[str], files_per_task: int) -> list[list[str]]:
     return [files[i : i + files_per_task] for i in range(0, len(files), files_per_task)]
 
 
-def _parse_float_list(value: str) -> list[float]:
-    out = []
-    for part in value.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        out.append(float(part))
-    if not out:
-        raise ValueError("Expected at least one numeric value")
-    return out
-
-
-def _select_files(files: list[str], max_files: int, seed: int) -> list[str]:
-    if max_files <= 0:
-        raise ValueError(f"max_files must be positive, got {max_files}")
-    if len(files) <= max_files:
-        return files
-    rng = np.random.default_rng(seed)
-    indices = rng.choice(len(files), size=max_files, replace=False)
-    indices.sort()
-    return [files[i] for i in indices]
-
-
-def _sample_array(arr: np.ndarray, target_size: int, rng: np.random.Generator) -> np.ndarray:
-    if arr.size <= target_size:
-        return arr
-    idx = rng.choice(arr.size, size=target_size, replace=False)
-    return arr[idx]
-
-
 def _build_accumulator_schema(ds: xr.Dataset, data_vars: list[str]) -> dict[str, dict[str, np.ndarray]]:
     accum = {}
     for var in data_vars:
@@ -203,34 +151,15 @@ def _merge_accumulators(
         accum[var]["sum_sq"] += partial[var]["sum_sq"]
 
 
-def _transform_concentration(da: xr.DataArray, params: dict[str, float] | None = None) -> xr.DataArray:
-    """Apply the CREDIT concentration-variable transform before statistics."""
+def _transform_concentration(da: xr.DataArray, transform_spec: dict | None) -> xr.DataArray:
+    """Apply the configured concentration transform before statistics."""
+
+    if transform_spec is None:
+        return da
 
     arr = np.asarray(da.values, dtype=np.float64)
     level_axis = da.dims.index("level") if "level" in da.dims else None
-    transform_spec = None
-    if params is not None and "transform_type" in params:
-        transform_spec = params
-    if transform_spec is not None:
-        transformed = forward_concentration_transform_numpy(arr, transform_spec, level_axis=level_axis)
-        return xr.DataArray(transformed, dims=da.dims, coords=da.coords)
-
-    merged = dict(_DEFAULT_CONCENTRATION_PARAMS)
-    if params is not None:
-        merged.update(params)
-    c1 = float(merged["c1"])
-    c2 = float(merged["c2"])
-    conc_max = float(merged["conc_max"])
-    conc_eps = float(merged["conc_eps"])
-    value_clip_min = merged.get("value_clip_min")
-    value_clip_max = merged.get("value_clip_max")
-    if value_clip_min is not None:
-        arr = np.maximum(arr, float(value_clip_min))
-    if value_clip_max is not None:
-        arr = np.minimum(arr, float(value_clip_max))
-    log_eps = math.log(conc_eps)
-    neg_log_eps = -log_eps
-    transformed = c1 * np.minimum(arr, conc_max) + c2 * (np.log(np.maximum(arr, conc_eps)) - log_eps) / neg_log_eps
+    transformed = forward_concentration_transform_numpy(arr, transform_spec, level_axis=level_axis)
     return xr.DataArray(transformed, dims=da.dims, coords=da.coords)
 
 
@@ -243,200 +172,7 @@ def _get_transform_clip_bounds(params: dict[str, float] | None) -> tuple[float |
             return float(params.get("zero_floor", 0.0)), float(params.get("clip_max", np.inf))
         if transform_type == "log_zscore":
             return float(params.get("clip_min", 0.0)), float(params.get("clip_max", np.inf))
-    return params.get("value_clip_min"), params.get("value_clip_max")
-
-
-def _score_concentration_candidate(
-    x: np.ndarray,
-    c1: float,
-    c2: float,
-    conc_max: float,
-    conc_eps: float,
-    target_low_clamp: float,
-    target_high_clamp: float,
-    min_spread: float,
-) -> dict[str, float]:
-    log_eps = math.log(conc_eps)
-    neg_log_eps = -log_eps
-    transformed = c1 * np.minimum(x, conc_max) + c2 * (np.log(np.maximum(x, conc_eps)) - log_eps) / neg_log_eps
-    p01, p99 = np.quantile(transformed, [0.01, 0.99])
-    mean = float(np.mean(transformed))
-    std = float(np.std(transformed))
-    skew = 0.0
-    if std > 0:
-        skew = float(np.mean(((transformed - mean) / std) ** 3))
-    spread = float(p99 - p01)
-    low_clamp_fraction = float(np.mean(x <= conc_eps))
-    high_clamp_fraction = float(np.mean(x >= conc_max))
-
-    score = (
-        3.0 * abs(low_clamp_fraction - target_low_clamp)
-        + 2.0 * abs(high_clamp_fraction - target_high_clamp)
-        + 4.0 * max(0.0, min_spread - spread)
-        + 0.2 * abs(skew)
-    )
-    return {
-        "score": float(score),
-        "c1": float(c1),
-        "c2": float(c2),
-        "conc_max": float(conc_max),
-        "conc_eps": float(conc_eps),
-        "low_clamp_fraction": low_clamp_fraction,
-        "high_clamp_fraction": high_clamp_fraction,
-        "transformed_spread_p99_p01": spread,
-        "transformed_skew": skew,
-    }
-
-
-def _auto_tune_concentration_params(
-    files: list[str],
-    max_files: int,
-    samples_per_file_per_var: int,
-    seed: int,
-    eps_quantiles: list[float],
-    max_quantiles: list[float],
-    c1_values: list[float],
-    target_low_clamp: float,
-    target_high_clamp: float,
-    min_spread: float,
-) -> dict[str, dict[str, float]]:
-    selected_files = _select_files(files, max_files=max_files, seed=seed)
-    print(f"[tune] selected_files={len(selected_files)} max_files={max_files} seed={seed}")
-    rng = np.random.default_rng(seed)
-    samples: dict[str, list[np.ndarray]] = {var: [] for var in _CONCENTRATION_VARS}
-
-    for idx, file_path in enumerate(selected_files, start=1):
-        print(f"[tune] sampling file {idx}/{len(selected_files)}: {file_path}")
-        ds = _zarr_open(file_path)
-        try:
-            for var in _CONCENTRATION_VARS:
-                if var not in ds.data_vars:
-                    continue
-                arr = np.asarray(ds[var].values, dtype=np.float64).ravel()
-                finite = np.isfinite(arr)
-                if not np.any(finite):
-                    continue
-                arr = arr[finite]
-                arr = arr[arr >= 0.0]
-                if arr.size == 0:
-                    continue
-                arr = _sample_array(arr, samples_per_file_per_var, rng)
-                samples[var].append(arr)
-        finally:
-            ds.close()
-
-    tuned: dict[str, dict[str, float]] = {}
-    for var in sorted(_CONCENTRATION_VARS):
-        if not samples[var]:
-            tuned[var] = dict(_DEFAULT_CONCENTRATION_PARAMS)
-            continue
-
-        x = np.concatenate(samples[var], axis=0)
-        x_pos = x[x > 0]
-        if x_pos.size == 0:
-            tuned[var] = dict(_DEFAULT_CONCENTRATION_PARAMS)
-            continue
-
-        eps_candidates = [1e-12, 1e-10, 1e-8, 1e-6, 1e-5, 1e-4]
-        eps_candidates.extend(float(np.quantile(x_pos, q)) for q in eps_quantiles)
-        eps_candidates = sorted({float(e) for e in eps_candidates if np.isfinite(e) and 0.0 < e < 1.0})
-        if not eps_candidates:
-            eps_candidates = [1e-6, 1e-5, 1e-4]
-
-        max_candidates = [0.5, 1.0, 2.5, 5.0]
-        max_candidates.extend(float(np.quantile(x_pos, q)) for q in max_quantiles)
-        max_candidates = sorted({float(m) for m in max_candidates if np.isfinite(m) and m > 0.0})
-        if not max_candidates:
-            max_candidates = [2.5]
-
-        best: dict[str, float] | None = None
-        for c1 in c1_values:
-            c2 = 1.0 - c1
-            for conc_eps in eps_candidates:
-                for conc_max in max_candidates:
-                    if conc_max <= conc_eps:
-                        continue
-                    candidate = _score_concentration_candidate(
-                        x=x,
-                        c1=float(c1),
-                        c2=float(c2),
-                        conc_max=float(conc_max),
-                        conc_eps=float(conc_eps),
-                        target_low_clamp=target_low_clamp,
-                        target_high_clamp=target_high_clamp,
-                        min_spread=min_spread,
-                    )
-                    if best is None or candidate["score"] < best["score"]:
-                        best = candidate
-
-        if best is None:
-            tuned[var] = dict(_DEFAULT_CONCENTRATION_PARAMS)
-            continue
-
-        tuned[var] = {
-            "c1": float(best["c1"]),
-            "c2": float(best["c2"]),
-            "conc_eps": float(best["conc_eps"]),
-            "conc_max": float(best["conc_max"]),
-        }
-        print(
-            f"[tune] best {var}: score={best['score']:.5f} c1={best['c1']:.3f} c2={best['c2']:.3f} "
-            f"conc_eps={best['conc_eps']:.3e} conc_max={best['conc_max']:.3e}"
-        )
-
-    return tuned
-
-
-def _load_concentration_params_json(path: str) -> dict[str, dict[str, float]]:
-    with Path(path).open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-    if isinstance(payload, dict) and "variables" in payload and isinstance(payload["variables"], dict):
-        out: dict[str, dict[str, float]] = {}
-        for var, info in payload["variables"].items():
-            if not isinstance(info, dict):
-                continue
-            if "recommended" in info and isinstance(info["recommended"], dict):
-                rec = info["recommended"]
-                out[var] = {
-                    "c1": float(rec.get("c1", _DEFAULT_CONCENTRATION_PARAMS["c1"])),
-                    "c2": float(rec.get("c2", _DEFAULT_CONCENTRATION_PARAMS["c2"])),
-                    "conc_max": float(rec.get("conc_max", _DEFAULT_CONCENTRATION_PARAMS["conc_max"])),
-                    "conc_eps": float(rec.get("conc_eps", _DEFAULT_CONCENTRATION_PARAMS["conc_eps"])),
-                    "value_clip_min": rec.get(
-                        "value_clip_min",
-                        info.get("value_clip_min", _DEFAULT_CONCENTRATION_PARAMS["value_clip_min"]),
-                    ),
-                    "value_clip_max": rec.get(
-                        "value_clip_max",
-                        info.get("value_clip_max", _DEFAULT_CONCENTRATION_PARAMS["value_clip_max"]),
-                    ),
-                }
-            elif {"c1", "c2", "conc_max", "conc_eps"}.issubset(info.keys()):
-                out[var] = {
-                    "c1": float(info["c1"]),
-                    "c2": float(info["c2"]),
-                    "conc_max": float(info["conc_max"]),
-                    "conc_eps": float(info["conc_eps"]),
-                    "value_clip_min": info.get("value_clip_min", _DEFAULT_CONCENTRATION_PARAMS["value_clip_min"]),
-                    "value_clip_max": info.get("value_clip_max", _DEFAULT_CONCENTRATION_PARAMS["value_clip_max"]),
-                }
-        return out
-    if isinstance(payload, dict):
-        out: dict[str, dict[str, float]] = {}
-        for var, info in payload.items():
-            if not isinstance(info, dict):
-                continue
-            if {"c1", "c2", "conc_max", "conc_eps"}.issubset(info.keys()):
-                out[var] = {
-                    "c1": float(info["c1"]),
-                    "c2": float(info["c2"]),
-                    "conc_max": float(info["conc_max"]),
-                    "conc_eps": float(info["conc_eps"]),
-                    "value_clip_min": info.get("value_clip_min", _DEFAULT_CONCENTRATION_PARAMS["value_clip_min"]),
-                    "value_clip_max": info.get("value_clip_max", _DEFAULT_CONCENTRATION_PARAMS["value_clip_max"]),
-                }
-        return out
-    raise ValueError(f"Unsupported concentration params JSON structure in {path}")
+    return None, None
 
 
 def _accumulate(stats, da: xr.DataArray, valid_mask: np.ndarray | None = None):
@@ -461,7 +197,6 @@ def _accumulate(stats, da: xr.DataArray, valid_mask: np.ndarray | None = None):
 def _compute_partial_stats(
     file_batch: list[str],
     accum_template: dict[str, dict[str, np.ndarray]],
-    concentration_params: dict[str, dict[str, float]],
     concentration_transform_specs: dict[str, dict],
     exclude_clipped_boundary_samples: bool,
     clip_boundary_tolerance: float,
@@ -484,12 +219,10 @@ def _compute_partial_stats(
                     continue
                 da = ds[var]
                 valid_mask = None
-                if var in _CONCENTRATION_VARS:
-                    params = concentration_transform_specs.get(var)
-                    if params is None:
-                        params = concentration_params.get(var)
-                    if exclude_clipped_boundary_samples and params is not None:
-                        clip_min, clip_max = _get_transform_clip_bounds(params)
+                if var in CONCENTRATION_VARS:
+                    transform_spec = concentration_transform_specs.get(var)
+                    if exclude_clipped_boundary_samples and transform_spec is not None:
+                        clip_min, clip_max = _get_transform_clip_bounds(transform_spec)
                         if clip_min is not None or clip_max is not None:
                             raw = np.asarray(da.values, dtype=np.float64)
                             valid_mask = np.isfinite(raw)
@@ -498,7 +231,7 @@ def _compute_partial_stats(
                                 valid_mask = valid_mask & (raw > float(clip_min) + tol)
                             if clip_max is not None:
                                 valid_mask = valid_mask & (raw < float(clip_max) - tol)
-                    da = _transform_concentration(da, params)
+                    da = _transform_concentration(da, transform_spec)
                 _accumulate(accum[var], da, valid_mask=valid_mask)
         finally:
             ds.close()
@@ -546,61 +279,7 @@ def main():
         "--transform-params-json",
         "--log-transform-params-json",
         dest="transform_params_json",
-        help="Optional generalized concentration transform JSON path (e.g. zero-inflated probit or log-zscore)",
-    )
-    parser.add_argument(
-        "--concentration-params-json",
-        help="Optional JSON path with per-variable concentration transform params (c1,c2,conc_eps,conc_max)",
-    )
-    parser.add_argument(
-        "--auto-tune-concentration",
-        action="store_true",
-        help="Auto-tune concentration transform params from a subset of files before computing statistics",
-    )
-    parser.add_argument("--tune-max-files", type=int, default=150, help="Max files to sample when auto-tuning")
-    parser.add_argument(
-        "--tune-samples-per-file-per-var",
-        type=int,
-        default=20000,
-        help="Max random samples per variable per sampled file when auto-tuning",
-    )
-    parser.add_argument("--tune-seed", type=int, default=1234, help="Random seed for auto-tuning")
-    parser.add_argument(
-        "--tune-eps-quantiles",
-        default="0.0005,0.001,0.002,0.005,0.01,0.02,0.05",
-        help="Comma-separated quantiles used to build conc_eps candidates during auto-tuning",
-    )
-    parser.add_argument(
-        "--tune-max-quantiles",
-        default="0.95,0.98,0.99,0.995,0.999",
-        help="Comma-separated quantiles used to build conc_max candidates during auto-tuning",
-    )
-    parser.add_argument(
-        "--tune-c1-values",
-        default="0.3,0.4,0.5,0.6,0.7",
-        help="Comma-separated c1 candidates during auto-tuning. c2 is set to (1-c1)",
-    )
-    parser.add_argument(
-        "--tune-target-low-clamp",
-        type=float,
-        default=0.025,
-        help="Target fraction of samples clamped at conc_eps during auto-tuning",
-    )
-    parser.add_argument(
-        "--tune-target-high-clamp",
-        type=float,
-        default=0.025,
-        help="Target fraction of samples capped at conc_max during auto-tuning",
-    )
-    parser.add_argument(
-        "--tune-min-spread",
-        type=float,
-        default=0.4,
-        help="Minimum desired transformed spread p99-p01 during auto-tuning",
-    )
-    parser.add_argument(
-        "--tune-json-out",
-        help="Optional JSON output path for the auto-tuned concentration parameters",
+        help="Generalized concentration transform JSON path (e.g. zero-inflated probit or log-zscore)",
     )
     parser.add_argument(
         "--exclude-clipped-boundary-samples",
@@ -614,20 +293,10 @@ def main():
         help="Tolerance used with --exclude-clipped-boundary-samples when testing clip boundaries",
     )
     args = parser.parse_args()
-
-    selected_transform_opts = sum(
-        1
-        for enabled in (
-            bool(args.transform_params_json),
-            bool(args.concentration_params_json),
-            bool(args.auto_tune_concentration),
-        )
-        if enabled
-    )
-    if selected_transform_opts > 1:
+    if not args.transform_params_json:
         raise SystemExit(
-            "Use only one of --transform-params-json/--log-transform-params-json, "
-            "--concentration-params-json, or --auto-tune-concentration"
+            "Missing --transform-params-json/--log-transform-params-json. "
+            "The deprecated piecewise concentration transform path has been removed."
         )
 
     files = sorted(glob.glob(args.glob))
@@ -652,51 +321,17 @@ def main():
             f"selected_files={len(files)}/{files_before_day_sampling}"
         )
 
-    concentration_params: dict[str, dict[str, float]] = {
-        var: dict(_DEFAULT_CONCENTRATION_PARAMS) for var in _CONCENTRATION_VARS
-    }
     concentration_transform_specs: dict[str, dict] = {}
-    concentration_params_source = "default"
     raw_transform_payload: dict | None = None
-    if args.transform_params_json:
-        raw_transform_payload, concentration_transform_specs = load_concentration_transform_json(
-            args.transform_params_json,
-            variables=_CONCENTRATION_VARS,
-        )
-        concentration_params_source = f"transform_json:{args.transform_params_json}"
-        print(
-            f"[transform] loaded generalized transform specs for "
-            f"{len(concentration_transform_specs)} variables from {args.transform_params_json}"
-        )
-    if args.concentration_params_json:
-        loaded = _load_concentration_params_json(args.concentration_params_json)
-        for var, params in loaded.items():
-            if var in _CONCENTRATION_VARS:
-                concentration_params[var].update(params)
-        concentration_params_source = f"json:{args.concentration_params_json}"
-        print(f"[transform] loaded params for {len(loaded)} variables from {args.concentration_params_json}")
-    elif args.auto_tune_concentration:
-        tuned = _auto_tune_concentration_params(
-            files,
-            max_files=args.tune_max_files,
-            samples_per_file_per_var=args.tune_samples_per_file_per_var,
-            seed=args.tune_seed,
-            eps_quantiles=_parse_float_list(args.tune_eps_quantiles),
-            max_quantiles=_parse_float_list(args.tune_max_quantiles),
-            c1_values=_parse_float_list(args.tune_c1_values),
-            target_low_clamp=args.tune_target_low_clamp,
-            target_high_clamp=args.tune_target_high_clamp,
-            min_spread=args.tune_min_spread,
-        )
-        for var, params in tuned.items():
-            concentration_params[var].update(params)
-        concentration_params_source = "auto_tuned"
-        if args.tune_json_out:
-            tune_path = Path(args.tune_json_out)
-            tune_path.parent.mkdir(parents=True, exist_ok=True)
-            with tune_path.open("w", encoding="utf-8") as f:
-                json.dump({"variables": tuned}, f, indent=2)
-            print(f"[tune] wrote tuned concentration params to {tune_path}")
+    raw_transform_payload, concentration_transform_specs = load_concentration_transform_json(
+        args.transform_params_json,
+        variables=CONCENTRATION_VARS,
+    )
+    concentration_transform_source = f"transform_json:{args.transform_params_json}"
+    print(
+        f"[transform] loaded generalized transform specs for "
+        f"{len(concentration_transform_specs)} variables from {args.transform_params_json}"
+    )
 
     first = None
     for file_path in files:
@@ -729,7 +364,6 @@ def main():
                 partial = _compute_partial_stats(
                     file_batch,
                     accum,
-                    concentration_params,
                     concentration_transform_specs,
                     exclude_clipped_boundary_samples=args.exclude_clipped_boundary_samples,
                     clip_boundary_tolerance=args.clip_boundary_tolerance,
@@ -750,7 +384,6 @@ def main():
                         _compute_partial_stats,
                         file_batch,
                         accum,
-                        concentration_params,
                         concentration_transform_specs,
                         args.exclude_clipped_boundary_samples,
                         args.clip_boundary_tolerance,
@@ -777,8 +410,7 @@ def main():
         std_ds = std_ds.assign_coords(level=level_coord)
 
     transform_metadata = {
-        "source": concentration_params_source,
-        "parameters": concentration_params,
+        "source": concentration_transform_source,
         "transform_specs_count": len(concentration_transform_specs),
         "exclude_clipped_boundary_samples": bool(args.exclude_clipped_boundary_samples),
         "clip_boundary_tolerance": float(args.clip_boundary_tolerance),
@@ -786,8 +418,8 @@ def main():
     transform_metadata_str = json.dumps(transform_metadata, sort_keys=True)
     mean_ds.attrs["concentration_transform_params_json"] = transform_metadata_str
     std_ds.attrs["concentration_transform_params_json"] = transform_metadata_str
-    mean_ds.attrs["concentration_transform_source"] = concentration_params_source
-    std_ds.attrs["concentration_transform_source"] = concentration_params_source
+    mean_ds.attrs["concentration_transform_source"] = concentration_transform_source
+    std_ds.attrs["concentration_transform_source"] = concentration_transform_source
     if raw_transform_payload is not None:
         raw_transform_str = json.dumps(raw_transform_payload, sort_keys=True)
         mean_ds.attrs["concentration_transform_spec_json"] = raw_transform_str
@@ -825,7 +457,7 @@ def main():
             mean_da = xr.DataArray(np.float32(mean))
             std_da = xr.DataArray(np.float32(std))
 
-        if var in _CONCENTRATION_VARS:
+        if var in CONCENTRATION_VARS:
             transform_spec = concentration_transform_specs.get(var)
             if transform_spec is not None:
                 for da in (mean_da, std_da):
@@ -837,19 +469,6 @@ def main():
                     elif str(transform_spec["transform_type"]) == "log_zscore":
                         da.attrs["concentration_transform_clip_min"] = float(transform_spec["clip_min"])
                         da.attrs["concentration_transform_clip_max"] = float(transform_spec["clip_max"])
-            else:
-                params = concentration_params.get(var, _DEFAULT_CONCENTRATION_PARAMS)
-                for da in (mean_da, std_da):
-                    da.attrs["concentration_transform_c1"] = float(params["c1"])
-                    da.attrs["concentration_transform_c2"] = float(params["c2"])
-                    da.attrs["concentration_transform_conc_eps"] = float(params["conc_eps"])
-                    da.attrs["concentration_transform_conc_max"] = float(params["conc_max"])
-                    clip_min = params.get("value_clip_min")
-                    clip_max = params.get("value_clip_max")
-                    if clip_min is not None:
-                        da.attrs["concentration_transform_clip_min"] = float(clip_min)
-                    if clip_max is not None:
-                        da.attrs["concentration_transform_clip_max"] = float(clip_max)
 
         mean_ds[var] = mean_da
         std_ds[var] = std_da

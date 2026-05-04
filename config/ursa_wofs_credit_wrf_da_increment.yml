@@ -37,6 +37,7 @@ data:
   #        --glob <cases_glob> --transform-params-json <stats_dir>/zero_inflated_transform_params.json ...
   #   3. Train with the same transform JSON path below.
   log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats/zero_inflated_transform_params.json'
+  concentration_normalization_mode: 'zscore'  # options: zscore | transform_only | scale_only
 
   concentration_level_ops:
     QRAIN:

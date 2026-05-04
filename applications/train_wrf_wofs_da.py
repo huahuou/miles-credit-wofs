@@ -39,6 +39,7 @@ from credit.samplers import DistributedFileLocalitySampler
 from credit.scheduler import annealed_probability
 from credit.seed import seed_everything
 from credit.trainers import load_trainer
+from credit.transforms.concentration import CONCENTRATION_VARS
 
 warnings.filterwarnings("ignore")
 
@@ -226,6 +227,28 @@ def _sync_prognostic_levels(conf: dict) -> int:
     return data_levels
 
 
+def _strip_deprecated_concentration_config(conf: dict) -> None:
+    data_conf = conf.get("data", {})
+    deprecated_path = data_conf.pop("concentration_params_json", None)
+    if deprecated_path:
+        logging.info(
+            "Ignoring deprecated data.concentration_params_json=%s during training; "
+            "using data.log_transform_params_json only.",
+            deprecated_path,
+        )
+
+
+def _validate_training_transform_config(conf: dict) -> None:
+    data_conf = conf["data"]
+    prognostic_concentration_vars = [var for var in data_conf.get("variables", []) if var in CONCENTRATION_VARS]
+    if prognostic_concentration_vars and not data_conf.get("log_transform_params_json"):
+        raise ValueError(
+            "Training with concentration prognostic variables requires data.log_transform_params_json. "
+            "The deprecated data.concentration_params_json path is no longer supported here. "
+            f"Missing log transform config for variables: {prognostic_concentration_vars}"
+        )
+
+
 def main(rank, world_size, conf, backend, trial=False):
     conf["save_loc"] = os.path.expandvars(conf["save_loc"])
     _sync_prognostic_levels(conf)
@@ -389,6 +412,8 @@ def primary_main():
         conf = yaml.load(cf, Loader=yaml.FullLoader)
 
     conf = credit_main_parser(conf, parse_training=True, parse_predict=False, print_summary=False)
+    _strip_deprecated_concentration_config(conf)
+    _validate_training_transform_config(conf)
     prog_levels = _sync_prognostic_levels(conf)
     logging.info("Using prognostic vertical levels: %s", prog_levels)
 

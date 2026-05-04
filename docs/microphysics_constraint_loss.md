@@ -186,47 +186,6 @@ N_r D_m^3$).
 **Caveat**: near-zero backgrounds $z_{Q,t0} \approx 0$ (clear air) will
 dominate.  Must gate by a background-magnitude mask.
 
----
-
-### Tier 2 — Physical-Space Constraints (Higher Fidelity)
-
-#### 5. Mean Diameter Bounds Penalty
-
-The most physically principled option.  Inverse-transform predictions to
-physical space, compute $D_m$, and penalize out-of-bounds values.
-
-Algorithm:
-
-1. Compute predicted physical state:
-   $$q_{r,1}^{\mathrm{pred}} = f^{-1}((z_{Q,t0} + \Delta\hat{z}_Q) \cdot \sigma_Q + \bar{f}_Q)$$
-   $$N_{r,1}^{\mathrm{pred}} = f^{-1}((z_{N,t0} + \Delta\hat{z}_N) \cdot \sigma_N + \bar{f}_N)$$
-2. Clamp to physical positivity: $q_r \leftarrow \max(q_r, 0)$, likewise $N_r$.
-3. Compute $D_m = \left(6\rho_\mathrm{air}q_r / (\pi\rho_w N_r)\right)^{1/3}$,
-   guarding division-by-zero with a small floor on $N_r$.
-4. Loss:
-   $$\mathcal{L}_{D_m} = \left\|\mathrm{ReLU}(D_{m,\min} - D_m)\right\|_2^2
-     + \left\|\mathrm{ReLU}(D_m - D_{m,\max})\right\|_2^2$$
-   masking clear-air grid points where $q_r < \varepsilon_{D_m}$.
-
-**Feasibility**: the inverse concentration transform's middle branch uses
-bisection (40 iterations) which is **not differentiable** through
-`numpy` but can be re-implemented with `torch` binary search (`torch.bucketize`
-or a fixed-iteration bisection in float32) to allow gradient flow.  This is
-non-trivial but the $f^{-1}$ regions outside the bisection segment have exact
-closed-form inverses and cover the majority of the range.
-
-An approximation: use only the log-branch of $f^{-1}$ (valid for $q_r <
-\varepsilon$ and $q_r > q_{\max}$), skip the bisection, accept ~5% error in the
-mid-range but gain full differentiability.
-
----
-
-#### 6. Joint-Zero Consistency
-
-If $q_{r,\mathrm{pred}} \leq \varepsilon_{q}$ then $N_{r,\mathrm{pred}}$
-should also be near zero, and vice versa.  This can be enforced as:
-
----
 
 ## Phase 2 — H-Operator Reflectivity Constraint (dBZ)
 
