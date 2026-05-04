@@ -145,6 +145,32 @@ class Trainer(BaseTrainer):
         # print(reg_loss.item(), occ_ce.item(), occ_aux_loss.item(), gate_mean.item())
         return total_loss, reg_loss, occ_ce, gate_mean
 
+    @staticmethod
+    def _format_progress_metrics(conf, results_dict, prefix):
+        progress_conf = conf.get("trainer", {}).get("progress_bar", {})
+        if not bool(progress_conf.get("enabled", False)):
+            return ""
+
+        raw_metrics = progress_conf.get("metrics", [])
+        if raw_metrics is None:
+            raw_metrics = []
+        missing_mode = str(progress_conf.get("missing", "hide")).lower().strip()
+
+        parts = []
+        for raw_name in raw_metrics:
+            name = str(raw_name)
+            key = name if name.startswith(f"{prefix}_") else f"{prefix}_{name}"
+            if key in results_dict and len(results_dict[key]) > 0:
+                value = np.mean(results_dict[key])
+            elif missing_mode == "nan":
+                value = np.nan
+            else:
+                continue
+            parts.append(f"{name}: {value:.6g}")
+        if not parts:
+            return ""
+        return " " + " ".join(parts)
+
     # Training function.
     def train_one_epoch(self, epoch, conf, trainloader, optimizer, criterion, scaler, scheduler, metrics):
         # training hyperparameters
@@ -346,6 +372,8 @@ class Trainer(BaseTrainer):
                 "microphysics_constraint_loss_weighted",
                 "refl_operator_constraint_loss",
                 "refl_operator_constraint_loss_weighted",
+                "physical_concentration_loss",
+                "physical_concentration_loss_weighted",
             ):
                 if aux_name in logs:
                     aux_tensor = torch.tensor([logs[aux_name]], device=self.device)
@@ -383,6 +411,7 @@ class Trainer(BaseTrainer):
             )
 
             to_print += " lr: {:.12f}".format(optimizer.param_groups[0]["lr"])
+            to_print += self._format_progress_metrics(conf, results_dict, "train")
             if self.rank == 0:
                 batch_group_generator.set_description(to_print)
 
@@ -547,6 +576,7 @@ class Trainer(BaseTrainer):
                     np.mean(results_dict["valid_acc"]),
                     np.mean(results_dict["valid_mae"]),
                 )
+                to_print += self._format_progress_metrics(conf, results_dict, "valid")
 
                 if self.rank == 0:
                     batch_group_generator.set_description(to_print)

@@ -9,6 +9,7 @@ from credit.losses.spectral import SpectralLoss2D
 from credit.losses.power import PSDLoss
 from credit.losses.microphysics_constraint import MicrophysicsConsistencyLoss
 from credit.losses.refl_operator_constraint import ReflOperatorConstraintLoss
+from credit.losses.physical_concentration_loss import PhysicalConcentrationIncrementLoss
 
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,18 @@ class VariableTotalLoss2D(torch.nn.Module):
             self.refl_constraint = ReflOperatorConstraintLoss(conf)
         # ------------------------------------------------------------- #
 
+        # ------------------------------------------------------------- #
+        # Physical-space concentration increment loss
+        self.use_physical_concentration_loss = (
+            not validation and bool(conf["loss"].get("use_physical_concentration_loss", False))
+        )
+        if self.use_physical_concentration_loss:
+            self.physical_concentration_loss_weight = float(
+                conf["loss"].get("physical_concentration_loss_weight", 0.005)
+            )
+            self.physical_concentration_loss = PhysicalConcentrationIncrementLoss(conf)
+        # ------------------------------------------------------------- #
+
         self._last_aux_losses = {}
 
         self.validation = validation
@@ -339,6 +352,15 @@ class VariableTotalLoss2D(torch.nn.Module):
             )
             loss += self.refl_constraint_weight * refl_loss
 
+        if self.use_physical_concentration_loss:
+            with torch.autocast(device_type=pred.device.type, enabled=False):
+                physical_loss = self.physical_concentration_loss(pred.float(), target.float())
+            self._last_aux_losses["physical_concentration_loss"] = physical_loss.detach()
+            self._last_aux_losses["physical_concentration_loss_weighted"] = (
+                self.physical_concentration_loss_weight * physical_loss.detach()
+            )
+            loss += self.physical_concentration_loss_weight * physical_loss
+
         return loss
 
     def get_last_aux_losses(self):
@@ -346,7 +368,7 @@ class VariableTotalLoss2D(torch.nn.Module):
 
     # Optional: allow trainer to provide batch context needed by reflectivity constraint
     def set_batch_context(self, step_batch: dict):
-        if not self.use_refl_operator_constraint:
+        if not self.use_refl_operator_constraint and not self.use_physical_concentration_loss:
             return
         try:
             # step_batch["x"]: (B, time=1, var, level, H, W) — we need t0 background for prognostic vars
@@ -362,7 +384,10 @@ class VariableTotalLoss2D(torch.nn.Module):
             if xb is not None:
                 innov_norm = xb[:, 0, 0]  # (B, L, H, W)
 
-            self.refl_constraint.set_batch_context(z0_norm=z0, forcing_static=forcing_static, boundary_innov_norm=innov_norm)
+            if self.use_refl_operator_constraint:
+                self.refl_constraint.set_batch_context(z0_norm=z0, forcing_static=forcing_static, boundary_innov_norm=innov_norm)
+            if self.use_physical_concentration_loss:
+                self.physical_concentration_loss.set_batch_context(z0_norm=z0)
         except Exception:
             # Swallow errors; constraint forward will safely return 0 without context
             pass

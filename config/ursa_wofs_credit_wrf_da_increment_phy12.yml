@@ -160,6 +160,15 @@ trainer:
   weight_decay: 1.0e-5
   amp: True
   residual_prediction: False   # output IS the increment — no residual skip needed
+  progress_bar:
+    enabled: true
+    missing: nan  # options: hide | nan
+    metrics:
+      - physical_concentration_loss_weighted
+      - refl_operator_constraint_loss_weighted
+      - microphysics_constraint_loss_weighted
+      - reg_loss
+      - occ_ce
   epochs: &epochs 100
   start_epoch: 0
   load_weights: False
@@ -228,6 +237,56 @@ loss:
     threshold_dbz: 0.5        # mask magnitudes below this (clear-air noise gate)
     threshold_norm: 0.05       # mask for normalized mode (unused when compare_space=dbz)
     include_species: [rain, snow, graupel, hail]
+
+  # Physical-space concentration increment loss.
+  # Compares inverse(z0 + predicted_delta_z) - inverse(z0) against
+  # inverse(z0 + target_delta_z) - inverse(z0), with hydrometeor-region masking.
+  use_physical_concentration_loss: true
+  physical_concentration_loss_weight: 1.0e-7
+  physical_concentration_loss:
+    variables: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
+    huber_weight: 1.0
+    log_ratio_weight_mass: 0.2
+    log_ratio_weight_qn: 1.0
+    ratio_threshold: 2.0
+    ratio_penalty_weight: 2.0
+    ratio_power: 2.0
+    max_log_ratio: 3.0
+    max_ratio_weight: 25.0
+    max_scaled_error: 50.0
+    positive_mass_underprediction_weight: 0.1
+    huber_beta: 1.0
+    mask_min: 1.0e-12
+    increment_min: 1.0e-12
+    eps_mass: 1.0e-12
+    eps_qn: 1.0e-6
+    threshold_by_var:
+      QRAIN: 1.0e-12
+      QHAIL: 1.0e-12
+      QGRAUP: 1.0e-12
+      QSNOW: 1.0e-12
+      QNRAIN: 1.0e-6
+      QNHAIL: 1.0e-6
+      QNGRAUPEL: 1.0e-6
+      QNSNOW: 1.0e-6
+    increment_threshold_by_var:
+      QRAIN: 1.0e-12
+      QHAIL: 1.0e-12
+      QGRAUP: 1.0e-12
+      QSNOW: 1.0e-12
+      QNRAIN: 1.0e-6
+      QNHAIL: 1.0e-6
+      QNGRAUPEL: 1.0e-6
+      QNSNOW: 1.0e-6
+    scale_by_var:
+      QRAIN: 1.0e-9
+      QHAIL: 1.0e-9
+      QGRAUP: 1.0e-9
+      QSNOW: 1.0e-9
+      QNRAIN: 1.0e3
+      QNHAIL: 1.0e3
+      QNGRAUPEL: 1.0e3
+      QNSNOW: 1.0e3
 
   variable_weights:
     QRAIN: [2.412559, 2.412284, 2.555078, 2.584206, 2.243196, 2.068756, 1.623277, 0.830359, 0.169828, 0.057489, 0.056585, 0.055757, 0.055588, 0.055945, 0.055397, 0.056074, 0.056151]
