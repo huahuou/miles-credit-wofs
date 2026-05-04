@@ -23,7 +23,7 @@
 #SBATCH --gpus-per-node=h100:2                # 2 H100 GPUs per node
 #SBATCH --cpus-per-task=192                    # CPU cores per task (for data loading workers)
 #SBATCH --mem=0                               # Use all available memory on the node
-#SBATCH --time=02:59:00                       # Wall time limit
+#SBATCH --time=01:29:00                       # Wall time limit
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out                   # stdout: <job-name>-<job-id>.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err                     # stderr: <job-name>-<job-id>.err
 #SBATCH --exclusive                           # Exclusive node access for best GPU performance
@@ -37,9 +37,9 @@ TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
 CONDA_ENV="credit-wofs"                       # Name or path of your conda environment
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
-CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0502/model.yml"
+CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0502_mreflconstraint/model.yml"
 EVAL_SCRIPT="applications/eval_wrf_wofs_da_trainer_like.py"   # Evaluation script
-SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_wofs_da_example/wofs_da_increment_experiment_0502/test1/eval_physical.zarr"                              # Path for physical-space Zarr store.
+SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_wofs_da_example/wofs_da_increment_experiment_0503_all_loss/test1/eval_physical.zarr"                              # Path for physical-space Zarr store.
                                               # Leave empty to auto-derive from eval.save_zarr_path
                                               # (appends _physical.zarr suffix). Example:
                                               # SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423/eval_physical.zarr"
