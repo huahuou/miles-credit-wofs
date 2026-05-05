@@ -32,6 +32,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from credit.boundary_padding import TensorPadding
 from credit.models.base_model import BaseModel
@@ -146,15 +147,15 @@ class VerticalLevelEmbedder(nn.Module):
                 x_lev = x[:, lev_start:lev_start + self.frames]     # (B, F, H, W)
                 proj = self.projectors[key](x_lev)                   # (B, D, H, W)
                 # Add level positional encoding (broadcast over spatial dims)
-                proj = proj + level_encs[lev].view(1, -1, 1, 1)
-                gate = torch.sigmoid(self.gate_logits[key])          # scalar
+                proj = proj + level_encs[lev].to(dtype=proj.dtype).view(1, -1, 1, 1)
+                gate = torch.sigmoid(self.gate_logits[key]).to(dtype=proj.dtype)  # scalar
                 out = gate * proj if out is None else out + gate * proj
 
         # ── 2-D variables (surface, dyn_forcing, forcing, static) ─────────
         for name, start_ch in self.surface_spec:
             x_var = x[:, start_ch:start_ch + self.frames]            # (B, F, H, W)
             proj = self.projectors[name](x_var)                      # (B, D, H, W)
-            gate = torch.sigmoid(self.gate_logits[name])
+            gate = torch.sigmoid(self.gate_logits[name]).to(dtype=proj.dtype)
             out = gate * proj if out is None else out + gate * proj
 
         if out is None:
@@ -222,6 +223,7 @@ class AuroraCrossFormerWRF(BaseModel):
     varname_forcing     (list[str]): 2-D static forcing (input-only).
     varname_static      (list[str]): 2-D static fields (input-only).
     varname_diagnostic  (list[str]): 2-D diagnostic / output-only variables.
+    varname_input_upper_air (list[str]): optional input-only 3-D context variables.
     varname_boundary_upper   (list[str]): boundary 3-D variables.
     varname_boundary_surface (list[str]): boundary 2-D variables.
     levels              (int):  vertical levels for interior upper-air vars.
@@ -248,6 +250,7 @@ class AuroraCrossFormerWRF(BaseModel):
         varname_diagnostic: List[str],
         varname_boundary_upper: List[str],
         varname_boundary_surface: List[str],
+        varname_input_upper_air: Optional[List[str]] = None,
         levels: int = 17,
         boundary_levels: int = 17,
         frames: int = 1,
@@ -267,6 +270,7 @@ class AuroraCrossFormerWRF(BaseModel):
         noise_injection: Optional[dict] = None,
         padding_conf: Optional[dict] = None,
         post_conf: Optional[dict] = None,
+        checkpoint_variable_embedder: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -288,6 +292,7 @@ class AuroraCrossFormerWRF(BaseModel):
         self.frames = frames
         self.local_window_size = local_window_size
         self.num_stages = len(dim)
+        self.checkpoint_variable_embedder = bool(checkpoint_variable_embedder)
 
         # ── save variable lists ────────────────────────────────────────────
         self.varname_upper_air = list(varname_upper_air)
@@ -296,16 +301,21 @@ class AuroraCrossFormerWRF(BaseModel):
         self.varname_forcing = list(varname_forcing)
         self.varname_static = list(varname_static)
         self.varname_diagnostic = list(varname_diagnostic)
+        self.varname_input_upper_air = list(varname_input_upper_air or [])
 
         # ── interior VerticalLevelEmbedder specs ───────────────────────────
         # Channel order in flat x delivered by the trainer:
-        #   upper_air × (levels × frames), surface × frames,
+        #   upper_air × (levels × frames), input_upper_air × (levels × frames),
+        #   surface × frames,
         #   dyn_forcing × frames, forcing × frames, static × frames
         int_upper_spec: List[Tuple[str, int]] = []
         int_surf_spec: List[Tuple[str, int]] = []
         cursor = 0
 
         for name in varname_upper_air:
+            int_upper_spec.append((name, cursor))
+            cursor += levels * frames
+        for name in self.varname_input_upper_air:
             int_upper_spec.append((name, cursor))
             cursor += levels * frames
         for name in varname_surface:
@@ -514,8 +524,12 @@ class AuroraCrossFormerWRF(BaseModel):
             xb_2d = x_boundary.reshape(Bb, Cb * Tb, Hb, Wb)
 
         # ── Aurora-style per-(var,level) variable token embedding ─────────
-        x_emb = self.interior_embedder(x_2d)    # (B, embed_dim, H, W)
-        xb_emb = self.boundary_embedder(xb_2d)  # (B, boundary_embed_dim, H, W)
+        if self.training and self.checkpoint_variable_embedder and torch.is_grad_enabled():
+            x_emb = checkpoint(self.interior_embedder, x_2d, use_reentrant=False)
+            xb_emb = checkpoint(self.boundary_embedder, xb_2d, use_reentrant=False)
+        else:
+            x_emb = self.interior_embedder(x_2d)    # (B, embed_dim, H, W)
+            xb_emb = self.boundary_embedder(xb_2d)  # (B, boundary_embed_dim, H, W)
 
         # ── Enhanced FiLM: 4-quadrant + global boundary pool ─────────────
         # 4-quadrant spatial pooling using avg_pool2d (deterministic on CUDA).

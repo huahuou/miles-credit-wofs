@@ -24,13 +24,13 @@
 #SBATCH --gpus-per-node=h100:2                # 2 H100 GPUs per node
 #SBATCH --cpus-per-task=192                    # CPU cores per task (for data loading workers)
 #SBATCH --mem=0                               # Use all available memory on the node
-#SBATCH --time=18:20:00                       # Wall time limit
+#SBATCH --time=2-00:30:00                       # Wall time limit
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out                   # stdout: <job-name>-<job-id>.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err                     # stderr: <job-name>-<job-id>.err
 #SBATCH --exclusive                           # Exclusive node access for best GPU performance
 
 #----- User Configuration (EDIT THESE) -----------------------------------------
-NUM_NODES=$SLURM_JOB_NUM_NODES               # Automatically set from Slurm allocation
+NUM_NODES=${SLURM_JOB_NUM_NODES:-1}          # Automatically set from Slurm allocation
 GPUS_PER_NODE=2                               # H100 nodes have 2 GPUs each
 AUTO_DETECT_NPROC_PER_NODE=1                  # 1: use visible GPU count, 0: use GPUS_PER_NODE
 NPROC_PER_NODE_OVERRIDE=""                    # Optional explicit override, e.g. "2"
@@ -38,10 +38,39 @@ TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
 CONDA_ENV="credit-wofs"                       # Name or path of your conda environment
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
-CONFIG="${PROJECT_DIR}/config/ursa_wofs_credit_wrf_da_increment_phy12.yml"
+CONFIG_DETER="${CONFIG_DETER:-${PROJECT_DIR}/config/ursa_wofs_credit_wrf_da_increment_aurora_deter.yml}"
+CONFIG_ENSEMBLE="${CONFIG_ENSEMBLE:-${PROJECT_DIR}/config/ursa_wofs_credit_wrf_da_increment_aurora_ens.yml}"
 ### CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0429_nophy2/model.yml"
-TRAINING_SCRIPT="applications/train_wrf_wofs_da.py"   # Multi-step WoFS trainer
-# For single-step training, use: TRAINING_SCRIPT="applications/train_wrf_wofs.py"
+
+# DA_TRAIN_MODE controls which entrypoint runs with the same config:
+#   deterministic -> applications/train_wrf_wofs_da.py
+#   ensemble      -> applications/train_wrf_wofs_da_ensemble.py
+DA_TRAIN_MODE="${DA_TRAIN_MODE:-ensemble}"
+DRY_RUN="${DRY_RUN:-0}"
+case "${DA_TRAIN_MODE}" in
+    deterministic)
+        TRAINING_SCRIPT="applications/train_wrf_wofs_da.py"
+        CONFIG="${CONFIG:-${CONFIG_DETER}}"
+        ;;
+    ensemble)
+        TRAINING_SCRIPT="applications/train_wrf_wofs_da_ensemble.py"
+        CONFIG="${CONFIG:-${CONFIG_ENSEMBLE}}"
+        ;;
+    *)
+        echo "Unsupported DA_TRAIN_MODE=${DA_TRAIN_MODE}. Use deterministic or ensemble."
+        exit 1
+        ;;
+esac
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "DRY_RUN=1"
+    echo "CONFIG=${CONFIG}"
+    echo "DA_TRAIN_MODE=${DA_TRAIN_MODE}"
+    echo "TRAINING_SCRIPT=${TRAINING_SCRIPT}"
+    echo "CONDA_ENV=${CONDA_ENV}"
+    echo "PROJECT_DIR=${PROJECT_DIR}"
+    exit 0
+fi
 
 #----- Load Modules ------------------------------------------------------------
 # Source the module system so module commands work inside batch scripts
@@ -122,6 +151,7 @@ echo "HEAD_NODE         = ${head_node}"
 echo "HEAD_NODE_IP      = ${head_node_ip}"
 echo "MASTER_PORT       = ${MASTER_PORT}"
 echo "CONFIG            = ${CONFIG}"
+echo "DA_TRAIN_MODE     = ${DA_TRAIN_MODE}"
 echo "TRAINING_SCRIPT   = ${TRAINING_SCRIPT}"
 echo "CONDA_ENV         = ${CONDA_ENV}"
 echo "CUDA_VISIBLE_DEVICES = ${CUDA_VISIBLE_DEVICES}"

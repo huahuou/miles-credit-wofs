@@ -22,6 +22,7 @@ from credit.models.swin_wrf import WRFTransformer
 from credit.models.dscale_wrf import DscaleTransformer
 from credit.models.wxformer.crossformer_wrf_ensemble import CrossFormerWRFEnsemble
 from credit.models.wxformer.aurora_crossformer_wrf import AuroraCrossFormerWRF
+from credit.models.wxformer.aurora_crossformer_wrf_da import AuroraCrossFormerWRFDA
 from credit.models.wofs_mae import WoFSMultiModalMAE
 
 
@@ -67,6 +68,10 @@ model_types = {
     "aurora_crossformer_wrf": (
         AuroraCrossFormerWRF,
         "Loading AuroraCrossFormerWRF – Aurora per-(var,level) embedder + CrossFormer UNet backbone",
+    ),
+    "aurora_crossformer_wrf_da": (
+        AuroraCrossFormerWRFDA,
+        "Loading AuroraCrossFormerWRFDA – role-aware DA profile embedder + CrossFormer UNet backbone",
     ),
     "dscale": (DscaleTransformer, "Loading downscaling Transformer"),
     "crossformer_downscaling": (

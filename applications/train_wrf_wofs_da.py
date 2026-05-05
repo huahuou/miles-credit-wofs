@@ -249,9 +249,31 @@ def _validate_training_transform_config(conf: dict) -> None:
         )
 
 
+def _configure_aurora_da_model(conf: dict) -> None:
+    model_conf = conf.get("model", {})
+    if model_conf.get("type") not in {"aurora_crossformer_wrf", "aurora_crossformer_wrf_da"}:
+        return
+
+    data_conf = conf["data"]
+    boundary_conf = data_conf["boundary"]
+    model_conf.setdefault("varname_upper_air", list(data_conf.get("variables", [])))
+    model_conf.setdefault("varname_input_upper_air", list(data_conf.get("context_upper_air_variables", [])))
+    model_conf.setdefault("varname_surface", list(data_conf.get("surface_variables", [])))
+    model_conf.setdefault("varname_dyn_forcing", list(data_conf.get("dynamic_forcing_variables", [])))
+    model_conf.setdefault("varname_forcing", list(data_conf.get("forcing_variables", [])))
+    model_conf.setdefault("varname_static", list(data_conf.get("static_variables", [])))
+    model_conf.setdefault("varname_diagnostic", list(data_conf.get("diagnostic_variables", [])))
+    model_conf.setdefault("varname_boundary_upper", list(boundary_conf.get("variables", data_conf.get("observation_variables", []))))
+    model_conf.setdefault("varname_boundary_surface", list(boundary_conf.get("surface_variables", [])))
+    model_conf.setdefault("levels", int(data_conf.get("prognostic_levels", data_conf.get("levels", model_conf.get("levels", 17)))))
+    model_conf.setdefault("boundary_levels", int(boundary_conf.get("levels", data_conf.get("levels", model_conf.get("boundary_levels", 17)))))
+    model_conf.setdefault("frames", int(data_conf.get("history_len", model_conf.get("frames", 1))))
+
+
 def main(rank, world_size, conf, backend, trial=False):
     conf["save_loc"] = os.path.expandvars(conf["save_loc"])
     _sync_prognostic_levels(conf)
+    _configure_aurora_da_model(conf)
     distributed = conf["trainer"]["mode"] in ["fsdp", "ddp"]
 
     try:
@@ -415,6 +437,7 @@ def primary_main():
     _strip_deprecated_concentration_config(conf)
     _validate_training_transform_config(conf)
     prog_levels = _sync_prognostic_levels(conf)
+    _configure_aurora_da_model(conf)
     logging.info("Using prognostic vertical levels: %s", prog_levels)
 
     save_loc = os.path.expandvars(conf["save_loc"])

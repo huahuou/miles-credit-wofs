@@ -23,6 +23,7 @@ from credit.models import load_model
 from credit.parser import credit_main_parser
 from credit.seed import seed_everything
 from credit.transforms.concentration import CONCENTRATION_VARS
+from train_wrf_wofs_da import _configure_aurora_da_model
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,26 @@ def _sample_to_model_inputs(batch: dict, device: torch.device) -> tuple[torch.Te
     x_time_encode = batch["x_time_encode"].to(device, non_blocking=True)
     y_true = reshape_only(batch["y"]).to(device, non_blocking=True)
     return x, x_boundary, x_time_encode, y_true
+
+
+def _repeat_for_ensemble(tensor: torch.Tensor, ensemble_size: int) -> torch.Tensor:
+    if ensemble_size <= 1:
+        return tensor
+    return torch.repeat_interleave(tensor, ensemble_size, dim=0)
+
+
+def _ensemble_mean(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    if y_pred.shape[0] == y_true.shape[0] or y_pred.shape[0] % y_true.shape[0] != 0:
+        return y_pred
+    ensemble_size = y_pred.shape[0] // y_true.shape[0]
+    return y_pred.view(y_true.shape[0], ensemble_size, *y_pred.shape[1:]).mean(dim=1)
+
+
+def _ensemble_members(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor | None:
+    if y_pred.shape[0] == y_true.shape[0] or y_pred.shape[0] % y_true.shape[0] != 0:
+        return None
+    ensemble_size = y_pred.shape[0] // y_true.shape[0]
+    return y_pred.view(y_true.shape[0], ensemble_size, *y_pred.shape[1:])
 
 
 def _apply_residual_prediction(
@@ -283,6 +304,7 @@ def _build_batch_dataset_for_zarr(
     x_boundaries: np.ndarray,
     y_trues: np.ndarray,
     y_preds: np.ndarray,
+    y_pred_members: np.ndarray | None,
     sample_indices: list[int],
     case_names: list[str],
     case_paths: list[str],
@@ -302,8 +324,7 @@ def _build_batch_dataset_for_zarr(
     if y_trues.shape[1] != len(output_channels):
         output_channels = [f"output_ch_{i}" for i in range(y_trues.shape[1])]
 
-    ds = xr.Dataset(
-        data_vars={
+    data_vars = {
             "x_input": (["sample", "input_channel", "time", "y", "x"], x_inputs.astype(np.float32)),
             "x_boundary": (["sample", "boundary_channel", "time", "y", "x"], x_boundaries.astype(np.float32)),
             "y_true": (["sample", "output_channel", "time", "y", "x"], y_trues.astype(np.float32)),
@@ -315,8 +336,8 @@ def _build_batch_dataset_for_zarr(
             "case_name": (["sample"], _fixed_bytes(case_names, 128)),
             "case_path": (["sample"], _fixed_bytes(case_paths, 512)),
             "global_index": (["sample"], np.array(sample_indices, dtype=np.int64)),
-        },
-        coords={
+    }
+    coords = {
             "sample": np.arange(sample_offset, sample_offset + n_samples, dtype=np.int64),
             "time": np.arange(n_time, dtype=np.int64),
             "y": np.arange(n_y, dtype=np.int64),
@@ -325,7 +346,17 @@ def _build_batch_dataset_for_zarr(
             "boundary_channel": np.array(boundary_channels, dtype=str),
             "output_channel": np.array(output_channels, dtype=str),
             "valid_time": (["sample"], np.array(valid_times, dtype="datetime64[ns]")),
-        },
+    }
+    if y_pred_members is not None:
+        data_vars["y_pred_members"] = (
+            ["sample", "ensemble_member", "output_channel", "time", "y", "x"],
+            y_pred_members.astype(np.float32),
+        )
+        coords["ensemble_member"] = np.arange(y_pred_members.shape[1], dtype=np.int64)
+
+    ds = xr.Dataset(
+        data_vars=data_vars,
+        coords=coords,
     )
 
     ds.attrs["description"] = "Trainer-like WoFS DA test samples with input, innovation boundary, target increment, and prediction"
@@ -393,6 +424,8 @@ def _append_batch_to_zarr(store_path: str, ds_batch: xr.Dataset, is_first_batch:
         encoding["y_true"] = {"chunks": (1, sz["output_channel"]) + spatial_chunk[1:]}
     if "y_pred" in ds_batch:
         encoding["y_pred"] = {"chunks": (1, sz["output_channel"]) + spatial_chunk[1:]}
+    if "y_pred_members" in ds_batch:
+        encoding["y_pred_members"] = {"chunks": (1, 1, sz["output_channel"]) + spatial_chunk[1:]}
     if "y_true_phys" in ds_batch:
         encoding["y_true_phys"] = {"chunks": (1, sz["output_channel"]) + spatial_chunk[1:]}
     if "y_pred_phys" in ds_batch:
@@ -437,6 +470,22 @@ def main() -> None:
         help="Output physical-space Zarr store path (overrides eval.save_physical_zarr_path). "
              "Defaults to <save-inference path with _physical suffix>.",
     )
+    parser.add_argument(
+        "--ensemble-size",
+        type=int,
+        default=None,
+        help="Evaluate this many stochastic ensemble members. Defaults to eval.ensemble_size, predict.ensemble_size, then trainer.ensemble_size.",
+    )
+    parser.add_argument(
+        "--save-ensemble-members",
+        action="store_true",
+        help="Store normalized y_pred_members with an ensemble_member dimension in the inference Zarr.",
+    )
+    parser.add_argument(
+        "--mean-only",
+        action="store_true",
+        help="Do not store ensemble members even when ensemble_size > 1.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -448,6 +497,7 @@ def main() -> None:
     _strip_deprecated_concentration_config(conf)
     _validate_eval_transform_config(conf)
     _sync_prognostic_levels(conf)
+    _configure_aurora_da_model(conf)
     eval_conf = conf.get("eval", {}) if isinstance(conf.get("eval", {}), dict) else {}
     predict_conf = conf.get("predict", {}) if isinstance(conf.get("predict", {}), dict) else {}
 
@@ -573,6 +623,17 @@ def main() -> None:
     residual_prediction = bool(conf["trainer"].get("residual_prediction", False))
     varnum_diag = len(conf["data"].get("diagnostic_variables", []))
     n_prog_channels = len(conf["data"]["variables"]) * int(conf["model"]["param_interior"]["levels"])
+    ensemble_size = (
+        int(args.ensemble_size)
+        if args.ensemble_size is not None
+        else int(eval_conf.get("ensemble_size", predict_conf.get("ensemble_size", conf["trainer"].get("ensemble_size", 1))))
+    )
+    if ensemble_size < 1:
+        raise ValueError("ensemble_size must be >= 1")
+    save_ensemble_members = bool(args.save_ensemble_members or eval_conf.get("save_ensemble_members", False))
+    if args.mean_only:
+        save_ensemble_members = False
+    logger.info("Evaluation ensemble_size=%d save_ensemble_members=%s", ensemble_size, save_ensemble_members)
 
     save_netcdf_enabled = bool(eval_conf.get("save_netcdf", True))
     overwrite_samples_store = bool(eval_conf.get("overwrite_samples_store", True))
@@ -629,15 +690,26 @@ def main() -> None:
 
                 t0 = time.monotonic()
                 x, x_boundary, x_time_encode, y_true = _sample_to_model_inputs(batch, device)
-                y_pred = model(x.float(), x_boundary.float(), x_time_encode.float())
-                y_pred = _apply_residual_prediction(y_pred, x, residual_prediction, varnum_diag)
+                x_model = _repeat_for_ensemble(x, ensemble_size)
+                x_boundary_model = _repeat_for_ensemble(x_boundary, ensemble_size)
+                x_time_encode_model = _repeat_for_ensemble(x_time_encode, ensemble_size)
+                y_pred = model(
+                    x_model.float(),
+                    x_boundary_model.float(),
+                    x_time_encode_model.float(),
+                    ensemble_size=ensemble_size,
+                )
+                y_pred = _apply_residual_prediction(y_pred, x_model, residual_prediction, varnum_diag)
+                y_pred_mean = _ensemble_mean(y_pred, y_true)
+                y_pred_members = _ensemble_members(y_pred, y_true) if save_ensemble_members else None
                 logger.info("  model inference done in %.2fs", time.monotonic() - t0)
 
                 t0 = time.monotonic()
                 x_np = x.detach().cpu().numpy()
                 x_boundary_np = x_boundary.detach().cpu().numpy()
                 y_true_np = y_true.detach().cpu().numpy()
-                y_pred_np = y_pred.detach().cpu().numpy()
+                y_pred_np = y_pred_mean.detach().cpu().numpy()
+                y_pred_members_np = y_pred_members.detach().cpu().numpy() if y_pred_members is not None else None
                 logger.info("  GPU->CPU transfer done in %.2fs", time.monotonic() - t0)
 
                 index_values = batch["index"].detach().cpu().numpy().astype(np.int64).tolist()
@@ -655,6 +727,8 @@ def main() -> None:
                     x_boundary_np = x_boundary_np[:take_n]
                     y_true_np = y_true_np[:take_n]
                     y_pred_np = y_pred_np[:take_n]
+                    if y_pred_members_np is not None:
+                        y_pred_members_np = y_pred_members_np[:take_n]
                     index_values = index_values[:take_n]
 
                 batch_case_names: list[str] = []
@@ -665,7 +739,7 @@ def main() -> None:
                 for local_idx, global_index in enumerate(index_values):
                     case_name, case_path, valid_time = _collect_sample_metadata(dataset, int(global_index))
 
-                    sample_y_pred = y_pred[local_idx : local_idx + 1]
+                    sample_y_pred = y_pred_mean[local_idx : local_idx + 1]
                     sample_y_true = y_true[local_idx : local_idx + 1]
                     sample_metrics = metrics(sample_y_pred.float(), sample_y_true.float(), forecast_datetime=1)
 
@@ -701,6 +775,7 @@ def main() -> None:
                         x_boundaries=x_boundary_np,
                         y_trues=y_true_np,
                         y_preds=y_pred_np,
+                        y_pred_members=y_pred_members_np,
                         sample_indices=[int(i) for i in index_values],
                         case_names=batch_case_names,
                         case_paths=batch_case_paths,

@@ -23,6 +23,25 @@ from credit.trainers.base_trainer import BaseTrainer
 logger = logging.getLogger(__name__)
 
 
+def _repeat_for_ensemble(tensor, ensemble_size):
+    if ensemble_size <= 1:
+        return tensor
+    return torch.repeat_interleave(tensor, ensemble_size, dim=0)
+
+
+def _ensemble_mean(pred, target):
+    if pred.shape[0] == target.shape[0] or pred.shape[0] % target.shape[0] != 0:
+        return pred
+    ensemble_size = pred.shape[0] // target.shape[0]
+    return pred.view(target.shape[0], ensemble_size, *pred.shape[1:]).mean(dim=1)
+
+
+def _scalar_item(value):
+    if torch.is_tensor(value):
+        return value.mean().item()
+    return float(value)
+
+
 class Trainer(BaseTrainer):
     def __init__(self, model: torch.nn.Module, rank: int):
         super().__init__(model, rank)
@@ -58,6 +77,7 @@ class Trainer(BaseTrainer):
     def _compute_loss_with_occupancy(self, conf, batch, y, y_pred, criterion, varnum_diag):
         occ_conf = conf.get("loss", {}).get("occupancy", {})
         occ_enabled = bool(occ_conf.get("enabled", False))
+        y_pred_occ = _ensemble_mean(y_pred, y)
 
         reg_loss = criterion(y, y_pred)
         occ_ce = None
@@ -70,7 +90,7 @@ class Trainer(BaseTrainer):
         if not all(key in batch for key in required_keys):
             return reg_loss, reg_loss, occ_ce, gate_mean
 
-        num_prog = y_pred.shape[1] - varnum_diag
+        num_prog = y_pred_occ.shape[1] - varnum_diag
         if num_prog <= 0:
             return reg_loss, reg_loss, occ_ce, gate_mean
 
@@ -81,20 +101,20 @@ class Trainer(BaseTrainer):
         masked_mode = str(occ_conf.get("masked_regression_mode", "soft")).lower().strip()
         reg_mask_min = float(occ_conf.get("reg_mask_min", 0.05))
 
-        y_prog_pred = y_pred[:, :num_prog, ...]
-        y_occ = reshape_only(batch["y_occupancy"]).to(self.device, dtype=y_pred.dtype, non_blocking=True)
+        y_prog_pred = y_pred_occ[:, :num_prog, ...]
+        y_occ = reshape_only(batch["y_occupancy"]).to(self.device, dtype=y_pred_occ.dtype, non_blocking=True)
         delta_thr_norm = reshape_only(batch["y_occ_delta_threshold_norm"]).to(
-            self.device, dtype=y_pred.dtype, non_blocking=True
+            self.device, dtype=y_pred_occ.dtype, non_blocking=True
         )
 
         occ_logits = (torch.abs(y_prog_pred) - delta_thr_norm) / tau
-        occ_channel_mask = self._occupancy_channel_mask(conf, num_prog, y_pred.dtype)
+        occ_channel_mask = self._occupancy_channel_mask(conf, num_prog, y_pred_occ.dtype)
         occ_weight = occ_channel_mask.expand_as(occ_logits)
 
         pos_weight = occ_conf.get("pos_weight", None)
         pos_weight_tensor = None
         if pos_weight is not None:
-            pos_weight_tensor = torch.tensor(float(pos_weight), device=self.device, dtype=y_pred.dtype)
+            pos_weight_tensor = torch.tensor(float(pos_weight), device=self.device, dtype=y_pred_occ.dtype)
 
         occ_loss_map = F.binary_cross_entropy_with_logits(
             occ_logits,
@@ -125,16 +145,16 @@ class Trainer(BaseTrainer):
         if use_masked_reg:
             if masked_mode == "hard" and "y_regression_mask_hard" in batch:
                 reg_mask_prog = reshape_only(batch["y_regression_mask_hard"]).to(
-                    self.device, dtype=y_pred.dtype, non_blocking=True
+                    self.device, dtype=y_pred_occ.dtype, non_blocking=True
                 )
             else:
-                reg_floor = torch.tensor(reg_mask_min, device=self.device, dtype=y_pred.dtype)
+                reg_floor = torch.tensor(reg_mask_min, device=self.device, dtype=y_pred_occ.dtype)
                 reg_mask_prog = torch.maximum(torch.sigmoid(occ_logits).detach(), reg_floor)
 
             # Channels not selected for occupancy keep full regression supervision.
             reg_mask_prog = reg_mask_prog * occ_channel_mask + (1.0 - occ_channel_mask)
 
-            full_reg_mask = torch.ones_like(y_pred)
+            full_reg_mask = torch.ones_like(y_pred_occ)
             full_reg_mask[:, :num_prog, ...] = reg_mask_prog
             reg_loss = criterion(y, y_pred, mask=full_reg_mask)
         else:
@@ -180,6 +200,7 @@ class Trainer(BaseTrainer):
         forecast_len = conf["data"]["forecast_len"]
         amp = conf["trainer"]["amp"]
         distributed = True if conf["trainer"]["mode"] in ["fsdp", "ddp"] else False
+        ensemble_size = int(conf["trainer"].get("ensemble_size", 1))
         residual_prediction = conf["trainer"].get("residual_prediction", False)
         retain_graph = conf["data"].get("retain_graph", False)
         varnum_diag = len(conf["data"]["diagnostic_variables"])
@@ -232,12 +253,14 @@ class Trainer(BaseTrainer):
                 else:
                     # no x_surf
                     x = reshape_only(batch["x"]).to(self.device, non_blocking=True)
+                x = _repeat_for_ensemble(x, ensemble_size)
 
                 # --------------------------------------------------------------------------------- #
                 # add forcing and static variables
                 if "x_forcing_static" in batch:
                     # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
                     x_forcing_batch = batch["x_forcing_static"].to(self.device, non_blocking=True).permute(0, 2, 1, 3, 4)
+                    x_forcing_batch = _repeat_for_ensemble(x_forcing_batch, ensemble_size)
 
                     # concat on var dimension
                     x = torch.cat((x, x_forcing_batch), dim=1)
@@ -262,13 +285,15 @@ class Trainer(BaseTrainer):
                     x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device, non_blocking=True)
                 else:
                     x_boundary = reshape_only(batch["x_boundary"]).to(self.device, non_blocking=True)
+                x_boundary = _repeat_for_ensemble(x_boundary, ensemble_size)
 
                 # --------------------------------------------------------------------------------- #
                 # time encoding
                 x_time_encode = batch["x_time_encode"].to(self.device, non_blocking=True)
+                x_time_encode = _repeat_for_ensemble(x_time_encode, ensemble_size)
 
                 # single step predict
-                y_pred = self.model(x, x_boundary, x_time_encode)
+                y_pred = self.model(x, x_boundary, x_time_encode, ensemble_size=ensemble_size)
 
                 # Residual prediction: model outputs a delta, add last input state back
                 if residual_prediction:
@@ -301,9 +326,10 @@ class Trainer(BaseTrainer):
                     varnum_diag,
                 )
 
-                # Metrics
-                # metrics_dict = metrics(y_pred.float(), y.float())
-                metrics_dict = metrics(y_pred, y)
+                # Metrics: LatWeightedMetrics handles ensemble reshaping itself
+                # when trainer.ensemble_size > 1.
+                metrics_pred = y_pred if getattr(metrics, "ensemble_size", 1) > 1 else _ensemble_mean(y_pred, y)
+                metrics_dict = metrics(metrics_pred, y)
 
                 # save training metrics
                 for name, value in metrics_dict.items():
@@ -317,16 +343,16 @@ class Trainer(BaseTrainer):
 
                 scaler.scale(loss / grad_accum_every).backward(retain_graph=retain_graph)
 
-            accum_log(logs, {"loss": loss.item() / grad_accum_every})
+            accum_log(logs, {"loss": _scalar_item(loss) / grad_accum_every})
             if reg_loss is not None:
-                accum_log(logs, {"reg_loss": reg_loss.item() / grad_accum_every})
+                accum_log(logs, {"reg_loss": _scalar_item(reg_loss) / grad_accum_every})
             if occ_ce is not None:
-                accum_log(logs, {"occ_ce": occ_ce.item() / grad_accum_every})
+                accum_log(logs, {"occ_ce": _scalar_item(occ_ce) / grad_accum_every})
             if gate_mean is not None:
-                accum_log(logs, {"occ_gate_mean": gate_mean.item()})
+                accum_log(logs, {"occ_gate_mean": _scalar_item(gate_mean)})
             if hasattr(criterion, "get_last_aux_losses") and callable(getattr(criterion, "get_last_aux_losses")):
                 for aux_name, aux_value in criterion.get_last_aux_losses().items():
-                    accum_log(logs, {aux_name: aux_value.item() / grad_accum_every})
+                    accum_log(logs, {aux_name: _scalar_item(aux_value) / grad_accum_every})
 
 
             # Note: DDP synchronizes gradients during backward(); no explicit barrier needed.
@@ -437,6 +463,7 @@ class Trainer(BaseTrainer):
 
         forecast_len = conf["data"]["valid_forecast_len"]
         distributed = True if conf["trainer"]["mode"] in ["fsdp", "ddp"] else False
+        ensemble_size = int(conf["trainer"].get("ensemble_size", 1))
         residual_prediction = conf["trainer"].get("residual_prediction", False)
         varnum_diag = len(conf["data"]["diagnostic_variables"])
 
@@ -477,12 +504,14 @@ class Trainer(BaseTrainer):
                 else:
                     # no x_surf
                     x = reshape_only(batch["x"]).to(self.device, non_blocking=True)
+                x = _repeat_for_ensemble(x, ensemble_size)
 
                 # --------------------------------------------------------------------------------- #
                 # add forcing and static variables
                 if "x_forcing_static" in batch:
                     # (batch_num, time, var, lat, lon) --> (batch_num, var, time, lat, lon)
                     x_forcing_batch = batch["x_forcing_static"].to(self.device, non_blocking=True).permute(0, 2, 1, 3, 4)
+                    x_forcing_batch = _repeat_for_ensemble(x_forcing_batch, ensemble_size)
 
                     # concat on var dimension
                     x = torch.cat((x, x_forcing_batch), dim=1)
@@ -507,12 +536,14 @@ class Trainer(BaseTrainer):
                     x_boundary = concat_and_reshape(batch["x_boundary"], batch["x_surf_boundary"]).to(self.device, non_blocking=True)
                 else:
                     x_boundary = reshape_only(batch["x_boundary"]).to(self.device, non_blocking=True)
+                x_boundary = _repeat_for_ensemble(x_boundary, ensemble_size)
 
                 # --------------------------------------------------------------------------------- #
                 # time encoding
                 x_time_encode = batch["x_time_encode"].to(self.device, non_blocking=True)
+                x_time_encode = _repeat_for_ensemble(x_time_encode, ensemble_size)
 
-                y_pred = self.model(x, x_boundary, x_time_encode)
+                y_pred = self.model(x, x_boundary, x_time_encode, ensemble_size=ensemble_size)
 
                 # Residual prediction: model outputs a delta, add last input state back
                 if residual_prediction:
@@ -543,9 +574,10 @@ class Trainer(BaseTrainer):
                     varnum_diag,
                 )
 
-                # Metrics
-                # metrics_dict = metrics(y_pred, y)
-                metrics_dict = metrics(y_pred.float(), y.float())
+                # Metrics: LatWeightedMetrics handles ensemble reshaping itself
+                # when trainer.ensemble_size > 1.
+                metrics_pred = y_pred.float() if getattr(metrics, "ensemble_size", 1) > 1 else _ensemble_mean(y_pred.float(), y)
+                metrics_dict = metrics(metrics_pred, y.float())
 
                 for name, value in metrics_dict.items():
                     value = torch.tensor([value], device=self.device)
@@ -555,18 +587,18 @@ class Trainer(BaseTrainer):
 
                     results_dict[f"valid_{name}"].append(value[0].item())
 
-                batch_loss = torch.tensor([loss.item()], device=self.device)
+                batch_loss = torch.tensor([_scalar_item(loss)], device=self.device)
 
                 if distributed:
                     torch.distributed.barrier()
 
                 results_dict["valid_loss"].append(batch_loss[0].item())
-                if reg_loss is not None:
-                    results_dict["valid_reg_loss"].append(reg_loss.item())
-                if occ_ce is not None:
-                    results_dict["valid_occ_ce"].append(occ_ce.item())
-                if gate_mean is not None:
-                    results_dict["valid_occ_gate_mean"].append(gate_mean.item())
+            if reg_loss is not None:
+                results_dict["valid_reg_loss"].append(_scalar_item(reg_loss))
+            if occ_ce is not None:
+                results_dict["valid_occ_ce"].append(_scalar_item(occ_ce))
+            if gate_mean is not None:
+                results_dict["valid_occ_gate_mean"].append(_scalar_item(gate_mean))
                 results_dict["valid_forecast_len"].append(forecast_len + 1)
 
                 # print to tqdm

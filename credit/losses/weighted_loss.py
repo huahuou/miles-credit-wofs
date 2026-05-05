@@ -294,6 +294,15 @@ class VariableTotalLoss2D(torch.nn.Module):
             torch.Tensor: The computed loss value.
 
         """
+        ensemble_size = None
+        if pred.shape[0] != target.shape[0] and pred.shape[0] % target.shape[0] == 0:
+            ensemble_size = pred.shape[0] // target.shape[0]
+
+        if ensemble_size is not None:
+            pred_for_aux = pred.view(target.shape[0], ensemble_size, *target.shape[1:]).mean(dim=1)
+        else:
+            pred_for_aux = pred
+
         # User defined loss
         loss = self.loss_fn(target, pred)
 
@@ -336,7 +345,7 @@ class VariableTotalLoss2D(torch.nn.Module):
         self._last_aux_losses = {}
 
         if self.use_microphysics_constraint:
-            micro_loss = self.micro_constraint_loss(pred, target)
+            micro_loss = self.micro_constraint_loss(pred_for_aux, target)
             self._last_aux_losses["microphysics_constraint_loss"] = micro_loss.detach()
             self._last_aux_losses["microphysics_constraint_loss_weighted"] = (
                 self.micro_constraint_weight * micro_loss.detach()
@@ -345,7 +354,7 @@ class VariableTotalLoss2D(torch.nn.Module):
 
         if self.use_refl_operator_constraint:
             # The reflectivity constraint requires batch context; if not set, it returns 0
-            refl_loss = self.refl_constraint(pred, target)
+            refl_loss = self.refl_constraint(pred_for_aux, target)
             self._last_aux_losses["refl_operator_constraint_loss"] = refl_loss.detach()
             self._last_aux_losses["refl_operator_constraint_loss_weighted"] = (
                 self.refl_constraint_weight * refl_loss.detach()
@@ -354,7 +363,7 @@ class VariableTotalLoss2D(torch.nn.Module):
 
         if self.use_physical_concentration_loss:
             with torch.autocast(device_type=pred.device.type, enabled=False):
-                physical_loss = self.physical_concentration_loss(pred.float(), target.float())
+                physical_loss = self.physical_concentration_loss(pred_for_aux.float(), target.float())
             self._last_aux_losses["physical_concentration_loss"] = physical_loss.detach()
             self._last_aux_losses["physical_concentration_loss_weighted"] = (
                 self.physical_concentration_loss_weight * physical_loss.detach()
