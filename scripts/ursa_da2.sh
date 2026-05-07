@@ -39,13 +39,13 @@ TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 CONDA_ENV="credit-wofs"                       # Name or path of your conda environment
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
 CONFIG_DETER="${CONFIG_DETER:-${PROJECT_DIR}/config/ursa_wofs_credit_wrf_da_increment_aurora_deter.yml}"
-CONFIG_ENSEMBLE="${CONFIG_ENSEMBLE:-${PROJECT_DIR}/config/ursa_wofs_credit_wrf_da_increment_aurora_ens.yml}"
-### CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0429_nophy2/model.yml"
+### CONFIG_ENSEMBLE="${CONFIG_ENSEMBLE:-${PROJECT_DIR}/config/ursa_wofs_credit_wrf_da_increment_aurora_ens.yml}"
+CONFIG_ENSEMBLE="/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0505_ens/model.yml"
 
 # DA_TRAIN_MODE controls which entrypoint runs with the same config:
 #   deterministic -> applications/train_wrf_wofs_da.py
 #   ensemble      -> applications/train_wrf_wofs_da_ensemble.py
-DA_TRAIN_MODE="${DA_TRAIN_MODE:-ensemble}"
+DA_TRAIN_MODE="${DA_TRAIN_MODE:-deterministic}"  # Default to deterministic if not set
 DRY_RUN="${DRY_RUN:-0}"
 case "${DA_TRAIN_MODE}" in
     deterministic)

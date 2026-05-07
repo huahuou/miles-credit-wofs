@@ -20,6 +20,7 @@ from credit.data import reshape_only
 from credit.datasets.wrf_wofs_da_increment import WoFSDAIncrementDataset
 from credit.metrics import LatWeightedMetrics
 from credit.models import load_model
+from credit.models.checkpoint import load_state_dict_error_handler
 from credit.parser import credit_main_parser
 from credit.seed import seed_everything
 from credit.transforms.concentration import CONCENTRATION_VARS
@@ -125,9 +126,136 @@ def _build_test_dataset(
 
 
 def _load_eval_model(conf: dict, device: torch.device) -> torch.nn.Module:
-    model = load_model(conf, load_weights=True).to(device)
+    model_type = conf.get("model", {}).get("type")
+    if model_type in {"aurora_crossformer_wrf", "aurora_crossformer_wrf_da"}:
+        checkpoint_path = _resolve_checkpoint_path(conf["save_loc"])
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+        _reconcile_aurora_model_conf_from_checkpoint(conf, state_dict)
+
+        model = load_model(conf, load_weights=False)
+        load_msg = model.load_state_dict(state_dict, strict=False)
+        load_state_dict_error_handler(load_msg)
+        model = model.to(device)
+    else:
+        model = load_model(conf, load_weights=True).to(device)
     model.eval()
     return model
+
+
+def _resolve_checkpoint_path(save_loc: str) -> str:
+    expanded_save_loc = os.path.expandvars(save_loc)
+    model_checkpoint = os.path.join(expanded_save_loc, "model_checkpoint.pt")
+    if os.path.isfile(model_checkpoint):
+        return model_checkpoint
+
+    checkpoint = os.path.join(expanded_save_loc, "checkpoint.pt")
+    if os.path.isfile(checkpoint):
+        return checkpoint
+
+    raise ValueError(f"No saved checkpoint exists under {expanded_save_loc}")
+
+
+def _state_tensor_shape(state_dict: dict, key_prefix: str) -> tuple[int, ...] | None:
+    for suffix in ("weight_orig", "weight", "bias"):
+        tensor = state_dict.get(f"{key_prefix}.{suffix}")
+        if tensor is not None:
+            return tuple(int(dim) for dim in tensor.shape)
+    return None
+
+
+def _reconcile_aurora_model_conf_from_checkpoint(conf: dict, state_dict: dict) -> None:
+    model_conf = conf.get("model", {})
+    if model_conf.get("type") not in {"aurora_crossformer_wrf", "aurora_crossformer_wrf_da"}:
+        return
+
+    resolved: dict[str, object] = {}
+
+    spectral_norm_enabled = any(key.endswith("weight_orig") for key in state_dict.keys())
+    resolved["use_spectral_norm"] = spectral_norm_enabled
+
+    interior_norm = state_dict.get("interior_embedder.norm.weight")
+    if interior_norm is not None:
+        resolved["embed_dim"] = int(interior_norm.shape[0])
+
+    boundary_norm = state_dict.get("boundary_embedder.norm.weight")
+    if boundary_norm is not None:
+        resolved["boundary_embed_dim"] = int(boundary_norm.shape[0])
+
+    film_in_shape = _state_tensor_shape(state_dict, "film_mlp.0")
+    if film_in_shape is not None and "boundary_embed_dim" in resolved:
+        time_encode_dim = int(film_in_shape[1]) - 5 * int(resolved["boundary_embed_dim"])
+        if time_encode_dim > 0:
+            resolved["time_encode_dim"] = time_encode_dim
+
+    encoder_dims: list[int] = []
+    encoder_depths: list[int] = []
+    stage_index = 0
+    while True:
+        stage_conv_prefix = f"encoder_layers.{stage_index}.0.convs"
+        conv_index = 0
+        stage_dim = 0
+        while True:
+            shape = _state_tensor_shape(state_dict, f"{stage_conv_prefix}.{conv_index}")
+            if shape is None:
+                break
+            stage_dim += int(shape[0])
+            conv_index += 1
+
+        if stage_dim == 0:
+            break
+
+        encoder_dims.append(stage_dim)
+
+        layer_index = 0
+        while True:
+            attn_shape = _state_tensor_shape(
+                state_dict,
+                f"encoder_layers.{stage_index}.1.layers.{layer_index}.0.to_qkv",
+            )
+            if attn_shape is None:
+                break
+            layer_index += 1
+        if layer_index > 0:
+            encoder_depths.append(layer_index)
+
+        stage_index += 1
+
+    if encoder_dims:
+        resolved["dim"] = encoder_dims
+    if len(encoder_depths) == len(encoder_dims):
+        resolved["depth"] = encoder_depths
+
+    noise_conf = dict(model_conf.get("noise_injection", {}))
+    latent_shape = _state_tensor_shape(state_dict, "dec_noise1.noise_transform")
+    if latent_shape is not None:
+        noise_conf["activate"] = True
+        noise_conf["latent_dim"] = int(latent_shape[1])
+        noise_conf["encoder_noise"] = any(key.startswith("enc_noise_layers.") for key in state_dict.keys())
+
+        noise_scales: list[float] = []
+        dec_noise_index = 1
+        while True:
+            tensor = state_dict.get(f"dec_noise{dec_noise_index}.noise_factor")
+            if tensor is None:
+                break
+            noise_scales.append(float(tensor.reshape(-1)[0].item()))
+            dec_noise_index += 1
+        if noise_scales:
+            noise_conf["noise_scales"] = noise_scales
+    elif "activate" not in noise_conf:
+        noise_conf["activate"] = False
+
+    resolved["noise_injection"] = noise_conf
+
+    changed = {}
+    for key, value in resolved.items():
+        if model_conf.get(key) != value:
+            changed[key] = {"from": model_conf.get(key), "to": value}
+            model_conf[key] = value
+
+    if changed:
+        logger.info("Reconciled Aurora model config from checkpoint: %s", changed)
 
 
 def _sample_to_model_inputs(batch: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -630,6 +758,8 @@ def main() -> None:
     )
     if ensemble_size < 1:
         raise ValueError("ensemble_size must be >= 1")
+    conf.setdefault("trainer", {})["ensemble_size"] = ensemble_size
+    conf.setdefault("predict", {})["ensemble_size"] = ensemble_size
     save_ensemble_members = bool(args.save_ensemble_members or eval_conf.get("save_ensemble_members", False))
     if args.mean_only:
         save_ensemble_members = False
@@ -701,7 +831,8 @@ def main() -> None:
                 )
                 y_pred = _apply_residual_prediction(y_pred, x_model, residual_prediction, varnum_diag)
                 y_pred_mean = _ensemble_mean(y_pred, y_true)
-                y_pred_members = _ensemble_members(y_pred, y_true) if save_ensemble_members else None
+                y_pred_members_all = _ensemble_members(y_pred, y_true)
+                y_pred_members = y_pred_members_all if save_ensemble_members else None
                 logger.info("  model inference done in %.2fs", time.monotonic() - t0)
 
                 t0 = time.monotonic()
@@ -739,7 +870,11 @@ def main() -> None:
                 for local_idx, global_index in enumerate(index_values):
                     case_name, case_path, valid_time = _collect_sample_metadata(dataset, int(global_index))
 
-                    sample_y_pred = y_pred_mean[local_idx : local_idx + 1]
+                    sample_y_pred = (
+                        y_pred_members_all[local_idx]
+                        if y_pred_members_all is not None
+                        else y_pred_mean[local_idx : local_idx + 1]
+                    )
                     sample_y_true = y_true[local_idx : local_idx + 1]
                     sample_metrics = metrics(sample_y_pred.float(), sample_y_true.float(), forecast_datetime=1)
 

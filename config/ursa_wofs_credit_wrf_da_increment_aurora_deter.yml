@@ -1,4 +1,4 @@
-save_loc: '/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0505_deter'
+save_loc: '/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0505_deter'
 seed: 1000
 
 data:
@@ -119,7 +119,7 @@ model:
   levels: 17
   boundary_levels: 17
   frames: 1
-  embed_dim: 128
+  embed_dim: 96
   boundary_embed_dim: 196
   time_encode_dim: 12
   dim: [64, 128, 192, 256]
@@ -188,8 +188,8 @@ trainer:
   no_hang_pin_memory: False
   no_hang_persistent_workers: True
   no_hang_timeout_s: 180
-  train_batch_size: 26
-  valid_batch_size: 26
+  train_batch_size: 24
+  valid_batch_size: 24
   batches_per_epoch: 0
   valid_batches_per_epoch: 0
   thread_workers: 6

@@ -295,8 +295,7 @@ def primary_main():
     save_loc = os.path.expandvars(conf["save_loc"])
     os.makedirs(save_loc, exist_ok=True)
 
-    if not os.path.exists(os.path.join(save_loc, "model.yml")):
-        shutil.copy(args.model_config, os.path.join(save_loc, "model.yml"))
+    shutil.copy(args.model_config, os.path.join(save_loc, "model.yml"))
 
     if int(args.launch):
         script_path = Path(__file__).absolute()

@@ -23,7 +23,7 @@
 #SBATCH --gpus-per-node=h100:2                # 2 H100 GPUs per node
 #SBATCH --cpus-per-task=192                    # CPU cores per task (for data loading workers)
 #SBATCH --mem=0                               # Use all available memory on the node
-#SBATCH --time=01:29:00                       # Wall time limit
+#SBATCH --time=02:29:00                       # Wall time limit
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out                   # stdout: <job-name>-<job-id>.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err                     # stderr: <job-name>-<job-id>.err
 #SBATCH --exclusive                           # Exclusive node access for best GPU performance
@@ -37,9 +37,9 @@ TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
 CONDA_ENV="credit-wofs"                       # Name or path of your conda environment
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"  # <-- Update path
-CONFIG="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0503_multiloss/model.yml"
+CONFIG="/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0505_ens/model.yml"
 EVAL_SCRIPT="applications/eval_wrf_wofs_da_trainer_like.py"   # Evaluation script
-SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_wofs_da_example/wofs_da_increment_experiment_0503_multiloss/test1/eval_physical.zarr"                              # Path for physical-space Zarr store.
+SAVE_PHYSICAL="/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_wofs_da_example/wofs_da_increment_experiment_0505_ens/test2/eval_physical.zarr"                              # Path for physical-space Zarr store.
                                               # Leave empty to auto-derive from eval.save_zarr_path
                                               # (appends _physical.zarr suffix). Example:
                                               # SAVE_PHYSICAL="/scratch5/purged/Zhanxiang.Hua/credit_runs/wofs_da_increment_experiment_0423/eval_physical.zarr"
@@ -107,6 +107,35 @@ if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
     raise SystemExit("No CUDA GPUs visible to PyTorch. Check CUDA_VISIBLE_DEVICES/Slurm GPU allocation.")
 PY
 
+#----- Eval argument selection -------------------------------------------------
+SAVE_ENSEMBLE_MEMBERS=$(
+python - "${CONFIG}" <<'PY'
+import sys
+import yaml
+
+config_path = sys.argv[1]
+with open(config_path) as f:
+    conf = yaml.safe_load(f)
+
+eval_conf = conf.get("eval", {}) if isinstance(conf.get("eval"), dict) else {}
+predict_conf = conf.get("predict", {}) if isinstance(conf.get("predict"), dict) else {}
+trainer_conf = conf.get("trainer", {}) if isinstance(conf.get("trainer"), dict) else {}
+
+ensemble_size = (
+    eval_conf.get("ensemble_size",
+    predict_conf.get("ensemble_size",
+    trainer_conf.get("ensemble_size", 1)))
+)
+
+print("1" if int(ensemble_size) > 1 else "0")
+PY
+)
+
+EVAL_EXTRA_ARGS=()
+if [ "${SAVE_ENSEMBLE_MEMBERS}" = "1" ]; then
+    EVAL_EXTRA_ARGS+=(--save-ensemble-members)
+fi
+
 #----- Launch Evaluation -------------------------------------------------------
 # Strategy:
 #   The eval script is not designed with PyTorch DistributedDataParallel (DDP). 
@@ -116,6 +145,7 @@ PY
 cd ${PROJECT_DIR}
 
 srun --cpu-bind=none python ${EVAL_SCRIPT} ${CONFIG} \
+    "${EVAL_EXTRA_ARGS[@]}" \
     ${SAVE_PHYSICAL:+--save-physical "${SAVE_PHYSICAL}"}
 
 echo "Evaluation finished with exit code: $?"
