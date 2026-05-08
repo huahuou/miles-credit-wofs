@@ -14,6 +14,7 @@ from credit.trainers.trainerWRF import Trainer as TrainerWRF
 from credit.trainers.trainerWRF_multi import Trainer as TrainerWRFMulti
 from credit.trainers.trainerWRF_multi_ensemble import Trainer as TrainerWRFMultiEnsemble
 from credit.trainers.trainerWRF_mae import TrainerMAE
+from credit.trainers.trainerWRF_diffmae import TrainerDiffMAE
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,10 @@ trainer_types = {
     "standard-wrf-mae": (
         TrainerMAE,
         "Multi-modal MAE trainer for WoFS data assimilation pre-training.",
+    ),
+    "standard-wrf-diffmae": (
+        TrainerDiffMAE,
+        "Conditional DiffMAE trainer for WoFS precip random-mask inpainting.",
     ),
 }
 

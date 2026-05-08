@@ -26,9 +26,9 @@ Padding: all 3D fields are spatially padded from (300, 300) → (304, 304) so
 that 8×8 patches tile evenly.  Surface/forcing are padded similarly.
 
 Normalization:
-    Reuses the same concentration transform + (x-mean)/std pipeline as
-    WoFSDAIncrementDataset.  Concentration params are loaded from JSON or
-    NetCDF attributes (same logic).
+    Reuses the same DA concentration transform + normalization pipeline as
+    WoFSDAIncrementDataset.  Concentration specs are loaded from
+    data.log_transform_params_json.
 
 Config keys (conf["data"]):
     background_vars          : list of upper-air var names for background modality
@@ -39,7 +39,8 @@ Config keys (conf["data"]):
     levels                   : int  — number of vertical levels
     mean_path                : str  — path to mean.nc
     std_path                 : str  — path to std.nc
-    concentration_params_json: str  — path to concentration_tuning.json
+    log_transform_params_json: str  — path to concentration transform JSON
+    concentration_normalization_mode: zscore | transform_only | scale_only
     mae_pad_to               : int  — target spatial size after padding (default 304)
     mae_include_t1_refl      : bool — use t1 reflectivity (default True)
     max_open_files_per_worker: int  — LRU cache size (default 8)
@@ -47,7 +48,6 @@ Config keys (conf["data"]):
     max_dataset_open_retries : int  — retry budget for corrupt files (default 3)
 """
 
-import json
 import logging
 import time
 from collections import OrderedDict
@@ -66,10 +66,12 @@ from credit.data import (
 )
 
 # Re-use normalization constants from the DA increment dataset
-from credit.datasets.wrf_wofs_da_increment import (
+from credit.transforms.concentration import (
     CONCENTRATION_VARS,
-    WoFSDAIncrementDataset,  # type: ignore  # used only for class methods via super-dict reuse
-    _DEFAULT_CONCENTRATION_PARAMS,
+    build_log_zscore_stats_override,
+    concentration_transform_overrides_stats,
+    forward_concentration_transform_numpy,
+    load_concentration_transform_json,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,50 +88,6 @@ DEFAULT_DYNAMIC_FORCING_VARS = [
     "cos_local_time", "sin_local_time",
     "cos_solar_zenith", "insolation",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Normalization helpers (mirror WoFSDAIncrementDataset)
-# ---------------------------------------------------------------------------
-
-def _coerce_concentration_params(params: Optional[dict]) -> dict:
-    merged = dict(_DEFAULT_CONCENTRATION_PARAMS)
-    if isinstance(params, dict):
-        for key in ("c1", "c2", "conc_eps", "conc_max"):
-            if key in params:
-                merged[key] = float(params[key])
-        if "value_clip_min" in params:
-            merged["value_clip_min"] = None if params["value_clip_min"] is None else float(params["value_clip_min"])
-        if "value_clip_max" in params:
-            merged["value_clip_max"] = None if params["value_clip_max"] is None else float(params["value_clip_max"])
-    if merged["conc_eps"] <= 0.0:
-        merged["conc_eps"] = _DEFAULT_CONCENTRATION_PARAMS["conc_eps"]
-    if merged["conc_max"] <= merged["conc_eps"]:
-        merged["conc_max"] = max(_DEFAULT_CONCENTRATION_PARAMS["conc_max"], merged["conc_eps"] * 10.0)
-    return merged
-
-
-def _forward_concentration_numpy(arr: np.ndarray, params: dict) -> np.ndarray:
-    """Concentration transform matching WoFSDAIncrementDataset._forward_concentration_numpy.
-
-    f(x) = c1 * min(x, conc_max) + c2 * (log(max(x, conc_eps)) - log(conc_eps)) / (-log(conc_eps))
-    """
-    c1 = float(params["c1"])
-    c2 = float(params["c2"])
-    eps = float(params["conc_eps"])
-    cmax = float(params["conc_max"])
-    clip_min = params.get("value_clip_min")
-    clip_max = params.get("value_clip_max")
-
-    x = arr.astype(np.float64, copy=True)
-    if clip_min is not None:
-        x = np.maximum(x, float(clip_min))
-    if clip_max is not None:
-        x = np.minimum(x, float(clip_max))
-    log_eps = float(np.log(eps))
-    neg_log_eps = float(-log_eps)
-    transformed = c1 * np.minimum(x, cmax) + c2 * (np.log(np.maximum(x, eps)) - log_eps) / neg_log_eps
-    return transformed.astype(np.float32, copy=False)
 
 
 class WoFSMAEDataset(Dataset):
@@ -174,10 +132,22 @@ class WoFSMAEDataset(Dataset):
         self.levels: int = int(data_conf.get("levels", 17))
         self.mean_path: str = data_conf["mean_path"]
         self.std_path: str = data_conf["std_path"]
-        self.concentration_params_json_path: Optional[str] = data_conf.get("concentration_params_json")
+        self._transform_params_json_path: Optional[str] = data_conf.get("log_transform_params_json")
+        self._concentration_normalization_mode = str(
+            data_conf.get("concentration_normalization_mode", "zscore")
+        ).strip().lower()
+        if self._concentration_normalization_mode not in {"zscore", "transform_only", "scale_only"}:
+            raise ValueError(
+                "data.concentration_normalization_mode must be one of "
+                "'zscore', 'transform_only', or 'scale_only'. "
+                f"Got: {self._concentration_normalization_mode}"
+            )
 
         self.mae_pad_to: int = int(data_conf.get("mae_pad_to", 304))
         self.mae_include_t1_refl: bool = bool(data_conf.get("mae_include_t1_refl", True))
+        self._concentration_level_ops = data_conf.get("concentration_level_ops", {})
+        self._prognostic_levels = int(data_conf.get("prognostic_levels", self.levels))
+        self._validate_transform_config()
 
         self.max_open_files: int = int(data_conf.get("max_open_files_per_worker", 8))
         # Always open zarr WITHOUT Dask (chunks=None) — Dask scheduler accumulates
@@ -196,7 +166,7 @@ class WoFSMAEDataset(Dataset):
         self.samples_per_file: Optional[List[int]] = None
         self.cumulative_samples: Optional[np.ndarray] = None
         self.upper_ds_cache: OrderedDict = OrderedDict()
-        self._concentration_params: dict = {v: dict(_DEFAULT_CONCENTRATION_PARAMS) for v in CONCENTRATION_VARS}
+        self._concentration_transform_specs: dict[str, dict] = {}
         self._mean_values: dict = {}
         self._std_values: dict = {}
         # Files that failed to open during training are blacklisted so workers
@@ -220,60 +190,6 @@ class WoFSMAEDataset(Dataset):
         mean_ds = xr.open_dataset(self.mean_path).load()
         std_ds = xr.open_dataset(self.std_path).load()
 
-        # Load concentration params from JSON
-        if self.concentration_params_json_path:
-            try:
-                with open(self.concentration_params_json_path, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                params_dict = payload.get("variables", payload) if isinstance(payload, dict) else {}
-                for var, info in params_dict.items():
-                    if var not in CONCENTRATION_VARS or not isinstance(info, dict):
-                        continue
-                    if "recommended" in info and isinstance(info["recommended"], dict):
-                        self._concentration_params[var] = _coerce_concentration_params(info["recommended"])
-                    else:
-                        self._concentration_params[var] = _coerce_concentration_params(info)
-            except Exception as exc:
-                logger.warning("Failed to load concentration params JSON: %s", exc)
-
-        # Fallback 2: global JSON string embedded in mean.nc attrs
-        attr_payload = mean_ds.attrs.get("concentration_transform_params_json")
-        if isinstance(attr_payload, str) and attr_payload.strip():
-            try:
-                payload = json.loads(attr_payload)
-                params_dict = payload.get("parameters", {}) if isinstance(payload, dict) else {}
-                if isinstance(params_dict, dict):
-                    for var, params in params_dict.items():
-                        if var in CONCENTRATION_VARS and isinstance(params, dict):
-                            self._concentration_params[var] = _coerce_concentration_params(params)
-                logger.info("Loaded concentration params from mean/std NetCDF attrs")
-            except Exception as exc:
-                logger.warning("Failed to parse concentration params from stats attrs: %s", exc)
-
-        # Fallback 3: per-variable NetCDF variable attrs (concentration_transform_c1, …)
-        for var in CONCENTRATION_VARS:
-            if var in mean_ds:
-                var_attrs = mean_ds[var].attrs
-                if any(
-                    key in var_attrs
-                    for key in (
-                        "concentration_transform_c1",
-                        "concentration_transform_c2",
-                        "concentration_transform_conc_eps",
-                        "concentration_transform_conc_max",
-                    )
-                ):
-                    self._concentration_params[var] = _coerce_concentration_params(
-                        {
-                            "c1": var_attrs.get("concentration_transform_c1", self._concentration_params[var]["c1"]),
-                            "c2": var_attrs.get("concentration_transform_c2", self._concentration_params[var]["c2"]),
-                            "conc_eps": var_attrs.get("concentration_transform_conc_eps", self._concentration_params[var]["conc_eps"]),
-                            "conc_max": var_attrs.get("concentration_transform_conc_max", self._concentration_params[var]["conc_max"]),
-                            "value_clip_min": var_attrs.get("concentration_transform_clip_min", self._concentration_params[var]["value_clip_min"]),
-                            "value_clip_max": var_attrs.get("concentration_transform_clip_max", self._concentration_params[var]["value_clip_max"]),
-                        }
-                    )
-
         # Load mean/std arrays for all needed vars
         all_vars = self._upper_air_vars + [v for v in self._surface_2d_vars if v in mean_ds]
         for var in all_vars:
@@ -287,6 +203,28 @@ class WoFSMAEDataset(Dataset):
                 std_vals = np.where(std_vals <= 0.0, 1.0, std_vals)
                 self._mean_values[var] = mean_vals
                 self._std_values[var] = std_vals
+
+        _, self._concentration_transform_specs = load_concentration_transform_json(
+            self._transform_params_json_path,
+            variables=CONCENTRATION_VARS,
+        )
+        missing_specs = [
+            var for var in self.precip_vars
+            if var in CONCENTRATION_VARS and var not in self._concentration_transform_specs
+        ]
+        if missing_specs:
+            raise KeyError(
+                "Missing concentration transform specs for MAE precip variables: "
+                f"{missing_specs} in {self._transform_params_json_path}"
+            )
+
+        for var, spec in self._concentration_transform_specs.items():
+            if not concentration_transform_overrides_stats(spec) or var not in self._mean_values:
+                continue
+            n_lev = int(np.asarray(self._mean_values[var]).shape[0]) if np.asarray(self._mean_values[var]).ndim >= 1 else 1
+            mean_override, std_override = build_log_zscore_stats_override(spec, n_lev)
+            self._mean_values[var] = mean_override
+            self._std_values[var] = std_override
 
         self._build_index_map()
         self._opened = True
@@ -419,15 +357,95 @@ class WoFSMAEDataset(Dataset):
         shape[axis] = stat_len
         return stats_arr.reshape(shape)
 
-    def _normalize_array(self, arr: np.ndarray, var_name: str) -> np.ndarray:
-        """Apply concentration transform (if needed) then z-score normalize."""
-        x = arr.astype(np.float32, copy=False)
+    def _validate_transform_config(self) -> None:
+        concentration_vars = [var for var in self.precip_vars if var in CONCENTRATION_VARS]
+        if concentration_vars and not self._transform_params_json_path:
+            raise ValueError(
+                "WoFSMAEDataset requires data.log_transform_params_json for concentration precip variables. "
+                f"Missing transform config for variables: {concentration_vars}"
+            )
+
+    @staticmethod
+    def _pick_axis_by_size(values_arr: np.ndarray, target_size: int) -> int | None:
+        matching_axes = [axis for axis, size in enumerate(values_arr.shape) if size == target_size]
+        if not matching_axes:
+            return None
+        return 1 if len(matching_axes) > 1 and 1 in matching_axes else matching_axes[0]
+
+    def _find_level_axis(self, values: np.ndarray, var_name: str) -> int | None:
+        stats = np.asarray(self._mean_values[var_name])
+        if stats.ndim != 1:
+            return None
+        return self._pick_axis_by_size(np.asarray(values), int(stats.shape[0]))
+
+    def _get_concentration_level_op(self, var_name: str, n_levels: int) -> dict | None:
+        if var_name not in CONCENTRATION_VARS or not isinstance(self._concentration_level_ops, dict):
+            return None
+        raw = self._concentration_level_ops.get(var_name)
+        if not isinstance(raw, dict) or "ceiling_level" not in raw:
+            return None
+        try:
+            ceiling_level = int(raw["ceiling_level"])
+        except Exception:
+            return None
+        mode = str(raw.get("mode", "cutoff")).lower().strip()
+        if mode not in {"cutoff", "sum", "mean"}:
+            mode = "cutoff"
+        ceiling_level = max(1, min(ceiling_level, int(n_levels)))
+        return {"ceiling_level": ceiling_level, "ceiling_index": ceiling_level - 1, "mode": mode}
+
+    def reduce_levels_for_var(self, var_values: np.ndarray, var_name: str, is_precip: bool = False) -> np.ndarray:
+        values_arr = np.asarray(var_values)
+        if (not is_precip) or (var_name not in CONCENTRATION_VARS):
+            return values_arr
+        level_axis = self._find_level_axis(values_arr, var_name)
+        if level_axis is None:
+            return values_arr
+        level_first = np.moveaxis(values_arr, level_axis, 0).copy()
+        n_levels = level_first.shape[0]
+        if self._prognostic_levels >= n_levels:
+            return values_arr
+
+        op = self._get_concentration_level_op(var_name, n_levels)
+        mode = op["mode"] if op is not None else "cutoff"
+        ceiling_idx = self._prognostic_levels - 1
+        if mode in {"sum", "mean"} and ceiling_idx + 1 < n_levels:
+            upper = level_first[ceiling_idx + 1 :]
+            if upper.shape[0] > 0:
+                level_first[ceiling_idx] = np.sum(upper, axis=0) if mode == "sum" else np.mean(upper, axis=0)
+        level_first = level_first[: self._prognostic_levels]
+        return np.moveaxis(level_first, 0, level_axis)
+
+    def _forward_var_transform(self, var_values: np.ndarray, var_name: str) -> np.ndarray:
         if var_name in CONCENTRATION_VARS:
-            params = self._concentration_params.get(var_name, _DEFAULT_CONCENTRATION_PARAMS)
-            x = _forward_concentration_numpy(x, params)
-        mean = self._broadcast_stats(self._mean_values[var_name], x)
-        std = self._broadcast_stats(self._std_values[var_name], x)
-        return (x - mean) / std
+            spec = self._concentration_transform_specs.get(var_name)
+            if spec is None:
+                raise KeyError(f"Missing concentration transform spec for variable {var_name}")
+            return forward_concentration_transform_numpy(
+                var_values,
+                spec,
+                level_axis=self._find_level_axis(np.asarray(var_values), var_name),
+            )
+        return var_values
+
+    def _normalize_transformed_values(self, transformed_values: np.ndarray, var_name: str) -> np.ndarray:
+        if var_name in CONCENTRATION_VARS:
+            mode = self._concentration_normalization_mode
+            if mode == "transform_only":
+                return transformed_values
+            std = self._broadcast_stats(self._std_values[var_name], transformed_values)
+            if mode == "scale_only":
+                return transformed_values / std
+
+        mean = self._broadcast_stats(self._mean_values[var_name], transformed_values)
+        std = self._broadcast_stats(self._std_values[var_name], transformed_values)
+        return (transformed_values - mean) / std
+
+    def _normalize_array(self, arr: np.ndarray, var_name: str) -> np.ndarray:
+        """Apply the DA concentration transform (if needed) then normalize."""
+        x = arr.astype(np.float32, copy=False)
+        transformed = self._forward_var_transform(x, var_name)
+        return self._normalize_transformed_values(transformed, var_name)
 
     # ------------------------------------------------------------------ #
     # Spatial padding helper
@@ -458,6 +476,7 @@ class WoFSMAEDataset(Dataset):
         parts = []
         for var in var_list:
             raw = chunk[var].isel(time=time_idx).values  # (level, H, W)
+            raw = self.reduce_levels_for_var(raw, var_name=var, is_precip=var in self.precip_vars)
             norm = self._normalize_array(raw, var)
             parts.append(norm.astype(np.float32))
         return np.concatenate(parts, axis=0)  # (C=levels*nvars, H, W)
@@ -570,18 +589,7 @@ class WoFSMAEDataset(Dataset):
     # Forcing channel computation
     # ------------------------------------------------------------------ #
     def _compute_forcing(self, dt64, chunk, target_size: int) -> np.ndarray:
-        """
-        Compute 10-channel forcing array from datetime and spatial metadata.
-        Returns (10, H_pad, W_pad).
-
-        Channels:
-            0: cos_lat     1: sin_lat
-            2: cos_lon     3: sin_lon
-            4: cos_julian_day  5: sin_julian_day
-            6: cos_local_time  7: sin_local_time
-            8: cos_solar_zenith
-            9: insolation
-        """
+        """Compute forcing channels in the exact order requested by config."""
         import datetime
 
         # Convert numpy datetime64 to Python datetime
@@ -634,19 +642,37 @@ class WoFSMAEDataset(Dataset):
         ).astype(np.float32)
         insolation = np.clip(cos_zenith, 0.0, None).astype(np.float32)
 
-        out = np.stack([
-            np.cos(lat_rad).astype(np.float32),          # 0
-            np.sin(lat_rad).astype(np.float32),          # 1
-            np.cos(lon_rad).astype(np.float32),          # 2
-            np.sin(lon_rad).astype(np.float32),          # 3
-            np.full((H, W), np.cos(julian_angle), dtype=np.float32),  # 4
-            np.full((H, W), np.sin(julian_angle), dtype=np.float32),  # 5
-            np.cos(local_angle).astype(np.float32),      # 6
-            np.sin(local_angle).astype(np.float32),      # 7
-            cos_zenith,                                   # 8
-            insolation,                                   # 9
-        ], axis=0)  # (10, H, W)
+        computed = {
+            "cos_lat": np.cos(lat_rad).astype(np.float32),
+            "cos_latitude": np.cos(lat_rad).astype(np.float32),
+            "sin_lat": np.sin(lat_rad).astype(np.float32),
+            "sin_latitude": np.sin(lat_rad).astype(np.float32),
+            "cos_lon": np.cos(lon_rad).astype(np.float32),
+            "cos_longitude": np.cos(lon_rad).astype(np.float32),
+            "sin_lon": np.sin(lon_rad).astype(np.float32),
+            "sin_longitude": np.sin(lon_rad).astype(np.float32),
+            "cos_julian_day": np.full((H, W), np.cos(julian_angle), dtype=np.float32),
+            "sin_julian_day": np.full((H, W), np.sin(julian_angle), dtype=np.float32),
+            "cos_local_time": np.cos(local_angle).astype(np.float32),
+            "sin_local_time": np.sin(local_angle).astype(np.float32),
+            "cos_solar_zenith": cos_zenith,
+            "cos_solar_zenith_angle": cos_zenith,
+            "insolation": insolation,
+        }
 
-        # Pad to target_size if needed
-        out = self._pad_to_size(out, target_size)
-        return out
+        parts = []
+        for var in self.forcing_vars:
+            if var in computed:
+                parts.append(computed[var])
+            elif var in chunk:
+                raw = chunk[var].isel(time=0).values.astype(np.float32)
+                if raw.shape[-2:] != (H, W):
+                    raw = self._pad_to_size(raw, target_size)
+                parts.append(raw)
+            else:
+                logger.debug("Forcing variable %s not found; filling with zeros.", var)
+                parts.append(np.zeros((H, W), dtype=np.float32))
+
+        if not parts:
+            return np.zeros((0, H, W), dtype=np.float32)
+        return np.stack(parts, axis=0).astype(np.float32, copy=False)

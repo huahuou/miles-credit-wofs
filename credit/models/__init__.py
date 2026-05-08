@@ -24,6 +24,7 @@ from credit.models.wxformer.crossformer_wrf_ensemble import CrossFormerWRFEnsemb
 from credit.models.wxformer.aurora_crossformer_wrf import AuroraCrossFormerWRF
 from credit.models.wxformer.aurora_crossformer_wrf_da import AuroraCrossFormerWRFDA
 from credit.models.wofs_mae import WoFSMultiModalMAE
+from credit.models.wofs_diffmae import WoFSDiffMAE
 
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ model_types = {
     ),
     "unet_downscaling": (DownscalingSegmentationModel, "Loading downscaling U-net"),
     "wofs-mae": (WoFSMultiModalMAE, "Multi-modal MAE for WoFS data assimilation"),
+    "wofs-diffmae": (WoFSDiffMAE, "Conditional DiffMAE for WoFS precip inpainting"),
 }
 
 

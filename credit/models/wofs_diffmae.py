@@ -1,0 +1,398 @@
+"""Conditional DiffMAE for WoFS precip random-mask inpainting."""
+
+from __future__ import annotations
+
+import math
+from collections import OrderedDict
+from typing import Dict, Iterable, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+from credit.models.base_model import BaseModel
+from credit.models.wofs_mae_adapters import Block, WoFSInputAdapter, build_2d_sincos_posemb, trunc_normal_
+
+
+def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Iterable[int]) -> torch.Tensor:
+    out = a.gather(0, t)
+    return out.reshape(t.shape[0], *((1,) * (len(tuple(x_shape)) - 1)))
+
+
+def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
+
+
+def sigmoid_beta_schedule(
+    timesteps: int,
+    start: float = -3,
+    end: float = 3,
+    tau: float = 1,
+    clamp_min: float = 1e-5,
+) -> torch.Tensor:
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps, dtype=torch.float64) / timesteps
+    v_start = torch.tensor(start / tau).sigmoid()
+    v_end = torch.tensor(end / tau).sigmoid()
+    alphas_cumprod = (-((x * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, clamp_min, 0.999)
+
+
+def linear_beta_schedule(timesteps: int) -> torch.Tensor:
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float64)
+
+
+class WoFSDiffMAE(BaseModel):
+    """Diffusion model that inpaints normalized precip conditioned on unmasked WoFS context."""
+
+    def __init__(
+        self,
+        modality_channels: Optional[Dict[str, int]] = None,
+        conditioned_modalities: Optional[list[str]] = None,
+        target_modality: str = "precip",
+        patch_size: int = 8,
+        surface_forcing_stride: int = 16,
+        image_size: Tuple[int, int] = (304, 304),
+        embed_dim: int = 384,
+        depth: int = 8,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        drop_path_rate: float = 0.0,
+        diffusion: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.modality_channels = modality_channels or {
+            "background": 102,
+            "precip": 136,
+            "reflectivity": 17,
+            "surface": 2,
+            "forcing": 10,
+        }
+        self.conditioned_modalities = conditioned_modalities or ["background", "surface", "forcing", "reflectivity"]
+        self.target_modality = target_modality
+        self.patch_size = int(patch_size)
+        self.surface_forcing_stride = int(surface_forcing_stride)
+        self.image_size = tuple(image_size)
+        self.embed_dim = int(embed_dim)
+        self.channels = int(self.modality_channels[target_modality])
+        self.output_channels = self.channels
+        self.input_channels = self.channels
+        self.frames = 1
+        self.self_condition = False
+        self.condition = True
+
+        sf_h = math.ceil(self.image_size[0] / self.surface_forcing_stride) * self.surface_forcing_stride
+        sf_w = math.ceil(self.image_size[1] / self.surface_forcing_stride) * self.surface_forcing_stride
+        sf_image_size = (sf_h, sf_w)
+
+        self.condition_adapters = nn.ModuleDict()
+        for mod in self.conditioned_modalities:
+            stride = self.surface_forcing_stride if mod in {"surface", "forcing"} else self.patch_size
+            adapter_image_size = sf_image_size if mod in {"surface", "forcing"} else self.image_size
+            self.condition_adapters[mod] = WoFSInputAdapter(
+                num_channels=self.modality_channels[mod],
+                patch_size=stride,
+                embed_dim=self.embed_dim,
+                image_size=adapter_image_size,
+            )
+
+        self.noisy_precip_adapter = WoFSInputAdapter(
+            num_channels=self.channels,
+            patch_size=self.patch_size,
+            embed_dim=self.embed_dim,
+            image_size=self.image_size,
+        )
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        trunc_normal_(self.mask_token, std=0.02)
+
+        time_dim = self.embed_dim * 4
+        self.time_mlp = nn.Sequential(
+            SinusoidalTimeEmbedding(self.embed_dim),
+            nn.Linear(self.embed_dim, time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim, self.embed_dim),
+        )
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.blocks = nn.ModuleList(
+            [Block(self.embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_path=dpr[i]) for i in range(depth)]
+        )
+        self.norm = nn.LayerNorm(self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.channels * self.patch_size * self.patch_size)
+
+        n_h = self.image_size[0] // self.patch_size
+        n_w = self.image_size[1] // self.patch_size
+        pos_emb = build_2d_sincos_posemb(n_h, n_w, self.embed_dim)
+        self.register_buffer("target_pos_emb", pos_emb)
+        self.target_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        trunc_normal_(self.target_modality_emb, std=0.02)
+
+        diffusion_conf = diffusion or {}
+        self.objective = diffusion_conf.get("objective", "pred_v")
+        if self.objective not in {"pred_noise", "pred_x0", "pred_v"}:
+            raise ValueError(f"Unsupported diffusion objective: {self.objective}")
+        self.num_timesteps = int(diffusion_conf.get("timesteps", 1000))
+        self.sampling_timesteps = int(diffusion_conf.get("sampling_timesteps", self.num_timesteps))
+        self.ddim_sampling_eta = float(diffusion_conf.get("ddim_sampling_eta", 0.0))
+        beta_schedule = diffusion_conf.get("beta_schedule", "sigmoid")
+        if beta_schedule == "linear":
+            betas = linear_beta_schedule(self.num_timesteps)
+        elif beta_schedule == "cosine":
+            betas = cosine_beta_schedule(self.num_timesteps)
+        elif beta_schedule == "sigmoid":
+            betas = sigmoid_beta_schedule(self.num_timesteps)
+        else:
+            raise ValueError(f"Unsupported beta_schedule: {beta_schedule}")
+        self._register_diffusion_buffers(betas)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def _register_diffusion_buffers(self, betas: torch.Tensor) -> None:
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        self.register_buffer("betas", betas.float())
+        self.register_buffer("alphas_cumprod", alphas_cumprod.float())
+        self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev.float())
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod).float())
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod).float())
+        self.register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod).float())
+        self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1).float())
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.register_buffer("posterior_variance", posterior_variance.float())
+        self.register_buffer("posterior_log_variance_clipped", torch.log(posterior_variance.clamp(min=1e-20)).float())
+        self.register_buffer("posterior_mean_coef1", (betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)).float())
+        self.register_buffer("posterior_mean_coef2", ((1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)).float())
+
+    @property
+    def device(self) -> torch.device:
+        return self.betas.device
+
+    def patchify_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        if mask.dim() == 3:
+            mask = mask[:, None]
+        pooled = F.max_pool2d(mask.float(), kernel_size=self.patch_size, stride=self.patch_size)
+        return rearrange(pooled, "b 1 h w -> b (h w)")
+
+    def expand_patch_mask(self, patch_mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        n_h = self.image_size[0] // self.patch_size
+        n_w = self.image_size[1] // self.patch_size
+        if patch_mask.dim() == 3:
+            mask = patch_mask.reshape(patch_mask.shape[0], patch_mask.shape[1], n_h, n_w)
+        else:
+            mask = patch_mask.reshape(patch_mask.shape[0], 1, n_h, n_w)
+        mask = mask.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
+        return mask[:, :, :height, :width]
+
+    def random_precip_mask(self, batch_size: int, mask_ratio: float | tuple[float, float], device: torch.device) -> torch.Tensor:
+        n_tokens = (self.image_size[0] // self.patch_size) * (self.image_size[1] // self.patch_size)
+        if isinstance(mask_ratio, (list, tuple)):
+            lo, hi = float(mask_ratio[0]), float(mask_ratio[1])
+            ratios = torch.empty(batch_size, device=device).uniform_(lo, hi)
+        else:
+            ratios = torch.full((batch_size,), float(mask_ratio), device=device)
+        ratios = ratios.clamp(0.0, 1.0)
+        noise = torch.rand(batch_size, n_tokens, device=device)
+        ids = torch.argsort(noise, dim=1)
+        ranks = torch.argsort(ids, dim=1)
+        n_mask = torch.round(ratios * n_tokens).long().clamp(0, n_tokens)
+        return (ranks < n_mask[:, None]).float()
+
+    def random_channel_precip_mask(self, batch_size: int, mask_ratio: float | tuple[float, float], device: torch.device) -> torch.Tensor:
+        n_tokens = (self.image_size[0] // self.patch_size) * (self.image_size[1] // self.patch_size)
+        n_elements = self.channels * n_tokens
+        if isinstance(mask_ratio, (list, tuple)):
+            lo, hi = float(mask_ratio[0]), float(mask_ratio[1])
+            ratios = torch.empty(batch_size, device=device).uniform_(lo, hi)
+        else:
+            ratios = torch.full((batch_size,), float(mask_ratio), device=device)
+        ratios = ratios.clamp(0.0, 1.0)
+        noise = torch.rand(batch_size, n_elements, device=device)
+        ids = torch.argsort(noise, dim=1)
+        ranks = torch.argsort(ids, dim=1)
+        n_mask = torch.round(ratios * n_elements).long().clamp(0, n_elements)
+        return (ranks < n_mask[:, None]).float().reshape(batch_size, self.channels, n_tokens)
+
+    def token_mask_from_precip_mask(self, precip_mask: torch.Tensor) -> torch.Tensor:
+        if precip_mask.dim() == 3:
+            return precip_mask.amax(dim=1)
+        return precip_mask
+
+    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def predict_noise_from_start(self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
+        return (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / extract(
+            self.sqrt_recipm1_alphas_cumprod, t, x_t.shape
+        )
+
+    def predict_v(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise
+            - extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+        )
+
+    def predict_start_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t
+            - extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def model_predictions(self, x_t: torch.Tensor, t: torch.Tensor, cond: Dict[str, torch.Tensor], precip_mask: torch.Tensor):
+        model_out = self.forward(x_t, t, cond, precip_mask)
+        if self.objective == "pred_noise":
+            pred_noise = model_out
+            pred_x_start = self.predict_start_from_noise(x_t, t, pred_noise)
+        elif self.objective == "pred_x0":
+            pred_x_start = model_out
+            pred_noise = self.predict_noise_from_start(x_t, t, pred_x_start)
+        else:
+            pred_x_start = self.predict_start_from_v(x_t, t, model_out)
+            pred_noise = self.predict_noise_from_start(x_t, t, pred_x_start)
+        return pred_noise, pred_x_start
+
+    def p_losses(
+        self,
+        x_start: torch.Tensor,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        b = x_start.shape[0]
+        if t is None:
+            t = torch.randint(0, self.num_timesteps, (b,), device=x_start.device).long()
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        x_t = self.q_sample(x_start, t, noise)
+        model_out = self.forward(x_t, t, cond, precip_mask)
+        if self.objective == "pred_noise":
+            target = noise
+        elif self.objective == "pred_x0":
+            target = x_start
+        else:
+            target = self.predict_v(x_start, t, noise)
+        pixel_mask = self.expand_patch_mask(precip_mask, x_start.shape[-2], x_start.shape[-1]).to(x_start.dtype)
+        loss_raw = (model_out - target) ** 2
+        denom = pixel_mask.sum()
+        if pixel_mask.shape[1] == 1:
+            denom = denom * x_start.shape[1]
+        loss = (loss_raw * pixel_mask).sum() / denom.clamp_min(1.0)
+        return {"loss": loss, "model_out": model_out, "target": target, "x_t": x_t, "t": t}
+
+    def forward(
+        self,
+        noisy_precip: torch.Tensor,
+        t: torch.Tensor,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        b, _, orig_h, orig_w = noisy_precip.shape
+        noisy_tokens = self.noisy_precip_adapter(noisy_precip)
+        token_mask = self.token_mask_from_precip_mask(precip_mask).to(noisy_tokens.dtype).unsqueeze(-1)
+        target_tokens = noisy_tokens * (1.0 - token_mask) + self.mask_token * token_mask
+        pos = rearrange(self.target_pos_emb.to(noisy_precip.dtype), "b d h w -> b (h w) d")
+        target_tokens = target_tokens + pos + self.target_modality_emb
+
+        cond_tokens = []
+        for mod in self.conditioned_modalities:
+            if mod in cond:
+                cond_tokens.append(self.condition_adapters[mod](cond[mod]))
+        tokens = torch.cat([target_tokens] + cond_tokens, dim=1)
+        tokens = tokens + self.time_mlp(t).unsqueeze(1)
+        for block in self.blocks:
+            tokens = block(tokens)
+        tokens = self.norm(tokens[:, : target_tokens.shape[1]])
+        patches = self.out_proj(tokens)
+        n_h = self.image_size[0] // self.patch_size
+        n_w = self.image_size[1] // self.patch_size
+        x = patches.reshape(b, n_h, n_w, self.channels, self.patch_size, self.patch_size)
+        x = torch.einsum("bhwcpq->bchpwq", x).reshape(b, self.channels, n_h * self.patch_size, n_w * self.patch_size)
+        return x[:, :, :orig_h, :orig_w]
+
+    @torch.no_grad()
+    def sample_precip(
+        self,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
+        sampling_timesteps: Optional[int] = None,
+        eta: Optional[float] = None,
+        return_all_timesteps: bool = False,
+    ) -> torch.Tensor:
+        first = next(iter(cond.values()))
+        b, _, h, w = first.shape
+        shape = (b, self.channels, h, w)
+        img = torch.randn(shape, device=first.device, dtype=first.dtype)
+        pixel_mask = self.expand_patch_mask(precip_mask, h, w).to(first.dtype)
+        if precip_visible is not None:
+            img = img * pixel_mask + precip_visible * (1.0 - pixel_mask)
+
+        total_steps = sampling_timesteps or self.sampling_timesteps
+        eta = self.ddim_sampling_eta if eta is None else float(eta)
+        times = torch.linspace(-1, self.num_timesteps - 1, steps=total_steps + 1, device=first.device)
+        times = list(reversed(times.int().tolist()))
+        imgs = [img]
+        for time, time_next in zip(times[:-1], times[1:]):
+            time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
+            pred_noise, x_start = self.model_predictions(img, time_cond, cond, precip_mask)
+            if time_next < 0:
+                img = x_start
+            else:
+                alpha = self.alphas_cumprod[time]
+                alpha_next = self.alphas_cumprod[time_next]
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma**2).sqrt()
+                img = x_start * alpha_next.sqrt() + c * pred_noise + sigma * torch.randn_like(img)
+            if precip_visible is not None:
+                img = img * pixel_mask + precip_visible * (1.0 - pixel_mask)
+            imgs.append(img)
+        return torch.stack(imgs, dim=1) if return_all_timesteps else img
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        device = time.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / max(half_dim - 1, 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = time.float()[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        if self.dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
