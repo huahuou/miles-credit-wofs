@@ -3,6 +3,7 @@ import torch
 
 from credit.datasets.wrf_wofs_mae import WoFSMAEDataset
 from credit.models.wofs_diffmae import WoFSDiffMAE
+from credit.trainers.trainerWRF_diffmae import TrainerDiffMAE
 from credit.transforms.concentration import forward_concentration_transform_numpy, parse_concentration_transform_payload
 
 
@@ -33,7 +34,46 @@ def _small_model(objective="pred_v"):
     )
 
 
+def _small_grouped_model(objective="pred_v"):
+    return WoFSDiffMAE(
+        modality_channels={
+            "background": 2,
+            "precip": 6,
+            "reflectivity": 1,
+            "surface": 1,
+            "forcing": 2,
+        },
+        conditioned_modalities=["background", "surface", "forcing", "reflectivity"],
+        target_modality="precip",
+        precip_grouping="grouped",
+        precip_group_names=["rain", "hail", "snow"],
+        precip_group_channels=[2, 2, 2],
+        patch_size=4,
+        surface_forcing_stride=4,
+        image_size=(16, 16),
+        embed_dim=32,
+        depth=2,
+        num_heads=4,
+        diffusion={
+            "timesteps": 32,
+            "sampling_timesteps": 4,
+            "objective": objective,
+            "beta_schedule": "linear",
+            "ddim_sampling_eta": 0.0,
+        },
+    )
+
+
 def _cond(batch=2):
+    return {
+        "background": torch.randn(batch, 2, 16, 16),
+        "surface": torch.randn(batch, 1, 16, 16),
+        "forcing": torch.randn(batch, 2, 16, 16),
+        "reflectivity": torch.randn(batch, 1, 16, 16),
+    }
+
+
+def _cond_grouped(batch=2):
     return {
         "background": torch.randn(batch, 2, 16, 16),
         "surface": torch.randn(batch, 1, 16, 16),
@@ -117,6 +157,98 @@ def test_channel_patch_mask_supports_channel_specific_corrections():
 
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+
+
+def test_grouped_precip_tokenization_supports_group_specific_masks():
+    model = _small_grouped_model()
+    cond = _cond_grouped(batch=1)
+    precip = torch.randn(1, 6, 16, 16)
+    visible = torch.randn_like(precip)
+    mask = torch.zeros(1, 3, 16)
+    mask[:, 1, :4] = 1.0
+
+    assert model.grouped_precip
+    assert model.precip_group_index_for_channel(0) == 0
+    assert model.precip_group_index_for_channel(2) == 1
+    assert model.precip_group_index_for_channel(5) == 2
+
+    pixel_mask = model.expand_patch_mask(mask, 16, 16)
+    assert pixel_mask.shape == precip.shape
+    assert pixel_mask[:, 0:2].sum().item() == 0.0
+    assert pixel_mask[:, 2:4, :4, :].sum().item() > 0.0
+    assert pixel_mask[:, 4:6].sum().item() == 0.0
+
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["model_out"].shape == precip.shape
+    assert torch.isfinite(losses["loss"])
+
+    sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
+    assert sample.shape == precip.shape
+    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+
+
+def test_denoise_snapshot_can_save_tensor_without_figure(tmp_path):
+    model = _small_model()
+    trainer = TrainerDiffMAE(model, rank=0)
+    batch = {
+        "background": torch.randn(1, 2, 16, 16),
+        "surface": torch.randn(1, 1, 16, 16),
+        "forcing": torch.randn(1, 2, 16, 16),
+        "reflectivity": torch.randn(1, 1, 16, 16),
+        "precip": torch.randn(1, 3, 16, 16),
+    }
+    mask = model.random_precip_mask(1, 1.0, torch.device("cpu"))
+    losses = model.p_losses(batch["precip"], trainer._condition_dict(batch), mask)
+    losses["precip_mask"] = mask
+    conf = {
+        "save_loc": str(tmp_path),
+        "trainer": {
+            "denoise_snapshot": {
+                "enabled": True,
+                "every_steps": 1,
+                "dir": "snapshots",
+                "save_snapshot": True,
+                "save_figure": False,
+            }
+        },
+    }
+
+    trainer._maybe_save_denoise_snapshot(0, 0, conf, batch, losses)
+
+    assert (tmp_path / "snapshots" / "epoch0000_step000000.pt").exists()
+    assert not (tmp_path / "snapshots" / "epoch0000_step000000.png").exists()
+
+
+def test_denoise_snapshot_can_save_figure_without_tensor(tmp_path):
+    model = _small_model()
+    trainer = TrainerDiffMAE(model, rank=0)
+    batch = {
+        "background": torch.randn(1, 2, 16, 16),
+        "surface": torch.randn(1, 1, 16, 16),
+        "forcing": torch.randn(1, 2, 16, 16),
+        "reflectivity": torch.randn(1, 1, 16, 16),
+        "precip": torch.randn(1, 3, 16, 16),
+    }
+    mask = model.random_precip_mask(1, 1.0, torch.device("cpu"))
+    losses = model.p_losses(batch["precip"], trainer._condition_dict(batch), mask)
+    losses["precip_mask"] = mask
+    conf = {
+        "save_loc": str(tmp_path),
+        "trainer": {
+            "denoise_snapshot": {
+                "enabled": True,
+                "every_steps": 1,
+                "dir": "snapshots",
+                "save_snapshot": False,
+                "save_figure": True,
+            }
+        },
+    }
+
+    trainer._maybe_save_denoise_snapshot(0, 0, conf, batch, losses)
+
+    assert not (tmp_path / "snapshots" / "epoch0000_step000000.pt").exists()
+    assert (tmp_path / "snapshots" / "epoch0000_step000000.png").exists()
 
 
 def test_mae_dataset_uses_da_zero_inflated_normalization():

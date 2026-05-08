@@ -155,19 +155,20 @@ class TrainerDiffMAE(BaseTrainer):
                     losses["precip_mask"][:1],
                     sampling_timesteps=sampling_steps,
                 )
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "step": step,
-                    "x_t": losses["x_t"][:1].detach().cpu(),
-                    "target_precip": batch["precip"][:1].detach().cpu(),
-                    "pred_x0": pred_x0[:1].detach().cpu(),
-                    "pred_noise": pred_noise[:1].detach().cpu(),
-                    "precip_mask": losses["precip_mask"][:1].detach().cpu(),
-                    "sample": None if sample is None else sample[:1].detach().cpu(),
-                },
-                out_dir / f"epoch{epoch:04d}_step{step:06d}.pt",
-            )
+            if bool(snapshot_conf.get("save_snapshot", True)):
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "step": step,
+                        "x_t": losses["x_t"][:1].detach().cpu(),
+                        "target_precip": batch["precip"][:1].detach().cpu(),
+                        "pred_x0": pred_x0[:1].detach().cpu(),
+                        "pred_noise": pred_noise[:1].detach().cpu(),
+                        "precip_mask": losses["precip_mask"][:1].detach().cpu(),
+                        "sample": None if sample is None else sample[:1].detach().cpu(),
+                    },
+                    out_dir / f"epoch{epoch:04d}_step{step:06d}.pt",
+                )
             if bool(snapshot_conf.get("save_figure", True)):
                 self._save_denoise_figure(
                     out_dir / f"epoch{epoch:04d}_step{step:06d}.png",

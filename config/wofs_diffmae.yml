@@ -1,6 +1,6 @@
 # WoFS Conditional DiffMAE — Precip Random-Mask Inpainting
 
-save_loc: '/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain2'
+save_loc: '/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3'
 seed: 1000
 
 data:
@@ -74,6 +74,9 @@ model:
     reflectivity: 17
     surface: 0
     forcing: 12
+  precip_grouping: grouped
+  precip_group_names: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
+  precip_group_channels: [17, 17, 17, 17, 17, 17, 17, 17]
   conditioned_modalities: ['background', 'forcing', 'reflectivity']
   target_modality: 'precip'
   patch_size: 8
@@ -101,7 +104,7 @@ trainer:
   epochs: 100
   start_epoch: 0
   stopping_patience: 100
-  batches_per_epoch: 5000
+  batches_per_epoch: 7000
   valid_batches_per_epoch: 100
   reload_epoch: true
   train_one_epoch: false
@@ -124,7 +127,7 @@ trainer:
   weight_decay: 1.0e-5
   amp: true
   grad_max_norm: 1.0
-  grad_accum_every: 2
+  grad_accum_every: 1
   precip_mask_ratio: [0.5, 1.0]
   precip_mask_mode: mixed        # spatial_patch | channel_patch | mixed
   channel_patch_mask_probability: 0.5
@@ -132,9 +135,10 @@ trainer:
   val_mask_mode: spatial_patch
   denoise_snapshot:
     enabled: true
-    every_steps: 2000
+    every_steps: 1750
     every_epoch: true
     dir: denoise_snapshots
+    save_snapshot: false
     save_figure: true
     save_sampling_figure: true
     sampling_timesteps: 25

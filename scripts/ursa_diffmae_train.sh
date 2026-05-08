@@ -11,7 +11,7 @@
 #===============================================================================
 
 #----- Slurm Directives --------------------------------------------------------
-#SBATCH --job-name=credit-wofs-diffmae-train
+#SBATCH --job-name=credit-wofs-da-train
 #SBATCH --account=gpu-ai4wp
 #SBATCH --partition=u1-h100
 #SBATCH --qos=gpu
@@ -20,7 +20,7 @@
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=192
 #SBATCH --mem=0
-#SBATCH --time=1-01:59:00
+#SBATCH --time=2-11:59:00
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err
 #SBATCH --exclusive
@@ -33,7 +33,8 @@ NPROC_PER_NODE_OVERRIDE=""
 
 CONDA_ENV="credit-wofs"
 PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"
-CONFIG="${PROJECT_DIR}/config/wofs_diffmae.yml"
+##CONFIG="${PROJECT_DIR}/config/wofs_diffmae.yml"
+CONFIG="/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3_c1/model.yml"
 TRAINING_SCRIPT="applications/train_wrf_wofs_mae.py"
 
 #----- Load Modules ------------------------------------------------------------
