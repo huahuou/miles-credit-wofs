@@ -206,6 +206,31 @@ def test_ddpm_sampling_reimposes_visible_precip():
     assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
 
 
+def test_repaint_sampling_reimposes_visible_precip_and_returns_trajectory():
+    model = _small_model()
+    cond = _cond(batch=1)
+    visible = torch.randn(1, 3, 16, 16)
+    mask = torch.ones(1, 16)
+    mask[:, :4] = 0.0
+    sample = model.sample_precip(
+        cond,
+        mask,
+        precip_visible=visible,
+        sampler="repaint",
+        sampling_timesteps=8,
+        repaint_jump_length=2,
+        repaint_jump_n_sample=2,
+        return_all_timesteps=True,
+    )
+    pixel_mask = model.expand_patch_mask(mask, 16, 16)
+    final = sample[:, -1]
+    assert sample.ndim == 5
+    assert sample.shape[0] == 1
+    assert sample.shape[2:] == visible.shape[1:]
+    assert torch.isfinite(sample).all()
+    assert torch.allclose(final * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+
+
 def test_rollout_condition_builder_uses_stacked_forcing():
     batch = {
         "background_a": torch.randn(1, 1, 16, 16),

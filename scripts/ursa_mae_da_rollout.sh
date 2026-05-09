@@ -19,7 +19,7 @@
 #===============================================================================
 
 #----- Slurm Directives --------------------------------------------------------
-#SBATCH --job-name=credit-wofs-diffmae-rollout
+#SBATCH --job-name=credit-wofs-da-eval
 #SBATCH --account=gpu-ai4wp
 #SBATCH --partition=u1-h100
 #SBATCH --qos=gpu
@@ -28,7 +28,7 @@
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=0
-#SBATCH --time=06:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err
 #SBATCH --exclusive
@@ -36,22 +36,23 @@
 #----- User Configuration ------------------------------------------------------
 CONDA_ENV="${CONDA_ENV:-credit-wofs}"
 PROJECT_DIR="${PROJECT_DIR:-/home/Zhanxiang.Hua/miles-credit-wofs}"
-CONFIG="${CONFIG:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3/model.yml}"
+##CONFIG="${CONFIG:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3/model.yml}"
+CONFIG="${CONFIG:-/home/Zhanxiang.Hua/miles-credit-wofs/config/wofs_diffmae.yml}"
 ROLLOUT_SCRIPT="${ROLLOUT_SCRIPT:-applications/rollout_wrf_wofs_mae_da.py}"
 
 # Path to the trained checkpoint (.pt file). Leave empty to let the rollout
 # script load ${save_loc}/checkpoint.pt from the config.
-CHECKPOINT="${CHECKPOINT:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3/best_checkpoint.pt}"
+CHECKPOINT="${CHECKPOINT:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_latest2/best_checkpoint.pt}"
 
 # Date range to process (YYYYMMDD, inclusive).
 START_DATE="${START_DATE:-20210415}"
 END_DATE="${END_DATE:-20210530}"
 
 # Directory where analysis .zarr stores will be written.
-OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain3/test1}"
+OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_latest2/ddim}"
 
 # Optional smoke-test limits. Empty means no explicit limit.
-MAX_FILES="${MAX_FILES:-10}"
+MAX_FILES="${MAX_FILES:-2}"
 MAX_TIMES="${MAX_TIMES:-}"
 
 EVAL_MODE="${EVAL_MODE:-none}"

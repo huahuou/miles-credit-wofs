@@ -92,7 +92,7 @@ data:
   valid_history_len: 1
   forecast_len: 0
   valid_forecast_len: 0
-  target_start_step: 1
+  target_start_step: 0
   lead_time_periods: 1
   static_first: false
 model:
@@ -127,7 +127,9 @@ model:
   - forcing
   - reflectivity
   target_modality: precip
+  # decoder_type options: concat_self, cross_self. cross_self uses DiffMAE-style target-to-context cross-attention followed by target self-attention.
   decoder_type: cross_self
+  # grouped_decoder_scope options: per_group, joint. per_group is much cheaper; joint lets all precip variable-group tokens self-attend together.
   grouped_decoder_scope: per_group
   patch_size: 8
   surface_forcing_stride: 16
@@ -220,20 +222,36 @@ trainer:
   residual_prediction: false
   update_learning_rate: false
 eval:
+  # mode options: none, ddp, fsdp. Controls rollout parallelism/checkpoint wrapping only.
   mode: none
+  # sampler options: ddim, ddpm, repaint. repaint uses RePaint resampling jumps for inpainting with known precip clamping.
   sampler: ddim
+  # sampling_timesteps: DDIM step count; for RePaint, starts from min(num_timesteps - 1, sampling_timesteps - 1) for faster rollout.
   sampling_timesteps: 200
+  # ddim_sampling_eta: DDIM stochasticity; 0 is deterministic, larger values add noise. Ignored by ddpm/repaint.
   ddim_sampling_eta: 0.01
+  # repaint_jump_length: number of adjacent forward noising steps in each RePaint resampling jump.
+  repaint_jump_length: 10
+  # repaint_jump_n_sample: total visits at each RePaint jump point; values >1 repeat forward/backward resampling.
+  repaint_jump_n_sample: 5
+  # precip_mask_ratio: fraction of precip patches or variable-group patches to inpaint.
   precip_mask_ratio: 0.75
+  # precip_mask_mode options: spatial_patch, channel_patch. spatial_patch shares x/y mask; channel_patch masks variable groups independently.
   precip_mask_mode: spatial_patch
+  # clamp_visible_precip: when true, visible precip is re-noised to each diffusion timestep and reinserted during sampling.
   clamp_visible_precip: true
+  # save_norm_output: also write normalized model-space output in the zarr group "norm_output".
   save_norm_output: true
+  # overwrite: remove an existing analysis zarr store before writing.
   overwrite: true
+  # save_denoise_trajectory: save selected normalized channels across sampling steps in the zarr group "denoise_trajectory".
   save_denoise_trajectory: true
+  # trajectory_channels: global precip channel indices to save in the denoising trajectory.
   trajectory_channels:
   - 0
   - 2
   - 5
+  # trajectory_stride: keep every Nth saved sampler state to reduce trajectory output size.
   trajectory_stride: 10
 loss:
   latitude_weights: ''

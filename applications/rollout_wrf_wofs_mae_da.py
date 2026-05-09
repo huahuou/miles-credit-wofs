@@ -8,7 +8,7 @@ Workflow per case file:
     1. Load background, reflectivity, surface, forcing from zarr
     2. Normalize using mean.nc / std.nc + concentration transform
     3. Build a precip mask from the eval/rollout config
-    4. Run model.sample_precip(...) with DDIM or DDPM sampling
+    4. Run model.sample_precip(...) with DDIM, DDPM, or RePaint sampling
     5. Inverse-normalize the precip output
     6. Write QRAIN/QNRAIN/... analysis arrays to output zarr
 
@@ -312,6 +312,8 @@ def rollout_one_timestep(
     sampler = str(eval_conf.get("sampler", "ddim")).strip().lower()
     sampling_timesteps = int(eval_conf.get("sampling_timesteps", getattr(core, "sampling_timesteps", 50)))
     eta = eval_conf.get("ddim_sampling_eta", None)
+    repaint_jump_length = int(eval_conf.get("repaint_jump_length", 10))
+    repaint_jump_n_sample = int(eval_conf.get("repaint_jump_n_sample", 10))
     save_trajectory = bool(eval_conf.get("save_denoise_trajectory", False))
 
     cond = _build_condition_dict(
@@ -331,6 +333,8 @@ def rollout_one_timestep(
             sampling_timesteps=sampling_timesteps,
             eta=eta,
             sampler=sampler,
+            repaint_jump_length=repaint_jump_length,
+            repaint_jump_n_sample=repaint_jump_n_sample,
             return_all_timesteps=save_trajectory,
         )
 
@@ -562,6 +566,8 @@ def run_rollout(args, conf: dict):
                         "sampler": str(eval_conf.get("sampler", "ddim")),
                         "sampling_timesteps": int(eval_conf.get("sampling_timesteps", 50)),
                         "ddim_sampling_eta": float(eval_conf.get("ddim_sampling_eta", 0.0)),
+                        "repaint_jump_length": int(eval_conf.get("repaint_jump_length", 10)),
+                        "repaint_jump_n_sample": int(eval_conf.get("repaint_jump_n_sample", 10)),
                         "precip_mask_mode": str(eval_conf.get("precip_mask_mode", "spatial_patch")),
                         "precip_mask_ratio": str(eval_conf.get("precip_mask_ratio", 1.0)),
                     },

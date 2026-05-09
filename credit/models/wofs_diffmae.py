@@ -592,6 +592,35 @@ class WoFSDiffMAE(BaseModel):
             visible_t = self.q_sample(precip_visible, t)
         return img * pixel_mask + visible_t * (1.0 - pixel_mask)
 
+    def _repaint_times(self, start_time: int, jump_length: int, jump_n_sample: int) -> list[int]:
+        jump_length = max(1, int(jump_length))
+        jump_n_sample = max(1, int(jump_n_sample))
+        t_t = int(start_time) + 1
+        jumps = {
+            time: jump_n_sample - 1
+            for time in range(0, t_t - jump_length, jump_length)
+        }
+        times = []
+        time = t_t
+        while time >= 1:
+            time -= 1
+            times.append(time)
+            if jumps.get(time, 0) > 0:
+                jumps[time] -= 1
+                for _ in range(jump_length):
+                    time += 1
+                    times.append(time)
+        times.append(-1)
+        return times
+
+    def _repaint_forward_step(self, img: torch.Tensor, from_time: int, to_time: int) -> torch.Tensor:
+        if to_time <= from_time:
+            return img
+        for time in range(from_time + 1, to_time + 1):
+            beta = self.betas[time]
+            img = (1.0 - beta).sqrt() * img + beta.sqrt() * torch.randn_like(img)
+        return img
+
     def p_losses(
         self,
         x_start: torch.Tensor,
@@ -641,6 +670,8 @@ class WoFSDiffMAE(BaseModel):
         sampling_timesteps: Optional[int] = None,
         eta: Optional[float] = None,
         sampler: str = "ddim",
+        repaint_jump_length: int = 10,
+        repaint_jump_n_sample: int = 10,
         return_all_timesteps: bool = False,
     ) -> torch.Tensor:
         first = next(iter(cond.values()))
@@ -650,11 +681,13 @@ class WoFSDiffMAE(BaseModel):
         pixel_mask = self.expand_patch_mask(precip_mask, h, w).to(first.dtype)
 
         sampler = str(sampler).strip().lower()
-        if sampler not in {"ddim", "ddpm"}:
+        if sampler not in {"ddim", "ddpm", "repaint"}:
             raise ValueError(f"Unsupported DiffMAE sampler: {sampler!r}")
-        total_steps = self.num_timesteps if sampler == "ddpm" else (sampling_timesteps or self.sampling_timesteps)
+        total_steps = self.num_timesteps if sampler in {"ddpm", "repaint"} else (sampling_timesteps or self.sampling_timesteps)
         eta = self.ddim_sampling_eta if eta is None else float(eta)
         start_time = self.num_timesteps - 1
+        if sampler == "repaint" and sampling_timesteps is not None:
+            start_time = min(start_time, max(0, int(sampling_timesteps) - 1))
         img = self._apply_visible_precip(img, precip_visible, pixel_mask, start_time)
         imgs = [img]
 
@@ -665,6 +698,24 @@ class WoFSDiffMAE(BaseModel):
                 noise = torch.randn_like(img) if time > 0 else torch.zeros_like(img)
                 img = model_mean + (0.5 * model_log_variance).exp() * noise
                 img = self._apply_visible_precip(img, precip_visible, pixel_mask, time - 1)
+                imgs.append(img)
+            return torch.stack(imgs, dim=1) if return_all_timesteps else img
+
+        if sampler == "repaint":
+            times = self._repaint_times(start_time, repaint_jump_length, repaint_jump_n_sample)
+            if not times or times[0] != start_time:
+                raise RuntimeError(f"Invalid RePaint schedule starts with {times[0] if times else None}, expected {start_time}")
+            for time, time_next in zip(times[:-1], times[1:]):
+                if time_next > time:
+                    img = self._repaint_forward_step(img, time, time_next)
+                    img = self._apply_visible_precip(img, precip_visible, pixel_mask, time_next)
+                    imgs.append(img)
+                    continue
+                time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
+                model_mean, _, model_log_variance, _ = self.p_mean_variance(img, time_cond, cond, precip_mask)
+                noise = torch.randn_like(img) if time > 0 else torch.zeros_like(img)
+                img = model_mean + (0.5 * model_log_variance).exp() * noise
+                img = self._apply_visible_precip(img, precip_visible, pixel_mask, time_next)
                 imgs.append(img)
             return torch.stack(imgs, dim=1) if return_all_timesteps else img
 
