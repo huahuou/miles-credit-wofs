@@ -5,9 +5,10 @@ from credit.datasets.wrf_wofs_mae import WoFSMAEDataset
 from credit.models.wofs_diffmae import WoFSDiffMAE
 from credit.trainers.trainerWRF_diffmae import TrainerDiffMAE
 from credit.transforms.concentration import forward_concentration_transform_numpy, parse_concentration_transform_payload
+from applications.rollout_wrf_wofs_mae_da import _build_condition_dict, _sample_mask
 
 
-def _small_model(objective="pred_v"):
+def _small_model(objective="pred_v", decoder_type="concat_self"):
     return WoFSDiffMAE(
         modality_channels={
             "background": 2,
@@ -18,6 +19,7 @@ def _small_model(objective="pred_v"):
         },
         conditioned_modalities=["background", "surface", "forcing", "reflectivity"],
         target_modality="precip",
+        decoder_type=decoder_type,
         patch_size=4,
         surface_forcing_stride=4,
         image_size=(16, 16),
@@ -34,7 +36,7 @@ def _small_model(objective="pred_v"):
     )
 
 
-def _small_grouped_model(objective="pred_v"):
+def _small_grouped_model(objective="pred_v", decoder_type="concat_self", grouped_decoder_scope="per_group"):
     return WoFSDiffMAE(
         modality_channels={
             "background": 2,
@@ -46,6 +48,8 @@ def _small_grouped_model(objective="pred_v"):
         conditioned_modalities=["background", "surface", "forcing", "reflectivity"],
         target_modality="precip",
         precip_grouping="grouped",
+        decoder_type=decoder_type,
+        grouped_decoder_scope=grouped_decoder_scope,
         precip_group_names=["rain", "hail", "snow"],
         precip_group_channels=[2, 2, 2],
         patch_size=4,
@@ -113,6 +117,31 @@ def test_predict_v_round_trip():
     assert torch.allclose(recovered, x0, atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_ddim_update_matches_reference_formula():
+    model = _small_model(objective="pred_noise")
+    x_t = torch.randn(2, 3, 16, 16)
+    eps = torch.randn_like(x_t)
+    time = 20
+    time_next = 10
+    eta = 0.0
+
+    alpha = model.alphas_cumprod[time]
+    alpha_next = model.alphas_cumprod[time_next]
+    x_start = model.predict_start_from_noise(
+        x_t,
+        torch.full((x_t.shape[0],), time, dtype=torch.long),
+        eps,
+    )
+    ours = x_start * alpha_next.sqrt() + (1 - alpha_next).sqrt() * eps
+    reference = (
+        torch.sqrt(alpha_next / alpha) * x_t
+        + (torch.sqrt(1 - alpha_next) - torch.sqrt((alpha_next * (1 - alpha)) / alpha)) * eps
+    )
+
+    assert eta == 0.0
+    assert torch.allclose(ours, reference, atol=1.0e-5, rtol=1.0e-5)
+
+
 def test_forward_loss_and_sampling_shapes_are_finite():
     model = _small_model()
     precip = torch.randn(2, 3, 16, 16)
@@ -126,6 +155,33 @@ def test_forward_loss_and_sampling_shapes_are_finite():
     assert torch.isfinite(sample).all()
 
 
+def test_cross_self_decoder_forward_loss_and_sampling_shapes_are_finite():
+    model = _small_model(decoder_type="cross_self")
+    precip = torch.randn(2, 3, 16, 16)
+    cond = _cond()
+    mask = model.random_precip_mask(2, 0.75, precip.device)
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["loss"].ndim == 0
+    assert torch.isfinite(losses["loss"])
+    sample = model.sample_precip(cond, mask, sampling_timesteps=2)
+    assert sample.shape == precip.shape
+    assert torch.isfinite(sample).all()
+
+
+def test_masked_noisy_state_affects_prediction():
+    model = _small_model()
+    cond = _cond(batch=1)
+    t = torch.tensor([5])
+    mask = torch.ones(1, 16)
+    x1 = torch.randn(1, 3, 16, 16)
+    x2 = x1 + 0.5 * torch.randn_like(x1)
+
+    y1 = model(x1, t, cond, mask)
+    y2 = model(x2, t, cond, mask)
+
+    assert not torch.allclose(y1, y2)
+
+
 def test_visible_precip_is_reimposed_during_sampling():
     model = _small_model()
     cond = _cond(batch=1)
@@ -135,6 +191,51 @@ def test_visible_precip_is_reimposed_during_sampling():
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     pixel_mask = model.expand_patch_mask(mask, 16, 16)
     assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+
+
+def test_ddpm_sampling_reimposes_visible_precip():
+    model = _small_model()
+    cond = _cond(batch=1)
+    visible = torch.randn(1, 3, 16, 16)
+    mask = torch.ones(1, 16)
+    mask[:, :4] = 0.0
+    sample = model.sample_precip(cond, mask, precip_visible=visible, sampler="ddpm")
+    pixel_mask = model.expand_patch_mask(mask, 16, 16)
+    assert sample.shape == visible.shape
+    assert torch.isfinite(sample).all()
+    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+
+
+def test_rollout_condition_builder_uses_stacked_forcing():
+    batch = {
+        "background_a": torch.randn(1, 1, 16, 16),
+        "reflectivity_a": torch.randn(1, 1, 16, 16),
+        "precip": torch.randn(1, 3, 16, 16),
+        "forcing": torch.randn(1, 2, 16, 16),
+    }
+    cond = _build_condition_dict(
+        batch,
+        background_vars=["background_a"],
+        reflectivity_vars=["reflectivity_a"],
+        surface_vars=[],
+        forcing_vars=["f0", "f1"],
+        target_size=16,
+    )
+    assert cond["background"].shape == (1, 1, 16, 16)
+    assert cond["reflectivity"].shape == (1, 1, 16, 16)
+    assert cond["surface"].shape == (1, 0, 16, 16)
+    assert cond["forcing"].shape == (1, 2, 16, 16)
+
+
+def test_rollout_grouped_mask_uses_variable_group_axis():
+    model = _small_grouped_model()
+    mask = _sample_mask(
+        model,
+        {"precip_mask_ratio": 0.5, "precip_mask_mode": "channel_patch"},
+        batch_size=2,
+        device=torch.device("cpu"),
+    )
+    assert mask.shape == (2, 3, 16)
 
 
 def test_channel_patch_mask_supports_channel_specific_corrections():
@@ -185,6 +286,30 @@ def test_grouped_precip_tokenization_supports_group_specific_masks():
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     assert sample.shape == precip.shape
     assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+
+
+def test_grouped_cross_self_decoder_supports_group_specific_masks():
+    model = _small_grouped_model(decoder_type="cross_self")
+    cond = _cond_grouped(batch=1)
+    precip = torch.randn(1, 6, 16, 16)
+    mask = torch.zeros(1, 3, 16)
+    mask[:, 1, :4] = 1.0
+
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["model_out"].shape == precip.shape
+    assert torch.isfinite(losses["loss"])
+
+
+def test_grouped_joint_cross_self_decoder_supports_group_specific_masks():
+    model = _small_grouped_model(decoder_type="cross_self", grouped_decoder_scope="joint")
+    cond = _cond_grouped(batch=1)
+    precip = torch.randn(1, 6, 16, 16)
+    mask = torch.zeros(1, 3, 16)
+    mask[:, 1, :4] = 1.0
+
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["model_out"].shape == precip.shape
+    assert torch.isfinite(losses["loss"])
 
 
 def test_denoise_snapshot_can_save_tensor_without_figure(tmp_path):

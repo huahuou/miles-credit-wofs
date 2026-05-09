@@ -1,57 +1,87 @@
-# WoFS Conditional DiffMAE — Precip Random-Mask Inpainting
-
-save_loc: '/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3'
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_latest2
 seed: 1000
-
 data:
-  save_loc: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip'
-  mean_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/mean.nc'
-  std_path: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/std.nc'
-  log_transform_params_json: '/scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/zero_inflated_transform_params.json'
-  concentration_normalization_mode: 'zscore'
-
-  background_vars: ['T', 'QVAPOR', 'U', 'V', 'W', 'GEOPOT']
-  precip_vars: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
-  reflectivity_vars: ['REFL_10CM']
+  save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
+  mean_path: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/mean.nc
+  std_path: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/std.nc
+  log_transform_params_json: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/zero_inflated_transform_params.json
+  concentration_normalization_mode: zscore
+  background_vars:
+  - T
+  - QVAPOR
+  - U
+  - V
+  - W
+  - GEOPOT
+  precip_vars:
+  - QRAIN
+  - QNRAIN
+  - QHAIL
+  - QNHAIL
+  - QGRAUP
+  - QNGRAUPEL
+  - QSNOW
+  - QNSNOW
+  reflectivity_vars:
+  - REFL_10CM
   surface_vars: []
   dynamic_forcing_variables:
-    - cos_latitude
-    - sin_latitude
-    - cos_longitude
-    - sin_longitude
-    - cos_julian_day
-    - sin_julian_day
-    - cos_local_time
-    - sin_local_time
-    - cos_solar_zenith_angle
-    - insolation
-    - XLAND
-    - HGT
-
+  - cos_latitude
+  - sin_latitude
+  - cos_longitude
+  - sin_longitude
+  - cos_julian_day
+  - sin_julian_day
+  - cos_local_time
+  - sin_local_time
+  - cos_solar_zenith_angle
+  - insolation
+  - XLAND
+  - HGT
   levels: 17
   prognostic_levels: 17
   mae_pad_to: 304
   mae_include_t1_refl: true
   concentration_level_ops:
-    QRAIN: {ceiling_level: 17, mode: cutoff}
-    QNRAIN: {ceiling_level: 17, mode: cutoff}
-    QHAIL: {ceiling_level: 17, mode: cutoff}
-    QNHAIL: {ceiling_level: 17, mode: cutoff}
-    QGRAUP: {ceiling_level: 17, mode: cutoff}
-    QNGRAUPEL: {ceiling_level: 17, mode: cutoff}
-    QSNOW: {ceiling_level: 17, mode: cutoff}
-    QNSNOW: {ceiling_level: 17, mode: cutoff}
-
-  train_years: [2019, 2020]
-  valid_years: [2021]
-  train_date_range: ['20190101', '20201231']
-  valid_date_range: ['20210415', '20210430']
-
+    QRAIN:
+      ceiling_level: 17
+      mode: cutoff
+    QNRAIN:
+      ceiling_level: 17
+      mode: cutoff
+    QHAIL:
+      ceiling_level: 17
+      mode: cutoff
+    QNHAIL:
+      ceiling_level: 17
+      mode: cutoff
+    QGRAUP:
+      ceiling_level: 17
+      mode: cutoff
+    QNGRAUPEL:
+      ceiling_level: 17
+      mode: cutoff
+    QSNOW:
+      ceiling_level: 17
+      mode: cutoff
+    QNSNOW:
+      ceiling_level: 17
+      mode: cutoff
+  train_years:
+  - 2019
+  - 2020
+  valid_years:
+  - 2021
+  train_date_range:
+  - '20190101'
+  - '20201231'
+  valid_date_range:
+  - '20210415'
+  - '20210430'
   zarr_time_chunk: 2
   max_open_files_per_worker: 2
   max_dataset_open_retries: 4
-
-  scaler_type: 'std-wrf'
+  scaler_type: std-wrf
   variables: []
   surface_variables: []
   forcing_variables: []
@@ -65,9 +95,8 @@ data:
   target_start_step: 1
   lead_time_periods: 1
   static_first: false
-
 model:
-  type: 'wofs-diffmae'
+  type: wofs-diffmae
   modality_channels:
     background: 102
     precip: 136
@@ -75,13 +104,36 @@ model:
     surface: 0
     forcing: 12
   precip_grouping: grouped
-  precip_group_names: ['QRAIN', 'QNRAIN', 'QHAIL', 'QNHAIL', 'QGRAUP', 'QNGRAUPEL', 'QSNOW', 'QNSNOW']
-  precip_group_channels: [17, 17, 17, 17, 17, 17, 17, 17]
-  conditioned_modalities: ['background', 'forcing', 'reflectivity']
-  target_modality: 'precip'
+  precip_group_names:
+  - QRAIN
+  - QNRAIN
+  - QHAIL
+  - QNHAIL
+  - QGRAUP
+  - QNGRAUPEL
+  - QSNOW
+  - QNSNOW
+  precip_group_channels:
+  - 17
+  - 17
+  - 17
+  - 17
+  - 17
+  - 17
+  - 17
+  - 17
+  conditioned_modalities:
+  - background
+  - forcing
+  - reflectivity
+  target_modality: precip
+  decoder_type: cross_self
+  grouped_decoder_scope: per_group
   patch_size: 8
   surface_forcing_stride: 16
-  image_size: [304, 304]
+  image_size:
+  - 304
+  - 304
   embed_dim: 384
   depth: 8
   num_heads: 8
@@ -90,13 +142,12 @@ model:
   diffusion:
     timesteps: 1000
     sampling_timesteps: 50
-    objective: pred_v
-    beta_schedule: sigmoid
-    ddim_sampling_eta: 0.0
-
+    objective: pred_x0
+    beta_schedule: linear
+    ddim_sampling_eta: 0.01
 trainer:
-  type: 'standard-wrf-diffmae'
-  mode: 'ddp'
+  type: standard-wrf-diffmae
+  mode: ddp
   ddp_find_unused_parameters: false
   use_file_locality_sampler: true
   train_batch_size: 8
@@ -123,25 +174,28 @@ trainer:
   no_hang_pin_memory: false
   no_hang_persistent_workers: true
   no_hang_timeout_s: 180
-  learning_rate: 1.0e-4
-  weight_decay: 1.0e-5
+  learning_rate: 0.0001
+  weight_decay: 1.0e-05
   amp: true
   grad_max_norm: 1.0
   grad_accum_every: 1
-  precip_mask_ratio: [0.5, 1.0]
-  precip_mask_mode: mixed        # spatial_patch | channel_patch | mixed
+  precip_mask_ratio:
+  - 0.5
+  - 1.0
+  precip_mask_mode: mixed
   channel_patch_mask_probability: 0.5
   val_mask_ratio: 1.0
   val_mask_mode: spatial_patch
   denoise_snapshot:
     enabled: true
-    every_steps: 1750
+    every_steps: 2000
     every_epoch: true
     dir: denoise_snapshots
     save_snapshot: false
     save_figure: true
     save_sampling_figure: true
-    sampling_timesteps: 25
+    sampling_use_visible_precip: true
+    sampling_timesteps: 100
     channel: 0
   load_weights: false
   load_optimizer: false
@@ -149,34 +203,49 @@ trainer:
   load_scaler: false
   save_backup_weights: true
   save_best_weights: true
-  training_metric: 'valid_loss'
-  training_metric_direction: 'min'
+  training_metric: valid_loss
+  training_metric_direction: min
   skip_validation: false
-  save_metric_vars: ['precip']
+  save_metric_vars:
+  - precip
   use_scheduler: true
   scheduler:
     scheduler_type: cosine-annealing-restarts
     first_cycle_steps: 1000
     cycle_mult: 2.0
-    max_lr: 1.0e-3
-    min_lr: 5.0e-5
+    max_lr: 0.001
+    min_lr: 5.0e-05
     warmup_steps: 500
     gamma: 0.8
   residual_prediction: false
   update_learning_rate: false
-
+eval:
+  mode: none
+  sampler: ddim
+  sampling_timesteps: 200
+  ddim_sampling_eta: 0.01
+  precip_mask_ratio: 0.75
+  precip_mask_mode: spatial_patch
+  clamp_visible_precip: true
+  save_norm_output: true
+  overwrite: true
+  save_denoise_trajectory: true
+  trajectory_channels:
+  - 0
+  - 2
+  - 5
+  trajectory_stride: 10
 loss:
   latitude_weights: ''
   use_latitude_weights: false
   use_variable_weights: false
-  training_loss: 'mse'
-
+  training_loss: mse
 pbs:
-  queue: 'main'
-  account: 'NAML0001'
+  queue: main
+  account: NAML0001
   walltime: '12:00:00'
   nodes: 1
   ncpus_per_node: 128
   ngpus_per_node: 4
-  mem: '240GB'
-  jobname: 'wofs-diffmae'
+  mem: 240GB
+  jobname: wofs-diffmae

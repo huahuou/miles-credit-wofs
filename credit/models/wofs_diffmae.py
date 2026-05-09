@@ -12,7 +12,15 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from credit.models.base_model import BaseModel
-from credit.models.wofs_mae_adapters import Block, WoFSInputAdapter, build_2d_sincos_posemb, trunc_normal_
+from credit.models.wofs_mae_adapters import (
+    Attention,
+    Block,
+    CrossAttention,
+    Mlp,
+    WoFSInputAdapter,
+    build_2d_sincos_posemb,
+    trunc_normal_,
+)
 
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Iterable[int]) -> torch.Tensor:
@@ -53,6 +61,59 @@ def linear_beta_schedule(timesteps: int) -> torch.Tensor:
     return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float64)
 
 
+class CrossSelfDecoderBlock(nn.Module):
+    """DiffMAE decoder block: target tokens cross-attend context, then self-attend."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.norm_cross_q = norm_layer(dim)
+        self.norm_cross_ctx = norm_layer(dim)
+        self.cross_attn = CrossAttention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        self.norm_self = norm_layer(dim)
+        self.self_attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        self.norm_mlp = norm_layer(dim)
+        self.mlp = Mlp(dim, hidden_features=int(dim * mlp_ratio), drop=drop)
+        self.drop_path_prob = float(drop_path)
+
+    def _drop_path(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_path_prob == 0.0:
+            return x
+        keep = 1.0 - self.drop_path_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor = torch.floor(random_tensor + keep)
+        return x * random_tensor / keep
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        if context.shape[1] > 0:
+            x = x + self._drop_path(self.cross_attn(self.norm_cross_q(x), self.norm_cross_ctx(context)))
+        x = x + self._drop_path(self.self_attn(self.norm_self(x)))
+        x = x + self._drop_path(self.mlp(self.norm_mlp(x)))
+        return x
+
+
 class WoFSDiffMAE(BaseModel):
     """Diffusion model that inpaints normalized precip conditioned on unmasked WoFS context."""
 
@@ -62,6 +123,8 @@ class WoFSDiffMAE(BaseModel):
         conditioned_modalities: Optional[list[str]] = None,
         target_modality: str = "precip",
         precip_grouping: str = "legacy",
+        decoder_type: str = "concat_self",
+        grouped_decoder_scope: str = "per_group",
         precip_group_names: Optional[list[str]] = None,
         precip_group_channels: Optional[list[int]] = None,
         patch_size: int = 8,
@@ -87,6 +150,12 @@ class WoFSDiffMAE(BaseModel):
         self.target_modality = target_modality
         self.precip_grouping = str(precip_grouping).strip().lower()
         self.grouped_precip = self.precip_grouping in {"grouped", "by_variable", "factorized"}
+        self.decoder_type = str(decoder_type).strip().lower()
+        if self.decoder_type not in {"concat_self", "cross_self"}:
+            raise ValueError(f"Unsupported decoder_type: {decoder_type}")
+        self.grouped_decoder_scope = str(grouped_decoder_scope).strip().lower()
+        if self.grouped_decoder_scope not in {"per_group", "joint"}:
+            raise ValueError(f"Unsupported grouped_decoder_scope: {grouped_decoder_scope}")
         self.precip_group_names = list(precip_group_names or [])
         self.precip_group_channels = list(precip_group_channels or [])
         self.patch_size = int(patch_size)
@@ -127,9 +196,22 @@ class WoFSDiffMAE(BaseModel):
         )
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        self.blocks = nn.ModuleList(
-            [Block(self.embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_path=dpr[i]) for i in range(depth)]
-        )
+        if self.decoder_type == "cross_self":
+            self.blocks = nn.ModuleList(
+                [
+                    CrossSelfDecoderBlock(
+                        self.embed_dim,
+                        num_heads=num_heads,
+                        mlp_ratio=mlp_ratio,
+                        drop_path=dpr[i],
+                    )
+                    for i in range(depth)
+                ]
+            )
+        else:
+            self.blocks = nn.ModuleList(
+                [Block(self.embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_path=dpr[i]) for i in range(depth)]
+            )
         self.norm = nn.LayerNorm(self.embed_dim)
 
         self.legacy_precip_adapter = None
@@ -326,22 +408,40 @@ class WoFSDiffMAE(BaseModel):
         b, _, orig_h, orig_w = noisy_precip.shape
         noisy_tokens = self.legacy_precip_adapter(noisy_precip)
         token_mask = self.token_mask_from_precip_mask(precip_mask).to(noisy_tokens.dtype).unsqueeze(-1)
-        target_tokens = noisy_tokens * (1.0 - token_mask) + self.mask_token * token_mask
+        target_tokens = noisy_tokens + self.mask_token * token_mask
         pos = rearrange(self.target_pos_emb.to(noisy_precip.dtype), "b d h w -> b (h w) d")
         target_tokens = target_tokens + pos + self.target_modality_emb
 
         cond_tokens = self._condition_tokens(cond)
-        tokens = torch.cat([target_tokens] + cond_tokens, dim=1)
-        tokens = tokens + self.time_mlp(t).unsqueeze(1)
-        for block in self.blocks:
-            tokens = block(tokens)
-        tokens = self.norm(tokens[:, : target_tokens.shape[1]])
+        tokens = self._decode_target_tokens(target_tokens, cond_tokens, t)
         patches = self.legacy_out_proj(tokens)
         n_h = self.image_size[0] // self.patch_size
         n_w = self.image_size[1] // self.patch_size
         x = patches.reshape(b, n_h, n_w, self.channels, self.patch_size, self.patch_size)
         x = torch.einsum("bhwcpq->bchpwq", x).reshape(b, self.channels, n_h * self.patch_size, n_w * self.patch_size)
         return x[:, :, :orig_h, :orig_w]
+
+    def _decode_target_tokens(
+        self,
+        target_tokens: torch.Tensor,
+        cond_tokens: list[torch.Tensor],
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        time_tokens = self.time_mlp(t).unsqueeze(1)
+        if self.decoder_type == "cross_self":
+            target_tokens = target_tokens + time_tokens
+            context = target_tokens.new_zeros(target_tokens.shape[0], 0, target_tokens.shape[-1])
+            if cond_tokens:
+                context = torch.cat(cond_tokens, dim=1)
+            for block in self.blocks:
+                target_tokens = block(target_tokens, context)
+            return self.norm(target_tokens)
+
+        tokens = torch.cat([target_tokens] + cond_tokens, dim=1)
+        tokens = tokens + time_tokens
+        for block in self.blocks:
+            tokens = block(tokens)
+        return self.norm(tokens[:, : target_tokens.shape[1]])
 
     def _condition_tokens(self, cond: Dict[str, torch.Tensor]) -> list[torch.Tensor]:
         cond_tokens = []
@@ -353,26 +453,62 @@ class WoFSDiffMAE(BaseModel):
     def _grouped_forward(self, noisy_precip: torch.Tensor, t: torch.Tensor, cond: Dict[str, torch.Tensor], precip_mask: torch.Tensor) -> torch.Tensor:
         b, _, orig_h, orig_w = noisy_precip.shape
         cond_tokens = self._condition_tokens(cond)
+        if self.grouped_decoder_scope == "joint":
+            return self._grouped_forward_joint(noisy_precip, t, cond_tokens, precip_mask)
+
         outs = []
         for group_idx, (name, (start, stop)) in enumerate(zip(self.precip_group_names, self.precip_group_slices)):
-            group_x = noisy_precip[:, start:stop]
-            group_adapter = self.precip_group_adapters[name]
-            group_tokens = group_adapter(group_x)
-            if precip_mask.dim() == 2:
-                group_mask = precip_mask
-            elif precip_mask.dim() == 3:
-                group_mask = precip_mask[:, group_idx, :]
-            else:
-                raise ValueError(f"Unsupported precip_mask shape {tuple(precip_mask.shape)}")
-            token_mask = group_mask.to(group_tokens.dtype).unsqueeze(-1)
-            group_tokens = group_tokens * (1.0 - token_mask) + self.mask_token * token_mask
-            pos = rearrange(self.target_pos_emb.to(noisy_precip.dtype), "b d h w -> b (h w) d")
-            group_tokens = group_tokens + pos + self.target_modality_emb + self.precip_group_embeds[name]
-            tokens = torch.cat([group_tokens] + cond_tokens, dim=1)
-            tokens = tokens + self.time_mlp(t).unsqueeze(1)
-            for block in self.blocks:
-                tokens = block(tokens)
-            tokens = self.norm(tokens[:, : group_tokens.shape[1]])
+            group_tokens = self._group_tokens(noisy_precip, precip_mask, group_idx, name, start, stop)
+            tokens = self._decode_target_tokens(group_tokens, cond_tokens, t)
+            patches = self.precip_group_out_proj[name](tokens)
+            n_ch = stop - start
+            n_h = self.image_size[0] // self.patch_size
+            n_w = self.image_size[1] // self.patch_size
+            group_out = patches.reshape(b, n_h, n_w, n_ch, self.patch_size, self.patch_size)
+            group_out = torch.einsum("bhwcpq->bchpwq", group_out).reshape(b, n_ch, n_h * self.patch_size, n_w * self.patch_size)
+            outs.append(group_out[:, :, :orig_h, :orig_w])
+        return torch.cat(outs, dim=1)
+
+    def _group_tokens(
+        self,
+        noisy_precip: torch.Tensor,
+        precip_mask: torch.Tensor,
+        group_idx: int,
+        name: str,
+        start: int,
+        stop: int,
+    ) -> torch.Tensor:
+        group_x = noisy_precip[:, start:stop]
+        group_tokens = self.precip_group_adapters[name](group_x)
+        if precip_mask.dim() == 2:
+            group_mask = precip_mask
+        elif precip_mask.dim() == 3:
+            group_mask = precip_mask[:, group_idx, :]
+        else:
+            raise ValueError(f"Unsupported precip_mask shape {tuple(precip_mask.shape)}")
+        token_mask = group_mask.to(group_tokens.dtype).unsqueeze(-1)
+        group_tokens = group_tokens + self.mask_token * token_mask
+        pos = rearrange(self.target_pos_emb.to(noisy_precip.dtype), "b d h w -> b (h w) d")
+        return group_tokens + pos + self.target_modality_emb + self.precip_group_embeds[name]
+
+    def _grouped_forward_joint(
+        self,
+        noisy_precip: torch.Tensor,
+        t: torch.Tensor,
+        cond_tokens: list[torch.Tensor],
+        precip_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        b, _, orig_h, orig_w = noisy_precip.shape
+        group_tokens = [
+            self._group_tokens(noisy_precip, precip_mask, group_idx, name, start, stop)
+            for group_idx, (name, (start, stop)) in enumerate(zip(self.precip_group_names, self.precip_group_slices))
+        ]
+        n_tokens = group_tokens[0].shape[1]
+        decoded = self._decode_target_tokens(torch.cat(group_tokens, dim=1), cond_tokens, t)
+        decoded_groups = decoded.split(n_tokens, dim=1)
+
+        outs = []
+        for tokens, name, (start, stop) in zip(decoded_groups, self.precip_group_names, self.precip_group_slices):
             patches = self.precip_group_out_proj[name](tokens)
             n_ch = stop - start
             n_h = self.image_size[0] // self.patch_size
@@ -426,6 +562,36 @@ class WoFSDiffMAE(BaseModel):
             pred_noise = self.predict_noise_from_start(x_t, t, pred_x_start)
         return pred_noise, pred_x_start
 
+    def q_posterior(self, x_start: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
+            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance
+
+    def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, cond: Dict[str, torch.Tensor], precip_mask: torch.Tensor):
+        _, x_start = self.model_predictions(x_t, t, cond, precip_mask)
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x_t, t=t)
+        return model_mean, posterior_variance, posterior_log_variance, x_start
+
+    def _apply_visible_precip(
+        self,
+        img: torch.Tensor,
+        precip_visible: Optional[torch.Tensor],
+        pixel_mask: torch.Tensor,
+        time: Optional[int],
+    ) -> torch.Tensor:
+        if precip_visible is None:
+            return img
+        if time is None or time < 0:
+            visible_t = precip_visible
+        else:
+            t = torch.full((img.shape[0],), int(time), device=img.device, dtype=torch.long)
+            visible_t = self.q_sample(precip_visible, t)
+        return img * pixel_mask + visible_t * (1.0 - pixel_mask)
+
     def p_losses(
         self,
         x_start: torch.Tensor,
@@ -474,6 +640,7 @@ class WoFSDiffMAE(BaseModel):
         precip_visible: Optional[torch.Tensor] = None,
         sampling_timesteps: Optional[int] = None,
         eta: Optional[float] = None,
+        sampler: str = "ddim",
         return_all_timesteps: bool = False,
     ) -> torch.Tensor:
         first = next(iter(cond.values()))
@@ -481,14 +648,28 @@ class WoFSDiffMAE(BaseModel):
         shape = (b, self.channels, h, w)
         img = torch.randn(shape, device=first.device, dtype=first.dtype)
         pixel_mask = self.expand_patch_mask(precip_mask, h, w).to(first.dtype)
-        if precip_visible is not None:
-            img = img * pixel_mask + precip_visible * (1.0 - pixel_mask)
 
-        total_steps = sampling_timesteps or self.sampling_timesteps
+        sampler = str(sampler).strip().lower()
+        if sampler not in {"ddim", "ddpm"}:
+            raise ValueError(f"Unsupported DiffMAE sampler: {sampler!r}")
+        total_steps = self.num_timesteps if sampler == "ddpm" else (sampling_timesteps or self.sampling_timesteps)
         eta = self.ddim_sampling_eta if eta is None else float(eta)
+        start_time = self.num_timesteps - 1
+        img = self._apply_visible_precip(img, precip_visible, pixel_mask, start_time)
+        imgs = [img]
+
+        if sampler == "ddpm":
+            for time in reversed(range(self.num_timesteps)):
+                time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
+                model_mean, _, model_log_variance, _ = self.p_mean_variance(img, time_cond, cond, precip_mask)
+                noise = torch.randn_like(img) if time > 0 else torch.zeros_like(img)
+                img = model_mean + (0.5 * model_log_variance).exp() * noise
+                img = self._apply_visible_precip(img, precip_visible, pixel_mask, time - 1)
+                imgs.append(img)
+            return torch.stack(imgs, dim=1) if return_all_timesteps else img
+
         times = torch.linspace(-1, self.num_timesteps - 1, steps=total_steps + 1, device=first.device)
         times = list(reversed(times.int().tolist()))
-        imgs = [img]
         for time, time_next in zip(times[:-1], times[1:]):
             time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
             pred_noise, x_start = self.model_predictions(img, time_cond, cond, precip_mask)
@@ -500,8 +681,7 @@ class WoFSDiffMAE(BaseModel):
                 sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
                 c = (1 - alpha_next - sigma**2).sqrt()
                 img = x_start * alpha_next.sqrt() + c * pred_noise + sigma * torch.randn_like(img)
-            if precip_visible is not None:
-                img = img * pixel_mask + precip_visible * (1.0 - pixel_mask)
+            img = self._apply_visible_precip(img, precip_visible, pixel_mask, time_next)
             imgs.append(img)
         return torch.stack(imgs, dim=1) if return_all_timesteps else img
 

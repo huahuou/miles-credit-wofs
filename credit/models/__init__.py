@@ -118,6 +118,12 @@ def load_fsdp_or_checkpoint_policy(conf):
         }
     # FuXi
     # FuXi supports "spectral_norm = True" only
+    elif "wofs-diffmae" in conf["model"]["type"]:
+        from credit.models.wofs_mae_adapters import Block
+        from credit.models.wofs_diffmae import CrossSelfDecoderBlock
+
+        transformer_layers_cls = {Block, CrossSelfDecoderBlock}
+
     elif "fuxi" in conf["model"]["type"] or ("wrf" in conf["model"]["type"]) or ("dscale" in conf["model"]["type"]):
         from timm.models.swin_transformer_v2 import SwinTransformerV2Stage
 

@@ -150,9 +150,11 @@ class TrainerDiffMAE(BaseTrainer):
             sample = None
             if bool(snapshot_conf.get("save_sampling_figure", False)):
                 sampling_steps = int(snapshot_conf.get("sampling_timesteps", 8))
+                sample_visible = batch["precip"][:1] if bool(snapshot_conf.get("sampling_use_visible_precip", True)) else None
                 sample = model.sample_precip(
                     self._condition_dict({k: v[:1] for k, v in batch.items()}),
                     losses["precip_mask"][:1],
+                    precip_visible=sample_visible,
                     sampling_timesteps=sampling_steps,
                 )
             if bool(snapshot_conf.get("save_snapshot", True)):

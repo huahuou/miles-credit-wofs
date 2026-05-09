@@ -15,27 +15,27 @@
 #SBATCH --account=gpu-ai4wp
 #SBATCH --partition=u1-h100
 #SBATCH --qos=gpu
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=192
 #SBATCH --mem=0
-#SBATCH --time=2-11:59:00
+#SBATCH --time=23:30:00
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err
 #SBATCH --exclusive
 
 #----- User Configuration ------------------------------------------------------
 NUM_NODES=${SLURM_JOB_NUM_NODES:-1}
-GPUS_PER_NODE=2
-AUTO_DETECT_NPROC_PER_NODE=1
-NPROC_PER_NODE_OVERRIDE=""
+GPUS_PER_NODE=${GPUS_PER_NODE:-2}
+AUTO_DETECT_NPROC_PER_NODE=${AUTO_DETECT_NPROC_PER_NODE:-1}
+NPROC_PER_NODE_OVERRIDE="${NPROC_PER_NODE_OVERRIDE:-}"
 
-CONDA_ENV="credit-wofs"
-PROJECT_DIR="/home/Zhanxiang.Hua/miles-credit-wofs"
-##CONFIG="${PROJECT_DIR}/config/wofs_diffmae.yml"
-CONFIG="/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3_c1/model.yml"
-TRAINING_SCRIPT="applications/train_wrf_wofs_mae.py"
+CONDA_ENV="${CONDA_ENV:-credit-wofs}"
+PROJECT_DIR="${PROJECT_DIR:-/home/Zhanxiang.Hua/miles-credit-wofs}"
+CONFIG="${PROJECT_DIR}/config/wofs_diffmae.yml"
+##CONFIG="${CONFIG:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain3_c1/model.yml}"
+TRAINING_SCRIPT="${TRAINING_SCRIPT:-applications/train_wrf_wofs_mae.py}"
 
 #----- Load Modules ------------------------------------------------------------
 source $MODULESHOME/init/bash
@@ -71,13 +71,24 @@ else
     NPROC_PER_NODE=${GPUS_PER_NODE}
 fi
 
+if [ "${NUM_NODES}" -lt 1 ]; then
+    echo "NUM_NODES must be >= 1"
+    exit 1
+fi
+
+if [ "${NPROC_PER_NODE}" -lt 1 ]; then
+    echo "NPROC_PER_NODE must be >= 1"
+    exit 1
+fi
+
 TOTAL_GPUS=$((NUM_NODES * NPROC_PER_NODE))
 nodes_array=($(scontrol show hostnames $SLURM_JOB_NODELIST))
 head_node=${nodes_array[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "${head_node}" hostname --ip-address | awk '{print $1}')
+head_node_ip=$(srun --nodes=1 --ntasks=1 --ntasks-per-node=1 -w "${head_node}" hostname --ip-address | awk '{print $1}')
 MASTER_PORT=$(( RANDOM % 9000 + 10000 ))
 
 echo "SLURM_JOB_ID        = ${SLURM_JOB_ID}"
+echo "SLURM_JOB_NODELIST  = ${SLURM_JOB_NODELIST}"
 echo "NUM_NODES           = ${NUM_NODES}"
 echo "GPUS_PER_NODE       = ${GPUS_PER_NODE}"
 echo "NPROC_PER_NODE      = ${NPROC_PER_NODE}"
@@ -99,7 +110,12 @@ PY
 
 cd ${PROJECT_DIR}
 
-srun --cpu-bind=none torchrun \
+srun --nodes=${NUM_NODES} \
+    --ntasks=${NUM_NODES} \
+    --ntasks-per-node=1 \
+    --cpu-bind=none \
+    --kill-on-bad-exit=1 \
+    torchrun \
     --nnodes=${NUM_NODES} \
     --nproc-per-node=${NPROC_PER_NODE} \
     --rdzv-id=${SLURM_JOB_ID} \
@@ -109,3 +125,6 @@ srun --cpu-bind=none torchrun \
     -c ${CONFIG} \
     --backend nccl
 
+status=$?
+echo "Training finished with exit code: ${status}"
+exit ${status}
