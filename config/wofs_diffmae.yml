@@ -223,11 +223,11 @@ trainer:
   update_learning_rate: false
 eval:
   # mode options: none, ddp, fsdp. Controls rollout parallelism/checkpoint wrapping only.
-  mode: none
+  mode: ddp
   # sampler options: ddim, ddpm, repaint. repaint uses RePaint resampling jumps for inpainting with known precip clamping.
   sampler: ddim
   # sampling_timesteps: DDIM step count; for RePaint, starts from min(num_timesteps - 1, sampling_timesteps - 1) for faster rollout.
-  sampling_timesteps: 200
+  sampling_timesteps: 400
   # ddim_sampling_eta: DDIM stochasticity; 0 is deterministic, larger values add noise. Ignored by ddpm/repaint.
   ddim_sampling_eta: 0.01
   # repaint_jump_length: number of adjacent forward noising steps in each RePaint resampling jump.

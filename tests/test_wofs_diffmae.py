@@ -6,6 +6,13 @@ from credit.models.wofs_diffmae import WoFSDiffMAE
 from credit.trainers.trainerWRF_diffmae import TrainerDiffMAE
 from credit.transforms.concentration import forward_concentration_transform_numpy, parse_concentration_transform_payload
 from applications.rollout_wrf_wofs_mae_da import _build_condition_dict, _sample_mask
+from applications.rollout_wrf_wofs_mae_da_metrics import (
+    _grouped_mask_to_runtime_mask,
+    _grouped_patch_to_pixel_mask,
+    compute_masked_normalized_metrics,
+    compute_masked_physical_metrics,
+)
+from credit.wofs_diffmae_mask_utils import build_grouped_patch_masks, grouped_patch_mask_time_slice, load_mask_bundle, save_mask_bundle
 
 
 def _small_model(objective="pred_v", decoder_type="concat_self"):
@@ -438,3 +445,71 @@ def test_mae_dataset_uses_da_zero_inflated_normalization():
     latent = forward_concentration_transform_numpy(raw, spec, level_axis=0)
     expected = (latent - ds._mean_values["QRAIN"][:, None, None]) / ds._std_values["QRAIN"][:, None, None]
     assert np.allclose(out, expected, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_grouped_mask_bundle_round_trip_and_runtime_conversion(tmp_path):
+    bundle = build_grouped_patch_masks(
+        n_times=3,
+        n_groups=2,
+        token_h=2,
+        token_w=2,
+        mask_ratio=0.5,
+        mask_mode="channel_patch",
+        seed=123,
+    )
+    out_path = tmp_path / "mask.npz"
+    save_mask_bundle(
+        out_path,
+        patch_mask_grouped=bundle["patch_mask_grouped"],
+        mask_mode=bundle["mask_mode"],
+        requested_mask_ratio=bundle["requested_mask_ratio"],
+        actual_group_mask_fraction=bundle["actual_group_mask_fraction"],
+        group_names=["rain", "hail"],
+        group_channels=[2, 1],
+        image_size=(8, 8),
+        patch_size=4,
+        seed=123,
+    )
+    loaded = load_mask_bundle(out_path)
+    grouped_mask, mode, requested_ratio = grouped_patch_mask_time_slice(loaded, 1)
+    runtime_mask = _grouped_mask_to_runtime_mask(grouped_mask, [2, 1], mode)
+    pixel_mask = _grouped_patch_to_pixel_mask(grouped_mask, [2, 1], patch_size=4, height=8, width=8)
+
+    assert loaded["patch_mask_grouped"].shape == (3, 2, 2, 2)
+    assert grouped_mask.shape == (2, 2, 2)
+    assert mode == "channel_patch"
+    assert requested_ratio == 0.5
+    assert runtime_mask.shape == (3, 2, 2)
+    assert pixel_mask.shape == (3, 8, 8)
+    assert np.allclose(pixel_mask[0], pixel_mask[1])
+    assert not np.allclose(pixel_mask[1], pixel_mask[2])
+
+
+def test_spatial_mask_runtime_conversion_returns_2d_token_mask():
+    grouped_mask = np.array(
+        [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[1.0, 0.0], [0.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+    runtime_mask = _grouped_mask_to_runtime_mask(grouped_mask, [2, 1], "spatial_patch")
+    assert runtime_mask.shape == (4,)
+    assert np.allclose(runtime_mask, grouped_mask[0].reshape(-1))
+
+
+def test_masked_metrics_only_use_masked_entries():
+    pred = np.array([[[1.0, 5.0], [2.0, 3.0]]], dtype=np.float32)
+    target = np.array([[[0.0, 100.0], [2.0, 1.0]]], dtype=np.float32)
+    mask = np.array([[[1.0, 0.0], [0.0, 1.0]]], dtype=np.float32)
+
+    norm_metrics = compute_masked_normalized_metrics(pred, target, mask)
+    phys_metrics = compute_masked_physical_metrics(pred, target, mask)
+
+    expected_mse = ((1.0 - 0.0) ** 2 + (3.0 - 1.0) ** 2) / 2.0
+    expected_mae = (abs(1.0 - 0.0) + abs(3.0 - 1.0)) / 2.0
+    assert np.isclose(norm_metrics["mse"], expected_mse)
+    assert np.isclose(norm_metrics["mae"], expected_mae)
+    assert np.isclose(phys_metrics["mse"], expected_mse)
+    assert np.isclose(phys_metrics["mae"], expected_mae)
+    assert np.isfinite(norm_metrics["ssim"])
