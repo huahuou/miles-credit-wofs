@@ -154,7 +154,7 @@ trainer:
   use_file_locality_sampler: true
   train_batch_size: 8
   valid_batch_size: 8
-  epochs: 100
+  epochs: 500
   start_epoch: 0
   stopping_patience: 100
   batches_per_epoch: 7000
@@ -199,10 +199,10 @@ trainer:
     sampling_use_visible_precip: true
     sampling_timesteps: 200
     channel: 0
-  load_weights: false
-  load_optimizer: false
-  load_scheduler: false
-  load_scaler: false
+  load_weights: true
+  load_optimizer: true
+  load_scheduler: true
+  load_scaler: true
   save_backup_weights: true
   save_best_weights: true
   training_metric: valid_loss

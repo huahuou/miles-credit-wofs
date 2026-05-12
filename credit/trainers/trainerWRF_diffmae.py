@@ -25,6 +25,24 @@ from credit.trainers.base_trainer import BaseTrainer
 logger = logging.getLogger(__name__)
 
 
+def _choose_mixed_height_mode(conf: dict, device: torch.device) -> str:
+    probs = torch.tensor(
+        [
+            float(conf.get("mixed_height_spatial_probability", 1.0)),
+            float(conf.get("mixed_height_channel_probability", 1.0)),
+            float(conf.get("mixed_height_height_probability", 1.0)),
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    if torch.any(probs < 0):
+        raise ValueError("Mixed height mask probabilities must be non-negative")
+    total = probs.sum()
+    if total <= 0:
+        raise ValueError("At least one mixed height mask probability must be positive")
+    return ["spatial_patch", "channel_patch", "height_patch"][int(torch.multinomial(probs / total, 1).item())]
+
+
 class TrainerDiffMAE(BaseTrainer):
     def __init__(self, model: torch.nn.Module, rank: int):
         super().__init__(model, rank)
@@ -57,7 +75,17 @@ class TrainerDiffMAE(BaseTrainer):
         if mode in {"mixed", "spatial_or_channel"} and not validation:
             channel_prob = float(trainer_conf.get("channel_patch_mask_probability", 0.5))
             mode = "channel_patch" if torch.rand((), device=device).item() < channel_prob else "spatial_patch"
+        elif mode in {"mixed_height", "mixed_with_height", "spatial_channel_height"}:
+            mode = _choose_mixed_height_mode(trainer_conf, device)
 
+        if mode in {"height_patch", "height", "level_patch", "vertical_patch"}:
+            return model.random_height_precip_mask(
+                batch_size,
+                ratio,
+                device,
+                masked_levels=trainer_conf.get("height_mask_levels"),
+                visible_levels=trainer_conf.get("height_visible_levels"),
+            )
         if mode in {"channel_patch", "random_channel", "channel"}:
             return model.random_channel_precip_mask(batch_size, ratio, device)
         if mode in {"spatial_patch", "spatial", "patch"}:

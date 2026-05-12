@@ -43,7 +43,12 @@ def _small_model(objective="pred_v", decoder_type="concat_self"):
     )
 
 
-def _small_grouped_model(objective="pred_v", decoder_type="concat_self", grouped_decoder_scope="per_group"):
+def _small_grouped_model(
+    objective="pred_v",
+    decoder_type="concat_self",
+    grouped_decoder_scope="per_group",
+    target_attention_window_size=0,
+):
     return WoFSDiffMAE(
         modality_channels={
             "background": 2,
@@ -65,6 +70,7 @@ def _small_grouped_model(objective="pred_v", decoder_type="concat_self", grouped
         embed_dim=32,
         depth=2,
         num_heads=4,
+        target_attention_window_size=target_attention_window_size,
         diffusion={
             "timesteps": 32,
             "sampling_timesteps": 4,
@@ -270,6 +276,26 @@ def test_rollout_grouped_mask_uses_variable_group_axis():
     assert mask.shape == (2, 3, 16)
 
 
+def test_training_mixed_height_mask_can_select_height_mask():
+    model = _small_grouped_model()
+    trainer = TrainerDiffMAE(model, rank=0)
+    mask = trainer._sample_mask(
+        batch_size=2,
+        trainer_conf={
+            "precip_mask_ratio": 0.5,
+            "precip_mask_mode": "mixed_height",
+            "mixed_height_spatial_probability": 0.0,
+            "mixed_height_channel_probability": 0.0,
+            "mixed_height_height_probability": 1.0,
+            "height_visible_levels": [0],
+        },
+        device=torch.device("cpu"),
+    )
+    assert mask.shape == (2, 3, 2, 16)
+    assert mask[:, :, 0].sum().item() == 0.0
+    assert mask[:, :, 1].sum().item() > 0.0
+
+
 def test_channel_patch_mask_supports_channel_specific_corrections():
     model = _small_model()
     cond = _cond(batch=1)
@@ -330,6 +356,29 @@ def test_grouped_cross_self_decoder_supports_group_specific_masks():
     losses = model.p_losses(precip, cond, mask)
     assert losses["model_out"].shape == precip.shape
     assert torch.isfinite(losses["loss"])
+
+
+def test_grouped_height_mask_supports_level_specific_visible_precip():
+    model = _small_grouped_model(decoder_type="cross_self", target_attention_window_size=2)
+    cond = _cond_grouped(batch=1)
+    precip = torch.randn(1, 6, 16, 16)
+    visible = torch.randn_like(precip)
+    mask = torch.zeros(1, 3, 2, 16)
+    mask[:, :, 1, :4] = 1.0
+
+    pixel_mask = model.expand_patch_mask(mask, 16, 16)
+    token_mask = model.token_mask_from_precip_mask(mask)
+    assert pixel_mask.shape == precip.shape
+    assert token_mask.shape == (1, 16)
+    assert pixel_mask[:, 0::2].sum().item() == 0.0
+    assert pixel_mask[:, 1::2, :4, :].sum().item() > 0.0
+
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["model_out"].shape == precip.shape
+    assert torch.isfinite(losses["loss"])
+
+    sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
+    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
 
 
 def test_grouped_joint_cross_self_decoder_supports_group_specific_masks():
@@ -483,6 +532,78 @@ def test_grouped_mask_bundle_round_trip_and_runtime_conversion(tmp_path):
     assert pixel_mask.shape == (3, 8, 8)
     assert np.allclose(pixel_mask[0], pixel_mask[1])
     assert not np.allclose(pixel_mask[1], pixel_mask[2])
+
+
+def test_height_mask_bundle_round_trip_and_runtime_conversion(tmp_path):
+    bundle = build_grouped_patch_masks(
+        n_times=2,
+        n_groups=2,
+        token_h=2,
+        token_w=2,
+        mask_ratio=1.0,
+        mask_mode="height_patch",
+        seed=123,
+        group_channels=[2, 2],
+        height_visible_levels=[0],
+    )
+    out_path = tmp_path / "height_mask.npz"
+    save_mask_bundle(
+        out_path,
+        patch_mask_grouped=bundle["patch_mask_grouped"],
+        mask_mode=bundle["mask_mode"],
+        requested_mask_ratio=bundle["requested_mask_ratio"],
+        actual_group_mask_fraction=bundle["actual_group_mask_fraction"],
+        group_names=["rain", "hail"],
+        group_channels=[2, 2],
+        image_size=(8, 8),
+        patch_size=4,
+        seed=123,
+    )
+    loaded = load_mask_bundle(out_path)
+    grouped_mask, mode, requested_ratio = grouped_patch_mask_time_slice(loaded, 0)
+    runtime_mask = _grouped_mask_to_runtime_mask(grouped_mask, [2, 2], mode)
+    pixel_mask = _grouped_patch_to_pixel_mask(grouped_mask, [2, 2], patch_size=4, height=8, width=8)
+
+    assert loaded["patch_mask_grouped"].shape == (2, 2, 2, 2, 2)
+    assert grouped_mask.shape == (2, 2, 2, 2)
+    assert mode == "height_patch"
+    assert requested_ratio == 1.0
+    assert runtime_mask.shape == (2, 2, 4)
+    assert pixel_mask.shape == (4, 8, 8)
+    assert pixel_mask[0].sum() == 0.0
+    assert pixel_mask[1].sum() == 64.0
+    assert pixel_mask[2].sum() == 0.0
+    assert pixel_mask[3].sum() == 64.0
+
+
+def test_mixed_height_mask_bundle_can_store_spatial_channel_and_height_modes():
+    bundle = build_grouped_patch_masks(
+        n_times=6,
+        n_groups=2,
+        token_h=2,
+        token_w=2,
+        mask_ratio=0.5,
+        mask_mode="mixed_height",
+        seed=4,
+        group_channels=[2, 2],
+        height_visible_levels=[0],
+    )
+
+    assert bundle["patch_mask_grouped"].shape == (6, 2, 2, 2, 2)
+    assert set(bundle["mask_mode"].tolist()) == {"spatial_patch", "channel_patch", "height_patch"}
+
+    for grouped_mask, mode in zip(bundle["patch_mask_grouped"], bundle["mask_mode"]):
+        runtime_mask = _grouped_mask_to_runtime_mask(grouped_mask, [2, 2], str(mode))
+        if mode == "height_patch":
+            assert runtime_mask.shape == (2, 2, 4)
+            assert runtime_mask[:, 0].sum() == 0.0
+        elif mode == "channel_patch":
+            assert runtime_mask.shape == (2, 2, 4)
+            assert np.allclose(runtime_mask[:, 0], runtime_mask[:, 1])
+        else:
+            assert runtime_mask.shape == (2, 2, 4)
+            assert np.allclose(runtime_mask[0], runtime_mask[1])
+            assert np.allclose(runtime_mask[:, 0], runtime_mask[:, 1])
 
 
 def test_spatial_mask_runtime_conversion_returns_2d_token_mask():

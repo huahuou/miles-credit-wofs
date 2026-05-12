@@ -29,7 +29,10 @@ def primary_main():
         "--mask-mode",
         default=None,
         type=str,
-        help="Override eval.precip_mask_mode from config. Supported: spatial_patch, channel_patch, mixed.",
+        help=(
+            "Override eval.precip_mask_mode from config. Supported: spatial_patch, "
+            "channel_patch, height_patch, mixed, mixed_height."
+        ),
     )
     parser.add_argument(
         "--mask-ratio",
@@ -60,6 +63,12 @@ def primary_main():
         mask_mode=eval_conf.get("precip_mask_mode", "spatial_patch"),
         seed=int(args.seed),
         channel_patch_mask_probability=float(conf.get("trainer", {}).get("channel_patch_mask_probability", 0.5)),
+        mixed_height_spatial_probability=float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
+        mixed_height_channel_probability=float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+        mixed_height_height_probability=float(eval_conf.get("mixed_height_height_probability", 1.0)),
+        group_channels=group_channels,
+        height_mask_levels=eval_conf.get("height_mask_levels"),
+        height_visible_levels=eval_conf.get("height_visible_levels"),
     )
     out_path = Path(args.out)
     save_mask_bundle(

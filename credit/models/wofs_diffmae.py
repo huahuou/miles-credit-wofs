@@ -73,6 +73,8 @@ class CrossSelfDecoderBlock(nn.Module):
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float = 0.0,
+        target_grid_size: Optional[Tuple[int, int]] = None,
+        target_window_size: int = 0,
         norm_layer=nn.LayerNorm,
     ):
         super().__init__()
@@ -86,13 +88,26 @@ class CrossSelfDecoderBlock(nn.Module):
             proj_drop=drop,
         )
         self.norm_self = norm_layer(dim)
-        self.self_attn = Attention(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-        )
+        if target_window_size and target_window_size > 0:
+            if target_grid_size is None:
+                raise ValueError("target_grid_size is required when target_window_size > 0")
+            self.self_attn = WindowAttention2D(
+                dim,
+                num_heads=num_heads,
+                grid_size=target_grid_size,
+                window_size=int(target_window_size),
+                qkv_bias=qkv_bias,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+            )
+        else:
+            self.self_attn = Attention(
+                dim,
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+            )
         self.norm_mlp = norm_layer(dim)
         self.mlp = Mlp(dim, hidden_features=int(dim * mlp_ratio), drop=drop)
         self.drop_path_prob = float(drop_path)
@@ -112,6 +127,52 @@ class CrossSelfDecoderBlock(nn.Module):
         x = x + self._drop_path(self.self_attn(self.norm_self(x)))
         x = x + self._drop_path(self.mlp(self.norm_mlp(x)))
         return x
+
+
+class WindowAttention2D(nn.Module):
+    """Local self-attention over a 2-D target-token grid."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        grid_size: Tuple[int, int],
+        window_size: int,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = (int(grid_size[0]), int(grid_size[1]))
+        self.window_size = int(window_size)
+        if self.window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {window_size}")
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, d = x.shape
+        grid_h, grid_w = self.grid_size
+        if n != grid_h * grid_w:
+            raise ValueError(f"WindowAttention2D expected {grid_h * grid_w} tokens, got {n}")
+        w = self.window_size
+        x_grid = x.reshape(b, grid_h, grid_w, d)
+        pad_h = (w - grid_h % w) % w
+        pad_w = (w - grid_w % w) % w
+        if pad_h or pad_w:
+            x_grid = F.pad(x_grid, (0, 0, 0, pad_w, 0, pad_h))
+        padded_h, padded_w = x_grid.shape[1], x_grid.shape[2]
+        x_windows = x_grid.reshape(b, padded_h // w, w, padded_w // w, w, d)
+        x_windows = x_windows.permute(0, 1, 3, 2, 4, 5).reshape(-1, w * w, d)
+        x_windows = self.attn(x_windows)
+        x_grid = x_windows.reshape(b, padded_h // w, padded_w // w, w, w, d)
+        x_grid = x_grid.permute(0, 1, 3, 2, 4, 5).reshape(b, padded_h, padded_w, d)
+        return x_grid[:, :grid_h, :grid_w].reshape(b, n, d)
 
 
 class WoFSDiffMAE(BaseModel):
@@ -135,6 +196,7 @@ class WoFSDiffMAE(BaseModel):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         drop_path_rate: float = 0.0,
+        target_attention_window_size: int = 0,
         diffusion: Optional[dict] = None,
         **kwargs,
     ):
@@ -168,6 +230,8 @@ class WoFSDiffMAE(BaseModel):
         self.frames = 1
         self.self_condition = False
         self.condition = True
+        self.target_grid_size = (self.image_size[0] // self.patch_size, self.image_size[1] // self.patch_size)
+        self.target_attention_window_size = int(target_attention_window_size)
 
         sf_h = math.ceil(self.image_size[0] / self.surface_forcing_stride) * self.surface_forcing_stride
         sf_w = math.ceil(self.image_size[1] / self.surface_forcing_stride) * self.surface_forcing_stride
@@ -204,6 +268,8 @@ class WoFSDiffMAE(BaseModel):
                         num_heads=num_heads,
                         mlp_ratio=mlp_ratio,
                         drop_path=dpr[i],
+                        target_grid_size=self.target_grid_size,
+                        target_window_size=self.target_attention_window_size,
                     )
                     for i in range(depth)
                 ]
@@ -231,8 +297,7 @@ class WoFSDiffMAE(BaseModel):
             )
             self.legacy_out_proj = nn.Linear(self.embed_dim, self.channels * self.patch_size * self.patch_size)
 
-        n_h = self.image_size[0] // self.patch_size
-        n_w = self.image_size[1] // self.patch_size
+        n_h, n_w = self.target_grid_size
         pos_emb = build_2d_sincos_posemb(n_h, n_w, self.embed_dim)
         self.register_buffer("target_pos_emb", pos_emb)
         self.target_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
@@ -330,7 +395,25 @@ class WoFSDiffMAE(BaseModel):
     def expand_patch_mask(self, patch_mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
         n_h = self.image_size[0] // self.patch_size
         n_w = self.image_size[1] // self.patch_size
-        if patch_mask.dim() == 3:
+        if patch_mask.dim() == 4:
+            if not self.grouped_precip:
+                raise ValueError("4-D height masks require grouped precip tokenization")
+            b, n_groups, _, _ = patch_mask.shape
+            if n_groups != len(self.precip_group_slices):
+                raise ValueError(
+                    f"Height mask has {n_groups} groups but model has {len(self.precip_group_slices)} precip groups"
+                )
+            expanded = []
+            for group_idx, (start, stop) in enumerate(self.precip_group_slices):
+                n_ch = stop - start
+                group_mask = patch_mask[:, group_idx, :n_ch, :]
+                if group_mask.shape[1] != n_ch:
+                    raise ValueError(
+                        f"Height mask group {group_idx} has {group_mask.shape[1]} levels, expected {n_ch}"
+                    )
+                expanded.append(group_mask.reshape(b, n_ch, n_h, n_w))
+            mask = torch.cat(expanded, dim=1)
+        elif patch_mask.dim() == 3:
             mask = patch_mask.reshape(patch_mask.shape[0], patch_mask.shape[1], n_h, n_w)
             if self.grouped_precip and patch_mask.shape[1] == len(self.precip_group_slices):
                 mask = torch.cat(
@@ -399,7 +482,56 @@ class WoFSDiffMAE(BaseModel):
         n_mask = torch.round(ratios * (n_groups * n_tokens)).long().clamp(0, n_groups * n_tokens)
         return (ranks < n_mask[:, None]).float().reshape(batch_size, n_groups, n_tokens)
 
+    def random_height_precip_mask(
+        self,
+        batch_size: int,
+        mask_ratio: float | tuple[float, float],
+        device: torch.device,
+        masked_levels: Optional[list[int]] = None,
+        visible_levels: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        n_tokens = (self.image_size[0] // self.patch_size) * (self.image_size[1] // self.patch_size)
+        if not self.grouped_precip:
+            return self.random_channel_precip_mask(batch_size, mask_ratio, device)
+        group_channels = [stop - start for start, stop in self.precip_group_slices]
+        if len(set(group_channels)) != 1:
+            raise ValueError("Height masks require all precip groups to have the same number of levels")
+        n_groups = len(group_channels)
+        n_levels = group_channels[0]
+        if isinstance(mask_ratio, (list, tuple)):
+            lo, hi = float(mask_ratio[0]), float(mask_ratio[1])
+            ratios = torch.empty(batch_size, device=device).uniform_(lo, hi)
+        else:
+            ratios = torch.full((batch_size,), float(mask_ratio), device=device)
+        ratios = ratios.clamp(0.0, 1.0)
+
+        eligible = torch.ones(n_levels, device=device, dtype=torch.bool)
+        if masked_levels is not None:
+            eligible = torch.zeros(n_levels, device=device, dtype=torch.bool)
+            for level in masked_levels:
+                if 0 <= int(level) < n_levels:
+                    eligible[int(level)] = True
+        if visible_levels is not None:
+            for level in visible_levels:
+                if 0 <= int(level) < n_levels:
+                    eligible[int(level)] = False
+        n_eligible = int(eligible.sum().item())
+        mask = torch.zeros(batch_size, n_groups, n_levels, n_tokens, device=device)
+        if n_eligible == 0:
+            return mask
+
+        n_elements = n_groups * n_eligible * n_tokens
+        noise = torch.rand(batch_size, n_elements, device=device)
+        ids = torch.argsort(noise, dim=1)
+        ranks = torch.argsort(ids, dim=1)
+        n_mask = torch.round(ratios * n_elements).long().clamp(0, n_elements)
+        sampled = (ranks < n_mask[:, None]).float().reshape(batch_size, n_groups, n_eligible, n_tokens)
+        mask[:, :, eligible, :] = sampled
+        return mask
+
     def token_mask_from_precip_mask(self, precip_mask: torch.Tensor) -> torch.Tensor:
+        if precip_mask.dim() == 4:
+            return precip_mask.amax(dim=(1, 2))
         if precip_mask.dim() == 3:
             return precip_mask.amax(dim=1)
         return precip_mask
@@ -484,6 +616,8 @@ class WoFSDiffMAE(BaseModel):
             group_mask = precip_mask
         elif precip_mask.dim() == 3:
             group_mask = precip_mask[:, group_idx, :]
+        elif precip_mask.dim() == 4:
+            group_mask = precip_mask[:, group_idx].amax(dim=1)
         else:
             raise ValueError(f"Unsupported precip_mask shape {tuple(precip_mask.shape)}")
         token_mask = group_mask.to(group_tokens.dtype).unsqueeze(-1)

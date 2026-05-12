@@ -215,6 +215,30 @@ def _sample_mask(model: torch.nn.Module, eval_conf: dict, batch_size: int, devic
     core = _unwrap_model(model)
     mask_ratio = eval_conf.get("precip_mask_ratio", eval_conf.get("mask_ratio", 1.0))
     mask_mode = str(eval_conf.get("precip_mask_mode", eval_conf.get("mask_mode", "spatial_patch"))).strip().lower()
+    if mask_mode in {"mixed_height", "mixed_with_height", "spatial_channel_height"}:
+        probs = torch.tensor(
+            [
+                float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
+                float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+                float(eval_conf.get("mixed_height_height_probability", 1.0)),
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        if torch.any(probs < 0):
+            raise ValueError("Mixed height mask probabilities must be non-negative")
+        total = probs.sum()
+        if total <= 0:
+            raise ValueError("At least one mixed height mask probability must be positive")
+        mask_mode = ["spatial_patch", "channel_patch", "height_patch"][int(torch.multinomial(probs / total, 1).item())]
+    if mask_mode in {"height_patch", "height", "level_patch", "vertical_patch"}:
+        return core.random_height_precip_mask(
+            batch_size,
+            mask_ratio,
+            device,
+            masked_levels=eval_conf.get("height_mask_levels"),
+            visible_levels=eval_conf.get("height_visible_levels"),
+        )
     if mask_mode in {"channel_patch", "random_channel", "channel", "group_patch", "variable_patch", "grouped"}:
         return core.random_channel_precip_mask(batch_size, mask_ratio, device)
     if mask_mode in {"spatial_patch", "spatial", "patch"}:

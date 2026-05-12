@@ -197,8 +197,12 @@ def _grouped_mask_to_runtime_mask(
     group_channels: list[int],
     mode: str,
 ) -> np.ndarray:
+    if grouped_mask.ndim == 4:
+        return np.asarray(grouped_mask, dtype=np.float32).reshape(len(group_channels), int(group_channels[0]), -1)
     if mode == "spatial_patch":
         return np.asarray(grouped_mask[0], dtype=np.float32).reshape(-1)
+    if mode == "height_patch":
+        return np.asarray(grouped_mask, dtype=np.float32).reshape(len(group_channels), int(group_channels[0]), -1)
 
     expanded: list[np.ndarray] = []
     for group_index, n_channels in enumerate(group_channels):
@@ -216,6 +220,13 @@ def _grouped_patch_to_pixel_mask(
     expanded = []
     for group_index, n_channels in enumerate(group_channels):
         group = grouped_mask[group_index]
+        if group.ndim == 3:
+            channel_pixels = []
+            for level in range(int(n_channels)):
+                pixel = np.repeat(np.repeat(group[level], patch_size, axis=0), patch_size, axis=1)
+                channel_pixels.append(pixel[:height, :width])
+            expanded.append(np.stack(channel_pixels, axis=0))
+            continue
         pixel = np.repeat(np.repeat(group, patch_size, axis=0), patch_size, axis=1)
         pixel = pixel[:height, :width]
         expanded.append(np.repeat(pixel[None, :, :], int(n_channels), axis=0))
@@ -324,6 +335,12 @@ def _write_case_mask_bundle(
         mask_mode=eval_conf.get("precip_mask_mode", "spatial_patch"),
         seed=seed,
         channel_patch_mask_probability=float(conf.get("trainer", {}).get("channel_patch_mask_probability", 0.5)),
+        mixed_height_spatial_probability=float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
+        mixed_height_channel_probability=float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+        mixed_height_height_probability=float(eval_conf.get("mixed_height_height_probability", 1.0)),
+        group_channels=group_channels,
+        height_mask_levels=eval_conf.get("height_mask_levels"),
+        height_visible_levels=eval_conf.get("height_visible_levels"),
     )
     mask_path = os.path.join(out_dir, f"{case_stem}_mask.npz")
     save_mask_bundle(
@@ -354,9 +371,27 @@ def _build_precip_mask_for_rollout(
     if mask_bundle is None:
         eval_conf = dict(_eval_conf(conf))
         mode = normalize_mask_mode(eval_conf.get("precip_mask_mode", "spatial_patch"))
+        needs_level_axis = mode == "mixed_height"
         if mode == "mixed":
             channel_prob = float(conf.get("trainer", {}).get("channel_patch_mask_probability", 0.5))
             mode = "channel_patch" if torch.rand((), device=device).item() < channel_prob else "spatial_patch"
+            eval_conf["precip_mask_mode"] = mode
+        elif mode == "mixed_height":
+            probs = torch.tensor(
+                [
+                    float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
+                    float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+                    float(eval_conf.get("mixed_height_height_probability", 1.0)),
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+            if torch.any(probs < 0):
+                raise ValueError("Mixed height mask probabilities must be non-negative")
+            total = probs.sum()
+            if total <= 0:
+                raise ValueError("At least one mixed height mask probability must be positive")
+            mode = ["spatial_patch", "channel_patch", "height_patch"][int(torch.multinomial(probs / total, 1).item())]
             eval_conf["precip_mask_mode"] = mode
         runtime_mask = _runtime_sample_mask(model, eval_conf, batch_size, device)
         token_h, token_w = token_grid_shape(conf)
@@ -366,8 +401,12 @@ def _build_precip_mask_for_rollout(
         if runtime_mask.ndim == 2:
             base = runtime_np[0].reshape(token_h, token_w)
             grouped_mask = np.repeat(base[None, :, :], grouped_count, axis=0)
+        elif runtime_mask.ndim == 4:
+            grouped_mask = runtime_np[0].reshape(grouped_count, int(group_channels[0]), token_h, token_w)
         else:
             grouped_mask = runtime_np[0].reshape(runtime_np.shape[1], token_h, token_w)
+        if needs_level_axis and grouped_mask.ndim == 3:
+            grouped_mask = np.repeat(grouped_mask[:, None, :, :], int(group_channels[0]), axis=1)
         return runtime_mask, {
             "mode": mode,
             "grouped_patch_mask": grouped_mask,
@@ -734,12 +773,18 @@ def run_rollout(args, conf: dict):
                     ).to_zarr(out_path, mode="a", group="denoise_trajectory")
 
                 group_names, group_channels = resolve_precip_group_layout(conf)
-                patch_h, patch_w = grouped_patch_masks[0].shape[-2:]
+                grouped_mask_arr = np.stack(grouped_patch_masks, axis=0).astype(np.float32)
+                patch_h, patch_w = grouped_mask_arr.shape[-2:]
+                grouped_mask_dims = ("time", "mask_group", "patch_y", "patch_x")
+                grouped_mask_coords = {}
+                if grouped_mask_arr.ndim == 5:
+                    grouped_mask_dims = ("time", "mask_group", "level", "patch_y", "patch_x")
+                    grouped_mask_coords["level"] = np.arange(grouped_mask_arr.shape[2], dtype=np.int32)
                 mask_ds = xr.Dataset(
                     data_vars={
                         "patch_mask_grouped": (
-                            ("time", "mask_group", "patch_y", "patch_x"),
-                            np.stack(grouped_patch_masks, axis=0).astype(np.float32),
+                            grouped_mask_dims,
+                            grouped_mask_arr,
                         ),
                         "pixel_mask_channel": (
                             ("time", "channel", "y", "x"),
@@ -758,6 +803,7 @@ def run_rollout(args, conf: dict):
                         "x": analysis_ds.coords["x"].values,
                         "mask_group_name": ("mask_group", np.asarray(group_names, dtype="<U64")),
                         "mask_group_channels": ("mask_group", np.asarray(group_channels, dtype=np.int32)),
+                        **grouped_mask_coords,
                     },
                     attrs={
                         "description": "Patch-aligned precip masks used during rollout. pixel_mask_channel is expanded from patch_mask_grouped.",

@@ -1,0 +1,239 @@
+# WoFS DiffMAE 6x6 patch configuration with height-aware precip masking.
+#
+# Height masking keeps the existing cheap spatial tokenization: each precip
+# variable group still contributes one token per x/y patch, so target attention
+# does not multiply by the number of vertical levels. The 4-D mask
+# (batch, group, level, patch) is used for loss weighting and visible-precip
+# clamping. A grouped token is marked as masked when any level in that group
+# and patch is masked.
+#
+# Important options:
+# - model.grouped_decoder_scope: per_group decodes each precip group separately.
+#   This is the main group-query-style compute reduction versus joint group
+#   target self-attention.
+# - model.decoder_type: cross_self lets target tokens cross-attend context
+#   tokens, then self-attend only within target tokens.
+# - model.target_attention_window_size: 0 means global target self-attention.
+#   A positive value uses local non-overlapping target windows of that many
+#   patch tokens per side. With patch_size=6 and image_size=300, window 10
+#   attends over 10x10 patch windows instead of the full 50x50 grid.
+# - trainer.precip_mask_mode/eval.precip_mask_mode: height_patch enables
+#   per-level precip masks. mixed_height randomly selects spatial_patch,
+#   channel_patch, or height_patch using the mixed_height_*_probability values.
+# - height_visible_levels: zero-based vertical levels that should stay visible
+#   and be reinserted from precip_visible during sampling.
+# - height_mask_levels: optional zero-based levels eligible for masking. Leave
+#   unset to allow all levels except height_visible_levels.
+# - precip_mask_ratio: fraction sampled from eligible group-level-patch elements.
+
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask
+seed: 1000
+data:
+  save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
+  mean_path: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/mean.nc
+  std_path: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/std.nc
+  log_transform_params_json: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/zero_inflated_transform_params.json
+  concentration_normalization_mode: zscore
+  background_vars:
+  - T
+  - QVAPOR
+  - U
+  - V
+  - W
+  - GEOPOT
+  precip_vars:
+  - QRAIN
+  - QNRAIN
+  - QHAIL
+  - QNHAIL
+  - QGRAUP
+  - QNGRAUPEL
+  - QSNOW
+  - QNSNOW
+  reflectivity_vars:
+  - REFL_10CM
+  surface_vars: []
+  dynamic_forcing_variables:
+  - cos_latitude
+  - sin_latitude
+  - cos_longitude
+  - sin_longitude
+  - cos_julian_day
+  - sin_julian_day
+  - cos_local_time
+  - sin_local_time
+  - cos_solar_zenith_angle
+  - insolation
+  - XLAND
+  - HGT
+  levels: 17
+  prognostic_levels: 17
+  mae_pad_to: 300
+  mae_include_t1_refl: false
+  concentration_level_ops:
+    QRAIN: {ceiling_level: 17, mode: cutoff}
+    QNRAIN: {ceiling_level: 17, mode: cutoff}
+    QHAIL: {ceiling_level: 17, mode: cutoff}
+    QNHAIL: {ceiling_level: 17, mode: cutoff}
+    QGRAUP: {ceiling_level: 17, mode: cutoff}
+    QNGRAUPEL: {ceiling_level: 17, mode: cutoff}
+    QSNOW: {ceiling_level: 17, mode: cutoff}
+    QNSNOW: {ceiling_level: 17, mode: cutoff}
+  train_years: [2019, 2020]
+  valid_years: [2021]
+  train_date_range: ['20190101', '20201231']
+  valid_date_range: ['20210415', '20210430']
+  zarr_time_chunk: 2
+  max_open_files_per_worker: 2
+  max_dataset_open_retries: 4
+  scaler_type: std-wrf
+  variables: []
+  surface_variables: []
+  forcing_variables: []
+  static_variables: []
+  diagnostic_variables: []
+  all_varnames: []
+  history_len: 1
+  valid_history_len: 1
+  forecast_len: 0
+  valid_forecast_len: 0
+  target_start_step: 0
+  lead_time_periods: 1
+  static_first: false
+model:
+  type: wofs-diffmae
+  modality_channels:
+    background: 102
+    precip: 136
+    reflectivity: 17
+    surface: 0
+    forcing: 12
+  precip_grouping: grouped
+  precip_group_names: [QRAIN, QNRAIN, QHAIL, QNHAIL, QGRAUP, QNGRAUPEL, QSNOW, QNSNOW]
+  precip_group_channels: [17, 17, 17, 17, 17, 17, 17, 17]
+  conditioned_modalities: [background, forcing, reflectivity]
+  target_modality: precip
+  decoder_type: cross_self
+  grouped_decoder_scope: per_group
+  target_attention_window_size: 15
+  patch_size: 4
+  surface_forcing_stride: 16
+  image_size: [300, 300]
+  embed_dim: 384
+  depth: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  drop_path_rate: 0.05
+  diffusion:
+    timesteps: 1000
+    sampling_timesteps: 200
+    objective: pred_x0
+    beta_schedule: sigmoid
+    ddim_sampling_eta: 0.01
+trainer:
+  type: standard-wrf-diffmae
+  mode: ddp
+  ddp_find_unused_parameters: false
+  use_file_locality_sampler: true
+  train_batch_size: 8
+  valid_batch_size: 8
+  epochs: 500
+  start_epoch: 0
+  stopping_patience: 100
+  batches_per_epoch: 7000
+  valid_batches_per_epoch: 100
+  reload_epoch: true
+  train_one_epoch: false
+  stop_after_epoch: false
+  thread_workers: 8
+  valid_thread_workers: 8
+  prefetch_factor: 1
+  pin_memory: true
+  persistent_workers: true
+  dataloader_timeout_s: 180
+  no_hang_debug: false
+  no_hang_thread_workers: 1
+  no_hang_valid_thread_workers: 1
+  no_hang_prefetch_factor: 1
+  no_hang_valid_prefetch_factor: 1
+  no_hang_pin_memory: false
+  no_hang_persistent_workers: true
+  no_hang_timeout_s: 180
+  learning_rate: 0.0001
+  weight_decay: 1.0e-05
+  amp: true
+  grad_max_norm: 1.0
+  grad_accum_every: 1
+  precip_mask_ratio: [0.6, 1.0]
+  precip_mask_mode: mixed_height
+  mixed_height_spatial_probability: 1.0
+  mixed_height_channel_probability: 1.0
+  mixed_height_height_probability: 1.0
+  height_visible_levels: [4,6,8,10]
+  val_mask_ratio: 1.0
+  val_mask_mode: spatial_patch
+  denoise_snapshot:
+    enabled: true
+    every_steps: 3000
+    every_epoch: true
+    dir: denoise_snapshots
+    save_snapshot: false
+    save_figure: true
+    save_sampling_figure: true
+    sampling_use_visible_precip: true
+    sampling_timesteps: 100
+    channel: 3
+  load_weights: true
+  load_optimizer: true
+  load_scheduler: true
+  load_scaler: true
+  save_backup_weights: true
+  save_best_weights: true
+  training_metric: valid_loss
+  training_metric_direction: min
+  skip_validation: false
+  save_metric_vars: [precip]
+  use_scheduler: true
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 800
+    cycle_mult: 2.0
+    max_lr: 5.0e-04
+    min_lr: 1.0e-05
+    warmup_steps: 400
+    gamma: 0.95
+  residual_prediction: false
+  update_learning_rate: false
+eval:
+  mode: ddp
+  sampler: ddim
+  sampling_timesteps: 400
+  ddim_sampling_eta: 0.01
+  repaint_jump_length: 10
+  repaint_jump_n_sample: 5
+  precip_mask_ratio: 0.75
+  precip_mask_mode: mixed_height
+  mixed_height_spatial_probability: 1.0
+  mixed_height_channel_probability: 1.0
+  mixed_height_height_probability: 1.0
+  height_visible_levels: [4,6,8,10]
+  clamp_visible_precip: true
+  save_norm_output: true
+  overwrite: true
+  save_denoise_trajectory: true
+  trajectory_channels: [0, 2, 5]
+  trajectory_stride: 10
+loss:
+  latitude_weights: ''
+  use_latitude_weights: false
+  use_variable_weights: false
+  training_loss: mse
+pbs:
+  queue: main
+  account: NAML0001
+  walltime: '12:00:00'
+  nodes: 1
+  ncpus_per_node: 128
+  ngpus_per_node: 4
+  mem: 240GB
+  jobname: wofs-diffmae-height

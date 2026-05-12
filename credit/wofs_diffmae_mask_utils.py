@@ -8,7 +8,9 @@ import numpy as np
 
 SPATIAL_MASK_MODES = {"spatial_patch", "spatial", "patch"}
 CHANNEL_MASK_MODES = {"channel_patch", "random_channel", "channel", "group_patch", "variable_patch", "grouped"}
+HEIGHT_MASK_MODES = {"height_patch", "height", "level_patch", "vertical_patch"}
 MIXED_MASK_MODES = {"mixed", "spatial_or_channel"}
+MIXED_HEIGHT_MASK_MODES = {"mixed_height", "mixed_with_height", "spatial_channel_height"}
 
 
 def normalize_mask_mode(mask_mode: str) -> str:
@@ -17,8 +19,12 @@ def normalize_mask_mode(mask_mode: str) -> str:
         return "spatial_patch"
     if mode in CHANNEL_MASK_MODES:
         return "channel_patch"
+    if mode in HEIGHT_MASK_MODES:
+        return "height_patch"
     if mode in MIXED_MASK_MODES:
         return "mixed"
+    if mode in MIXED_HEIGHT_MASK_MODES:
+        return "mixed_height"
     raise ValueError(f"Unsupported precip mask mode: {mask_mode!r}")
 
 
@@ -68,6 +74,45 @@ def _sample_rank_mask(n_elements: int, ratio: float, rng: np.random.Generator) -
     return (ranks < n_mask).astype(np.float32)
 
 
+def _eligible_levels(
+    n_levels: int,
+    masked_levels: list[int] | tuple[int, ...] | None,
+    visible_levels: list[int] | tuple[int, ...] | None,
+) -> np.ndarray:
+    eligible = np.ones(n_levels, dtype=bool)
+    if masked_levels is not None:
+        eligible[:] = False
+        for level in masked_levels:
+            level = int(level)
+            if 0 <= level < n_levels:
+                eligible[level] = True
+    if visible_levels is not None:
+        for level in visible_levels:
+            level = int(level)
+            if 0 <= level < n_levels:
+                eligible[level] = False
+    return eligible
+
+
+def _choose_mixed_height_mode(
+    rng: np.random.Generator,
+    spatial_probability: float,
+    channel_probability: float,
+    height_probability: float,
+) -> str:
+    probs = np.asarray(
+        [float(spatial_probability), float(channel_probability), float(height_probability)],
+        dtype=np.float64,
+    )
+    if np.any(probs < 0):
+        raise ValueError("Mixed height mask probabilities must be non-negative")
+    total = float(probs.sum())
+    if total <= 0.0:
+        raise ValueError("At least one mixed height mask probability must be positive")
+    probs = probs / total
+    return str(rng.choice(["spatial_patch", "channel_patch", "height_patch"], p=probs))
+
+
 def build_grouped_patch_masks(
     n_times: int,
     n_groups: int,
@@ -77,12 +122,28 @@ def build_grouped_patch_masks(
     mask_mode: str,
     seed: int,
     channel_patch_mask_probability: float = 0.5,
+    mixed_height_spatial_probability: float = 1.0,
+    mixed_height_channel_probability: float = 1.0,
+    mixed_height_height_probability: float = 1.0,
+    group_channels: list[int] | tuple[int, ...] | None = None,
+    height_mask_levels: list[int] | tuple[int, ...] | None = None,
+    height_visible_levels: list[int] | tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(int(seed))
     normalized_mode = normalize_mask_mode(mask_mode)
     n_tokens = token_h * token_w
 
-    masks = np.zeros((n_times, n_groups, token_h, token_w), dtype=np.float32)
+    level_count = 0
+    if normalized_mode in {"height_patch", "mixed_height"}:
+        if not group_channels:
+            raise ValueError("group_channels is required for height_patch or mixed_height mask generation")
+        group_channels = [int(v) for v in group_channels]
+        if len(set(group_channels)) != 1:
+            raise ValueError("height_patch and mixed_height masks require all precip groups to have the same number of levels")
+        level_count = group_channels[0]
+        masks = np.zeros((n_times, n_groups, level_count, token_h, token_w), dtype=np.float32)
+    else:
+        masks = np.zeros((n_times, n_groups, token_h, token_w), dtype=np.float32)
     mask_modes: list[str] = []
     requested_ratios = np.zeros(n_times, dtype=np.float32)
 
@@ -93,13 +154,35 @@ def build_grouped_patch_masks(
         current_mode = normalized_mode
         if current_mode == "mixed":
             current_mode = "channel_patch" if rng.random() < float(channel_patch_mask_probability) else "spatial_patch"
+        elif current_mode == "mixed_height":
+            current_mode = _choose_mixed_height_mode(
+                rng,
+                mixed_height_spatial_probability,
+                mixed_height_channel_probability,
+                mixed_height_height_probability,
+            )
 
         if current_mode == "spatial_patch":
             base = _sample_rank_mask(n_tokens, sampled_ratio, rng).reshape(token_h, token_w)
-            masks[time_idx] = np.repeat(base[None, :, :], n_groups, axis=0)
+            if masks.ndim == 5:
+                masks[time_idx] = np.repeat(base[None, None, :, :], n_groups * level_count, axis=0).reshape(
+                    n_groups, level_count, token_h, token_w
+                )
+            else:
+                masks[time_idx] = np.repeat(base[None, :, :], n_groups, axis=0)
         elif current_mode == "channel_patch":
             base = _sample_rank_mask(n_groups * n_tokens, sampled_ratio, rng).reshape(n_groups, token_h, token_w)
-            masks[time_idx] = base
+            if masks.ndim == 5:
+                masks[time_idx] = np.repeat(base[:, None, :, :], level_count, axis=1)
+            else:
+                masks[time_idx] = base
+        elif current_mode == "height_patch":
+            eligible = _eligible_levels(level_count, height_mask_levels, height_visible_levels)
+            n_eligible = int(eligible.sum())
+            if n_eligible > 0:
+                base = _sample_rank_mask(n_groups * n_eligible * n_tokens, sampled_ratio, rng)
+                base = base.reshape(n_groups, n_eligible, token_h, token_w)
+                masks[time_idx][:, eligible, :, :] = base
         else:
             raise ValueError(f"Unexpected normalized mask mode {current_mode!r}")
 
@@ -163,9 +246,10 @@ def load_mask_bundle(mask_path: str | Path) -> dict[str, Any]:
         source_case = str(np.asarray(payload["source_case"]).item())
         config_path = str(np.asarray(payload["config_path"]).item())
 
-    if patch_mask_grouped.ndim != 4:
+    if patch_mask_grouped.ndim not in (4, 5):
         raise ValueError(
-            f"Expected patch_mask_grouped to have shape (time, group, token_y, token_x); got {patch_mask_grouped.shape}"
+            "Expected patch_mask_grouped to have shape (time, group, token_y, token_x) or "
+            f"(time, group, level, token_y, token_x); got {patch_mask_grouped.shape}"
         )
     if patch_mask_grouped.shape[0] != mask_mode.shape[0]:
         raise ValueError("mask_mode length does not match patch_mask_grouped time dimension")
