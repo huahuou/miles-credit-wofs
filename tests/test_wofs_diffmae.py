@@ -48,6 +48,7 @@ def _small_grouped_model(
     decoder_type="concat_self",
     grouped_decoder_scope="per_group",
     target_attention_window_size=0,
+    anti_patch_refiner=None,
 ):
     return WoFSDiffMAE(
         modality_channels={
@@ -71,6 +72,7 @@ def _small_grouped_model(
         depth=2,
         num_heads=4,
         target_attention_window_size=target_attention_window_size,
+        anti_patch_refiner=anti_patch_refiner,
         diffusion={
             "timesteps": 32,
             "sampling_timesteps": 4,
@@ -379,6 +381,33 @@ def test_grouped_height_mask_supports_level_specific_visible_precip():
 
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+
+
+def test_anti_patch_refiner_is_initially_identity_and_checkpoint_compatible():
+    base_model = _small_grouped_model(decoder_type="cross_self")
+    refined_model = _small_grouped_model(
+        decoder_type="cross_self",
+        anti_patch_refiner={
+            "enabled": True,
+            "hidden_channels": 8,
+            "depth": 2,
+            "kernel_size": 3,
+        },
+    )
+    load_msg = refined_model.load_state_dict(base_model.state_dict(), strict=False)
+    assert load_msg.unexpected_keys == []
+    assert any(key.startswith("anti_patch_refiner") for key in load_msg.missing_keys)
+
+    cond = _cond_grouped(batch=1)
+    precip = torch.randn(1, 6, 16, 16)
+    t = torch.tensor([5])
+    mask = torch.zeros(1, 3, 16)
+    base_model.eval()
+    refined_model.eval()
+    with torch.no_grad():
+        base_out = base_model(precip, t, cond, mask)
+        refined_out = refined_model(precip, t, cond, mask)
+    assert torch.allclose(refined_out, base_out, atol=1.0e-6)
 
 
 def test_grouped_joint_cross_self_decoder_supports_group_specific_masks():

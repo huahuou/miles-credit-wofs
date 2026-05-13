@@ -17,6 +17,8 @@
 #   A positive value uses local non-overlapping target windows of that many
 #   patch tokens per side. With patch_size=6 and image_size=300, window 10
 #   attends over 10x10 patch windows instead of the full 50x50 grid.
+# - model.anti_patch_refiner: optional zero-initialized residual CNN applied
+#   after patch tiling to reduce patch-edge discontinuities during fine-tuning.
 # - trainer.precip_mask_mode/eval.precip_mask_mode: height_patch enables
 #   per-level precip masks. mixed_height randomly selects spatial_patch,
 #   channel_patch, or height_patch using the mixed_height_*_probability values.
@@ -116,6 +118,12 @@ model:
   decoder_type: cross_self
   grouped_decoder_scope: per_group
   target_attention_window_size: 10
+  anti_patch_refiner:
+    enabled: true
+    hidden_channels: 64
+    depth: 3
+    kernel_size: 3
+    groups: 1
   patch_size: 6
   surface_forcing_stride: 16
   image_size: [300, 300]

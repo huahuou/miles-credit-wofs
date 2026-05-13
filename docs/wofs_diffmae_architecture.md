@@ -122,6 +122,34 @@ The outputs from all 8 precip groups are concatenated to recover:
 (B, 136, 300, 300)
 ```
 
+## Anti-Patch Refiner
+
+The optional `anti_patch_refiner` is a small residual CNN applied after the
+patch-token outputs have been tiled back to pixel space:
+
+```text
+refined_output = patch_tiled_output + CNN(patch_tiled_output)
+```
+
+The last convolution is initialized to zero, so enabling the module starts from
+exactly the same output as the pre-refiner model. This makes it suitable for
+fine-tuning from an existing checkpoint loaded with `strict=False`.
+
+Current height-mask config:
+
+```yaml
+anti_patch_refiner:
+  enabled: true
+  hidden_channels: 64
+  depth: 3
+  kernel_size: 3
+  groups: 1
+```
+
+The refiner is intended to reduce visible seams from non-overlapping patch
+tiling. It is cheaper than replacing the output head with an overlapping
+`F.fold` decoder.
+
 ## Diffusion Objective
 
 The config uses:

@@ -175,6 +175,46 @@ class WindowAttention2D(nn.Module):
         return x_grid[:, :grid_h, :grid_w].reshape(b, n, d)
 
 
+class ResidualConvRefiner(nn.Module):
+    """Small zero-initialized residual CNN for reducing patch-edge artifacts."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int = 64,
+        depth: int = 2,
+        kernel_size: int = 3,
+        groups: int = 1,
+    ):
+        super().__init__()
+        depth = max(1, int(depth))
+        hidden_channels = int(hidden_channels)
+        kernel_size = int(kernel_size)
+        padding = kernel_size // 2
+        layers: list[nn.Module] = []
+        in_channels = int(channels)
+        for _ in range(depth - 1):
+            layers.append(
+                nn.Conv2d(
+                    in_channels,
+                    hidden_channels,
+                    kernel_size=kernel_size,
+                    padding=padding,
+                    groups=int(groups) if in_channels == hidden_channels else 1,
+                )
+            )
+            layers.append(nn.GELU())
+            in_channels = hidden_channels
+        final = nn.Conv2d(in_channels, int(channels), kernel_size=kernel_size, padding=padding)
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+        layers.append(final)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
 class WoFSDiffMAE(BaseModel):
     """Diffusion model that inpaints normalized precip conditioned on unmasked WoFS context."""
 
@@ -197,6 +237,7 @@ class WoFSDiffMAE(BaseModel):
         mlp_ratio: float = 4.0,
         drop_path_rate: float = 0.0,
         target_attention_window_size: int = 0,
+        anti_patch_refiner: Optional[dict] = None,
         diffusion: Optional[dict] = None,
         **kwargs,
     ):
@@ -232,6 +273,17 @@ class WoFSDiffMAE(BaseModel):
         self.condition = True
         self.target_grid_size = (self.image_size[0] // self.patch_size, self.image_size[1] // self.patch_size)
         self.target_attention_window_size = int(target_attention_window_size)
+        refiner_conf = anti_patch_refiner or {}
+        self.anti_patch_refiner_enabled = bool(refiner_conf.get("enabled", False))
+        self.anti_patch_refiner = nn.Identity()
+        if self.anti_patch_refiner_enabled:
+            self.anti_patch_refiner = ResidualConvRefiner(
+                channels=self.channels,
+                hidden_channels=int(refiner_conf.get("hidden_channels", 64)),
+                depth=int(refiner_conf.get("depth", 2)),
+                kernel_size=int(refiner_conf.get("kernel_size", 3)),
+                groups=int(refiner_conf.get("groups", 1)),
+            )
 
         sf_h = math.ceil(self.image_size[0] / self.surface_forcing_stride) * self.surface_forcing_stride
         sf_w = math.ceil(self.image_size[1] / self.surface_forcing_stride) * self.surface_forcing_stride
@@ -551,7 +603,7 @@ class WoFSDiffMAE(BaseModel):
         n_w = self.image_size[1] // self.patch_size
         x = patches.reshape(b, n_h, n_w, self.channels, self.patch_size, self.patch_size)
         x = torch.einsum("bhwcpq->bchpwq", x).reshape(b, self.channels, n_h * self.patch_size, n_w * self.patch_size)
-        return x[:, :, :orig_h, :orig_w]
+        return self.anti_patch_refiner(x[:, :, :orig_h, :orig_w])
 
     def _decode_target_tokens(
         self,
@@ -599,7 +651,7 @@ class WoFSDiffMAE(BaseModel):
             group_out = patches.reshape(b, n_h, n_w, n_ch, self.patch_size, self.patch_size)
             group_out = torch.einsum("bhwcpq->bchpwq", group_out).reshape(b, n_ch, n_h * self.patch_size, n_w * self.patch_size)
             outs.append(group_out[:, :, :orig_h, :orig_w])
-        return torch.cat(outs, dim=1)
+        return self.anti_patch_refiner(torch.cat(outs, dim=1))
 
     def _group_tokens(
         self,
@@ -650,7 +702,7 @@ class WoFSDiffMAE(BaseModel):
             group_out = patches.reshape(b, n_h, n_w, n_ch, self.patch_size, self.patch_size)
             group_out = torch.einsum("bhwcpq->bchpwq", group_out).reshape(b, n_ch, n_h * self.patch_size, n_w * self.patch_size)
             outs.append(group_out[:, :, :orig_h, :orig_w])
-        return torch.cat(outs, dim=1)
+        return self.anti_patch_refiner(torch.cat(outs, dim=1))
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None:

@@ -28,7 +28,7 @@
 #   unset to allow all levels except height_visible_levels.
 # - precip_mask_ratio: fraction sampled from eligible group-level-patch elements.
 
-save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_3x3patch_heightmask
 seed: 1000
 data:
   save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
@@ -121,14 +121,14 @@ model:
   anti_patch_refiner:
     enabled: true
     hidden_channels: 64
-    depth: 3
-    kernel_size: 5
+    depth: 2
+    kernel_size: 3
     groups: 1
-  patch_size: 4
+  patch_size: 3
   surface_forcing_stride: 16
   image_size: [300, 300]
   embed_dim: 384
-  depth: 8
+  depth: 6
   num_heads: 8
   mlp_ratio: 4.0
   drop_path_rate: 0.05
@@ -143,8 +143,8 @@ trainer:
   mode: ddp
   ddp_find_unused_parameters: false
   use_file_locality_sampler: true
-  train_batch_size: 8
-  valid_batch_size: 8
+  train_batch_size: 6
+  valid_batch_size: 6
   epochs: 500
   start_epoch: 0
   stopping_patience: 100
@@ -191,10 +191,10 @@ trainer:
     sampling_use_visible_precip: true
     sampling_timesteps: 100
     channel: 3
-  load_weights: true
+  load_weights: false
   load_optimizer: false
   load_scheduler: false
-  load_scaler: true
+  load_scaler: false
   save_backup_weights: true
   save_best_weights: true
   training_metric: valid_loss
