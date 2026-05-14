@@ -25,6 +25,7 @@ from credit.models.wxformer.aurora_crossformer_wrf import AuroraCrossFormerWRF
 from credit.models.wxformer.aurora_crossformer_wrf_da import AuroraCrossFormerWRFDA
 from credit.models.wofs_mae import WoFSMultiModalMAE
 from credit.models.wofs_diffmae import WoFSDiffMAE
+from credit.models.wofs_maskdit import WoFSMaskDiT
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ model_types = {
     "unet_downscaling": (DownscalingSegmentationModel, "Loading downscaling U-net"),
     "wofs-mae": (WoFSMultiModalMAE, "Multi-modal MAE for WoFS data assimilation"),
     "wofs-diffmae": (WoFSDiffMAE, "Conditional DiffMAE for WoFS precip inpainting"),
+    "wofs-maskdit": (WoFSMaskDiT, "MaskDiT-style conditional diffusion model for WoFS precip inpainting"),
 }
 
 
@@ -118,11 +120,12 @@ def load_fsdp_or_checkpoint_policy(conf):
         }
     # FuXi
     # FuXi supports "spectral_norm = True" only
-    elif "wofs-diffmae" in conf["model"]["type"]:
+    elif "wofs-diffmae" in conf["model"]["type"] or "wofs-maskdit" in conf["model"]["type"]:
         from credit.models.wofs_mae_adapters import Block
         from credit.models.wofs_diffmae import CrossSelfDecoderBlock
+        from credit.models.wofs_maskdit import MaskDiTBlock
 
-        transformer_layers_cls = {Block, CrossSelfDecoderBlock}
+        transformer_layers_cls = {Block, CrossSelfDecoderBlock, MaskDiTBlock}
 
     elif "fuxi" in conf["model"]["type"] or ("wrf" in conf["model"]["type"]) or ("dscale" in conf["model"]["type"]):
         from timm.models.swin_transformer_v2 import SwinTransformerV2Stage
