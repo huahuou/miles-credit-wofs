@@ -37,19 +37,19 @@ NPROC_PER_NODE_OVERRIDE="${NPROC_PER_NODE_OVERRIDE:-}"
 
 CONDA_ENV="${CONDA_ENV:-credit-wofs}"
 PROJECT_DIR="${PROJECT_DIR:-/home/Zhanxiang.Hua/miles-credit-wofs}"
-CONFIG="${CONFIG:-/home/Zhanxiang.Hua/miles-credit-wofs/config/wofs_diffmae.yml}"
+CONFIG="${CONFIG:-/home/Zhanxiang.Hua/miles-credit-wofs/config/wofs_diffmae_4x4_patch_height_mask.yml}"
 ROLLOUT_MODULE="${ROLLOUT_MODULE:-applications.rollout_wrf_wofs_mae_da_metrics}"
-CHECKPOINT="${CHECKPOINT:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_latest2/best_checkpoint.pt}"
+CHECKPOINT="${CHECKPOINT:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask_v2/checkpoint.pt}"
 
 START_DATE="${START_DATE:-20210425}"
 END_DATE="${END_DATE:-20210530}"
-OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_latest2/ddim_metrics}"
+OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_4x4patch_heightmask_v2/test1}"
 
 MASK_FILE="${MASK_FILE:-}"
 MASK_SEED="${MASK_SEED:-1000}"
 
-MAX_FILES="${MAX_FILES:-2}"
-MAX_TIMES="${MAX_TIMES:-10}"
+MAX_FILES="${MAX_FILES:-32}"
+MAX_TIMES="${MAX_TIMES:-1}"
 
 EVAL_MODE="${EVAL_MODE:-ddp}"
 BACKEND="${BACKEND:-nccl}"

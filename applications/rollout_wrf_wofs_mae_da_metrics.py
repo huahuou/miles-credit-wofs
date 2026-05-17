@@ -58,6 +58,20 @@ from credit.wofs_diffmae_mask_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_eval_ensemble_size(conf: dict) -> tuple[int, int, bool, float]:
+    eval_conf = _eval_conf(conf)
+    requested = int(eval_conf.get("ensemble_size", eval_conf.get("ensemble", 1)))
+    if requested < 1:
+        raise ValueError(f"eval.ensemble_size must be >= 1, got {requested}")
+
+    sampler = str(eval_conf.get("sampler", "ddim")).strip().lower()
+    eta = eval_conf.get("ddim_sampling_eta", conf.get("model", {}).get("diffusion", {}).get("ddim_sampling_eta", 0.0))
+    eta = float(0.0 if eta is None else eta)
+    deterministic = sampler == "ddim" and np.isclose(eta, 0.0)
+    effective = 1 if deterministic else requested
+    return requested, effective, deterministic, eta
+
+
 def _gaussian_kernel_1d(size: int, sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     coords = torch.arange(size, device=device, dtype=dtype) - size // 2
     kernel = torch.exp(-(coords**2) / (2 * sigma * sigma))
@@ -453,6 +467,7 @@ def rollout_one_timestep_with_metrics(
     repaint_jump_length = int(_eval_conf(conf).get("repaint_jump_length", 10))
     repaint_jump_n_sample = int(_eval_conf(conf).get("repaint_jump_n_sample", 10))
     save_trajectory = bool(_eval_conf(conf).get("save_denoise_trajectory", False))
+    _, ensemble_size, _, _ = _resolve_eval_ensemble_size(conf)
 
     cond = _build_condition_dict(
         batch,
@@ -463,53 +478,7 @@ def rollout_one_timestep_with_metrics(
         target.shape[-1],
     )
 
-    with torch.no_grad():
-        pred_norm = core.sample_precip(
-            cond,
-            precip_mask,
-            precip_visible=precip_visible,
-            sampling_timesteps=sampling_timesteps,
-            eta=eta,
-            sampler=sampler,
-            repaint_jump_length=repaint_jump_length,
-            repaint_jump_n_sample=repaint_jump_n_sample,
-            return_all_timesteps=save_trajectory,
-        )
-
-    trajectory = None
-    if save_trajectory:
-        all_steps = pred_norm[0].detach().cpu().numpy()
-        pred_norm = pred_norm[:, -1]
-        channels = _eval_conf(conf).get("trajectory_channels", [int(_eval_conf(conf).get("channel", 0))])
-        if isinstance(channels, int):
-            channels = [channels]
-        channels = [max(0, min(int(channel), all_steps.shape[1] - 1)) for channel in channels]
-        stride = max(1, int(_eval_conf(conf).get("trajectory_stride", 1)))
-        all_steps = all_steps[::stride, channels]
-        trajectory = {
-            "values": all_steps.astype(np.float32, copy=False),
-            "channels": np.asarray(channels, dtype=np.int32),
-        }
-
-    pred_norm = pred_norm[0].detach().cpu().numpy()
-    orig_h, orig_w = batch.get("_orig_hw", pred_norm.shape[-2:])
-    pred_norm = pred_norm[:, :orig_h, :orig_w]
-
-    out_norm: Dict[str, np.ndarray] = {}
-    offset = 0
-    for var in dummy_dataset.precip_vars:
-        n_ch = dummy_dataset._mean_values[var].shape[0] if np.asarray(dummy_dataset._mean_values[var]).ndim > 0 else 1
-        out_norm[var] = pred_norm[offset : offset + n_ch].copy()
-        offset += n_ch
-
-    out = _denormalize_precip_target(
-        pred_norm,
-        mean_values=mean_values,
-        std_values=std_values,
-        concentration_specs=concentration_specs,
-        dummy_dataset=dummy_dataset,
-    )
-
+    orig_h, orig_w = batch.get("_orig_hw", target.shape[-2:])
     target_norm = _stack_precip_target(batch, dummy_dataset)[:, :orig_h, :orig_w]
     target_phys = _concat_var_dict(
         _denormalize_precip_target(
@@ -521,8 +490,6 @@ def rollout_one_timestep_with_metrics(
         ),
         dummy_dataset.precip_vars,
     )
-    pred_phys = _concat_var_dict(out, dummy_dataset.precip_vars)
-
     pixel_mask = _grouped_patch_to_pixel_mask(
         np.asarray(mask_info["grouped_patch_mask"], dtype=np.float32),
         resolve_precip_group_layout(conf)[1],
@@ -531,38 +498,110 @@ def rollout_one_timestep_with_metrics(
         width=orig_w,
     )
 
-    normalized_metrics = compute_masked_normalized_metrics(pred_norm, target_norm, pixel_mask)
-    physical_metrics = compute_masked_physical_metrics(pred_phys, target_phys, pixel_mask)
+    out_by_var: Dict[str, List[np.ndarray]] = {var: [] for var in dummy_dataset.precip_vars}
+    out_norm_by_var: Dict[str, List[np.ndarray]] = {var: [] for var in dummy_dataset.precip_vars}
+    trajectory_values: List[np.ndarray] = []
+    trajectory_channels = None
+    metrics_rows: list[dict] = []
     full_mask = np.ones_like(pixel_mask, dtype=np.float32)
-    normalized_metrics_full = compute_masked_normalized_metrics(pred_norm, target_norm, full_mask)
-    physical_metrics_full = compute_masked_physical_metrics(pred_phys, target_phys, full_mask)
-    metrics_row = {
-        "time_index": int(time_index),
-        "normalized_mse_masked": normalized_metrics["mse"],
-        "normalized_mae_masked": normalized_metrics["mae"],
-        "normalized_ssim_masked": normalized_metrics["ssim"],
-        "normalized_mse_full": normalized_metrics_full["mse"],
-        "normalized_mae_full": normalized_metrics_full["mae"],
-        "normalized_ssim_full": normalized_metrics_full["ssim"],
-        "physical_mse_masked": physical_metrics["mse"],
-        "physical_mae_masked": physical_metrics["mae"],
-        "physical_mse_full": physical_metrics_full["mse"],
-        "physical_mae_full": physical_metrics_full["mae"],
-        "masked_fraction": normalized_metrics["masked_fraction"],
-        "mask_mode": mask_info["mode"],
-        "requested_mask_ratio": float(mask_info["requested_ratio"]),
-    }
+
+    for ensemble_index in range(ensemble_size):
+        with torch.no_grad():
+            pred_norm = core.sample_precip(
+                cond,
+                precip_mask,
+                precip_visible=precip_visible,
+                sampling_timesteps=sampling_timesteps,
+                eta=eta,
+                sampler=sampler,
+                repaint_jump_length=repaint_jump_length,
+                repaint_jump_n_sample=repaint_jump_n_sample,
+                return_all_timesteps=save_trajectory,
+            )
+
+        if save_trajectory:
+            all_steps = pred_norm[0].detach().cpu().numpy()
+            pred_norm = pred_norm[:, -1]
+            channels = _eval_conf(conf).get("trajectory_channels", [int(_eval_conf(conf).get("channel", 0))])
+            if isinstance(channels, int):
+                channels = [channels]
+            channels = [max(0, min(int(channel), all_steps.shape[1] - 1)) for channel in channels]
+            stride = max(1, int(_eval_conf(conf).get("trajectory_stride", 1)))
+            trajectory_values.append(all_steps[::stride, channels].astype(np.float32, copy=False))
+            trajectory_channels = np.asarray(channels, dtype=np.int32)
+
+        pred_norm = pred_norm[0].detach().cpu().numpy()
+        pred_norm = pred_norm[:, :orig_h, :orig_w]
+
+        member_out_norm: Dict[str, np.ndarray] = {}
+        offset = 0
+        for var in dummy_dataset.precip_vars:
+            n_ch = dummy_dataset._mean_values[var].shape[0] if np.asarray(dummy_dataset._mean_values[var]).ndim > 0 else 1
+            member_out_norm[var] = pred_norm[offset : offset + n_ch].copy()
+            offset += n_ch
+
+        member_out = _denormalize_precip_target(
+            pred_norm,
+            mean_values=mean_values,
+            std_values=std_values,
+            concentration_specs=concentration_specs,
+            dummy_dataset=dummy_dataset,
+        )
+        pred_phys = _concat_var_dict(member_out, dummy_dataset.precip_vars)
+
+        normalized_metrics = compute_masked_normalized_metrics(pred_norm, target_norm, pixel_mask)
+        physical_metrics = compute_masked_physical_metrics(pred_phys, target_phys, pixel_mask)
+        normalized_metrics_full = compute_masked_normalized_metrics(pred_norm, target_norm, full_mask)
+        physical_metrics_full = compute_masked_physical_metrics(pred_phys, target_phys, full_mask)
+        metrics_rows.append(
+            {
+                "time_index": int(time_index),
+                "ensemble_index": int(ensemble_index),
+                "normalized_mse_masked": normalized_metrics["mse"],
+                "normalized_mae_masked": normalized_metrics["mae"],
+                "normalized_ssim_masked": normalized_metrics["ssim"],
+                "normalized_mse_full": normalized_metrics_full["mse"],
+                "normalized_mae_full": normalized_metrics_full["mae"],
+                "normalized_ssim_full": normalized_metrics_full["ssim"],
+                "physical_mse_masked": physical_metrics["mse"],
+                "physical_mae_masked": physical_metrics["mae"],
+                "physical_mse_full": physical_metrics_full["mse"],
+                "physical_mae_full": physical_metrics_full["mae"],
+                "masked_fraction": normalized_metrics["masked_fraction"],
+                "mask_mode": mask_info["mode"],
+                "requested_mask_ratio": float(mask_info["requested_ratio"]),
+            }
+        )
+
+        for var, arr in member_out.items():
+            out_by_var[var].append(arr)
+        for var, arr in member_out_norm.items():
+            out_norm_by_var[var].append(arr)
+
+    trajectory = None
+    if trajectory_values:
+        trajectory = {
+            "values": np.stack(trajectory_values, axis=0).astype(np.float32, copy=False),
+            "channels": trajectory_channels,
+        }
+
     mask_record = {
         "grouped_patch_mask": np.asarray(mask_info["grouped_patch_mask"], dtype=np.float32),
         "pixel_mask": pixel_mask,
         "mask_mode": str(mask_info["mode"]),
         "requested_mask_ratio": float(mask_info["requested_ratio"]),
     }
-    return out, out_norm, trajectory, {"metrics": metrics_row, "mask": mask_record}
+    return (
+        {var: np.stack(frames, axis=0).astype(np.float32, copy=False) for var, frames in out_by_var.items()},
+        {var: np.stack(frames, axis=0).astype(np.float32, copy=False) for var, frames in out_norm_by_var.items()},
+        trajectory,
+        {"metrics": metrics_rows, "mask": mask_record},
+    )
 
 
 def run_rollout(args, conf: dict):
     eval_conf = _eval_conf(conf)
+    requested_ensemble_size, ensemble_size, deterministic_ensemble, effective_eta = _resolve_eval_ensemble_size(conf)
     mode = str(eval_conf.get("mode", "none")).strip().lower()
     local_rank, world_rank, world_size = get_rank_info(mode)
     distributed = mode in {"ddp", "fsdp"}
@@ -577,6 +616,12 @@ def run_rollout(args, conf: dict):
         else:
             device = torch.device("cpu")
         logger.info("Running DiffMAE rollout+metrics on rank %d/%d device=%s", world_rank, world_size, device)
+        if deterministic_ensemble and world_rank == 0:
+            logger.info(
+                "Eval sampler=ddim with ddim_sampling_eta=%s is deterministic; forcing rollout ensemble_size=1 (requested %d).",
+                effective_eta,
+                requested_ensemble_size,
+            )
 
         _copy_config_to_output(args.model_config, args.out_dir, world_rank)
         model = _load_diffmae_model(conf, args.checkpoint, device)
@@ -695,9 +740,9 @@ def run_rollout(args, conf: dict):
                         trajectories.append(trajectory["values"])
                         trajectory_channels = trajectory["channels"]
 
-                    metrics_row = extra["metrics"]
-                    metrics_row["valid_time"] = str(ds["time"].values[t_idx]) if "time" in ds.coords else str(t_idx)
-                    metric_rows.append(metrics_row)
+                    for metrics_row in extra["metrics"]:
+                        metrics_row["valid_time"] = str(ds["time"].values[t_idx]) if "time" in ds.coords else str(t_idx)
+                        metric_rows.append(metrics_row)
                     grouped_patch_masks.append(extra["mask"]["grouped_patch_mask"])
                     pixel_masks.append(extra["mask"]["pixel_mask"])
                     mask_modes.append(extra["mask"]["mask_mode"])
@@ -707,7 +752,7 @@ def run_rollout(args, conf: dict):
                 data_vars = {}
                 for var, frames in recon_by_var.items():
                     stacked = np.stack(frames, axis=0).astype(np.float32)
-                    data_vars[var] = (("time", "level", "y", "x"), stacked)
+                    data_vars[var] = (("time", "ensemble", "level", "y", "x"), stacked)
                 if not data_vars:
                     raise RuntimeError(f"No rollout frames were produced for {case_file}")
                 first_data = next(iter(data_vars.values()))[1]
@@ -715,20 +760,24 @@ def run_rollout(args, conf: dict):
                     data_vars=data_vars,
                     coords={
                         "time": time_vals,
-                        "level": np.arange(first_data.shape[1], dtype=np.int32),
-                        "y": np.arange(first_data.shape[2], dtype=np.int32),
-                        "x": np.arange(first_data.shape[3], dtype=np.int32),
+                        "ensemble": np.arange(first_data.shape[1], dtype=np.int32),
+                        "level": np.arange(first_data.shape[2], dtype=np.int32),
+                        "y": np.arange(first_data.shape[3], dtype=np.int32),
+                        "x": np.arange(first_data.shape[4], dtype=np.int32),
                     },
                     attrs={
                         "units": "physical_units_after_inverse_normalization",
                         "sampler": str(eval_conf.get("sampler", "ddim")),
                         "sampling_timesteps": int(eval_conf.get("sampling_timesteps", 50)),
-                        "ddim_sampling_eta": float(eval_conf.get("ddim_sampling_eta", 0.0)),
+                        "ddim_sampling_eta": float(effective_eta),
                         "repaint_jump_length": int(eval_conf.get("repaint_jump_length", 10)),
                         "repaint_jump_n_sample": int(eval_conf.get("repaint_jump_n_sample", 10)),
                         "precip_mask_mode": str(eval_conf.get("precip_mask_mode", "spatial_patch")),
                         "precip_mask_ratio": str(eval_conf.get("precip_mask_ratio", 1.0)),
                         "mask_file": str(args.mask_file) if args.mask_file else "",
+                        "requested_ensemble_size": requested_ensemble_size,
+                        "ensemble_size": ensemble_size,
+                        "deterministic_ensemble_override": int(deterministic_ensemble),
                     },
                 )
                 if os.path.exists(out_path):
@@ -738,7 +787,7 @@ def run_rollout(args, conf: dict):
                 if bool(eval_conf.get("save_norm_output", True)):
                     xr.Dataset(
                         data_vars={
-                            var: (("time", "level", "y", "x"), np.stack(frames, axis=0).astype(np.float32))
+                            var: (("time", "ensemble", "level", "y", "x"), np.stack(frames, axis=0).astype(np.float32))
                             for var, frames in recon_by_var_norm.items()
                         },
                         coords=analysis_ds.coords,
@@ -755,11 +804,15 @@ def run_rollout(args, conf: dict):
                         channel_levels.append(level_idx)
                     xr.Dataset(
                         data_vars={
-                            "precip": (("time", "denoise_step", "channel", "y_padded", "x_padded"), traj_arr)
+                            "precip": (
+                                ("time", "ensemble", "denoise_step", "channel", "y_padded", "x_padded"),
+                                traj_arr,
+                            )
                         },
                         coords={
                             "time": time_vals[: traj_arr.shape[0]],
-                            "denoise_step": np.arange(traj_arr.shape[1], dtype=np.int32),
+                            "ensemble": np.arange(traj_arr.shape[1], dtype=np.int32),
+                            "denoise_step": np.arange(traj_arr.shape[2], dtype=np.int32),
                             "channel": trajectory_channels,
                             "channel_level": ("channel", np.asarray(channel_levels, dtype=np.int32)),
                             "y_padded": np.arange(traj_arr.shape[-2], dtype=np.int32),
@@ -821,6 +874,9 @@ def run_rollout(args, conf: dict):
                         "analysis_zarr": out_path,
                         "mask_file": str(args.mask_file) if args.mask_file else os.path.join(case_out_dir, f"{case_stem}_mask.npz"),
                         "config_copy": os.path.join(out_dir, Path(args.model_config).name),
+                        "requested_ensemble_size": requested_ensemble_size,
+                        "ensemble_size": ensemble_size,
+                        "deterministic_ensemble_override": bool(deterministic_ensemble),
                     },
                 )
                 logger.info("Wrote analysis to %s and metrics to %s", out_path, metrics_path)

@@ -28,8 +28,8 @@
 #   unset to allow all levels except height_visible_levels.
 # - precip_mask_ratio: fraction sampled from eligible group-level-patch elements.
 
-save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask
-seed: 1000
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask_v3
+seed: 1002
 data:
   save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
   mean_path: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/mean.nc
@@ -95,8 +95,8 @@ data:
   static_variables: []
   diagnostic_variables: []
   all_varnames: []
-  history_len: 1
-  valid_history_len: 1
+  history_len: 0
+  valid_history_len: 0
   forecast_len: 0
   valid_forecast_len: 0
   target_start_step: 0
@@ -167,7 +167,7 @@ trainer:
   no_hang_pin_memory: false
   no_hang_persistent_workers: true
   no_hang_timeout_s: 180
-  learning_rate: 0.0001
+  learning_rate: 1.0e-05
   weight_decay: 1.0e-05
   amp: true
   grad_max_norm: 1.0
@@ -177,7 +177,7 @@ trainer:
   mixed_height_spatial_probability: 1.0
   mixed_height_channel_probability: 1.0
   mixed_height_height_probability: 1.0
-  height_visible_levels: [4,6,8,10]
+  height_visible_levels: [15,16,17]
   val_mask_ratio: 1.0
   val_mask_mode: spatial_patch
   denoise_snapshot:
@@ -189,12 +189,12 @@ trainer:
     save_figure: true
     save_sampling_figure: true
     sampling_use_visible_precip: true
-    sampling_timesteps: 100
+    sampling_timesteps: 200
     channel: 3
   load_weights: true
   load_optimizer: false
   load_scheduler: false
-  load_scaler: true
+  load_scaler: false
   save_backup_weights: true
   save_best_weights: true
   training_metric: valid_loss
@@ -206,16 +206,17 @@ trainer:
     scheduler_type: cosine-annealing-restarts
     first_cycle_steps: 800
     cycle_mult: 2.0
-    max_lr: 5.0e-04
-    min_lr: 1.0e-05
+    max_lr: 5.0e-05
+    min_lr: 1.0e-06
     warmup_steps: 400
-    gamma: 0.95
+    gamma: 0.7
   residual_prediction: false
   update_learning_rate: false
 eval:
   mode: ddp
+  ensemble_size: 1
   sampler: ddim
-  sampling_timesteps: 400
+  sampling_timesteps: 300
   ddim_sampling_eta: 0.01
   repaint_jump_length: 10
   repaint_jump_n_sample: 5
@@ -224,7 +225,7 @@ eval:
   mixed_height_spatial_probability: 1.0
   mixed_height_channel_probability: 1.0
   mixed_height_height_probability: 1.0
-  height_visible_levels: [4,6,8,10]
+  height_visible_levels: [15,16,17]
   clamp_visible_precip: true
   save_norm_output: true
   overwrite: true
