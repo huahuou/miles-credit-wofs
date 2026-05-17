@@ -213,25 +213,47 @@ trainer:
   residual_prediction: false
   update_learning_rate: false
 eval:
+  # mode options: none, ddp, fsdp. Controls rollout parallelism/checkpoint wrapping only.
   mode: ddp
-  ensemble_size: 1
-  sampler: ddim
-  sampling_timesteps: 300
-  ddim_sampling_eta: 0.01
+  # ensemble_size: number of independent samples saved on the "ensemble" dimension.
+  # For sampler=ddim with ddim_sampling_eta=0, rollout is deterministic and forces ensemble_size=1.
+  ensemble_size: 4
+  # sampler options: ddim, ddpm, repaint, repaint_ddim.
+  # ddim uses a sparse deterministic/stochastic DDIM path; ddpm uses all diffusion steps.
+  # repaint uses DDPM-style forward/backward jumps; repaint_ddim uses DDIM steps with inner RePaint resampling.
+  sampler: repaint_ddim
+  # sampling_timesteps: DDIM/repaint_ddim step count. For repaint, this caps the starting time at sampling_timesteps - 1.
+  sampling_timesteps: 100
+  # ddim_sampling_eta: DDIM stochasticity; 0 is deterministic, larger values add noise. Used by ddim only.
+  ddim_sampling_eta: 0.02
+  # repaint_jump_length: adjacent forward noising steps in each DDPM-style repaint jump. Ignored by repaint_ddim.
   repaint_jump_length: 10
-  repaint_jump_n_sample: 5
+  # repaint_jump_n_sample: RePaint resampling count. For repaint_ddim this is the paper's [https://arxiv.org/pdf/2304.03760] inner loop count U.
+  repaint_jump_n_sample: 10
+  # precip_mask_ratio: fraction of eligible precip patch elements to inpaint.
   precip_mask_ratio: 0.75
+  # precip_mask_mode options: spatial_patch, channel_patch, height_patch, mixed, mixed_height.
+  # spatial_patch shares one x/y mask; channel_patch masks precip groups independently.
+  # height_patch masks group-level-patch elements; mixed_height samples among spatial/channel/height modes.
   precip_mask_mode: mixed_height
+  # mixed_height_*_probability: nonnegative weights used only when precip_mask_mode=mixed_height.
   mixed_height_spatial_probability: 1.0
   mixed_height_channel_probability: 1.0
   mixed_height_height_probability: 1.0
+  # height_visible_levels: zero-based vertical levels kept visible/excluded from height_patch masking.
   height_visible_levels: [15,16,17]
+  # clamp_visible_precip: when true, visible precip is re-noised to each diffusion timestep and reinserted during sampling.
   clamp_visible_precip: true
+  # save_norm_output: also write normalized model-space output in the zarr group "norm_output".
   save_norm_output: true
+  # overwrite: remove an existing analysis zarr store before writing.
   overwrite: true
+  # save_denoise_trajectory: write selected normalized reverse-process states to group "denoise_trajectory".
   save_denoise_trajectory: true
-  trajectory_channels: [0, 2, 5]
-  trajectory_stride: 10
+  # trajectory_channels: global precip channel indices [0, 17, 34, 51, 68, 85, 102, 119] to save when save_denoise_trajectory=true.
+  trajectory_channels: [0, 17, 40, 57, 78, 95, 112, 129]
+  # trajectory_stride: save every Nth reverse-process state in the denoise trajectory.
+  trajectory_stride: 25
 loss:
   latitude_weights: ''
   use_latitude_weights: false
