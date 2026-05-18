@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -70,6 +71,14 @@ def _resolve_eval_ensemble_size(conf: dict) -> tuple[int, int, bool, float]:
     deterministic = sampler == "ddim" and np.isclose(eta, 0.0)
     effective = 1 if deterministic else requested
     return requested, effective, deterministic, eta
+
+
+def _resolve_eval_batch_size(conf: dict, ensemble_size: int) -> int:
+    eval_conf = _eval_conf(conf)
+    batch_size = int(eval_conf.get("eval_batch_size", 1))
+    if batch_size < 1:
+        raise ValueError(f"eval.eval_batch_size must be >= 1, got {batch_size}")
+    return min(batch_size, int(ensemble_size))
 
 
 def _gaussian_kernel_1d(size: int, sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -468,6 +477,7 @@ def rollout_one_timestep_with_metrics(
     repaint_jump_n_sample = int(_eval_conf(conf).get("repaint_jump_n_sample", 10))
     save_trajectory = bool(_eval_conf(conf).get("save_denoise_trajectory", False))
     _, ensemble_size, _, _ = _resolve_eval_ensemble_size(conf)
+    eval_batch_size = _resolve_eval_batch_size(conf, ensemble_size)
 
     cond = _build_condition_dict(
         batch,
@@ -505,12 +515,22 @@ def rollout_one_timestep_with_metrics(
     metrics_rows: list[dict] = []
     full_mask = np.ones_like(pixel_mask, dtype=np.float32)
 
-    for ensemble_index in range(ensemble_size):
+    for ensemble_start in range(0, ensemble_size, eval_batch_size):
+        member_count = min(eval_batch_size, ensemble_size - ensemble_start)
+        cond_batch = {
+            key: value.repeat(member_count, *((1,) * (value.ndim - 1)))
+            for key, value in cond.items()
+        }
+        precip_mask_batch = precip_mask.repeat(member_count, *((1,) * (precip_mask.ndim - 1)))
+        precip_visible_batch = None
+        if precip_visible is not None:
+            precip_visible_batch = precip_visible.repeat(member_count, *((1,) * (precip_visible.ndim - 1)))
+
         with torch.no_grad():
             pred_norm = core.sample_precip(
-                cond,
-                precip_mask,
-                precip_visible=precip_visible,
+                cond_batch,
+                precip_mask_batch,
+                precip_visible=precip_visible_batch,
                 sampling_timesteps=sampling_timesteps,
                 eta=eta,
                 sampler=sampler,
@@ -520,63 +540,65 @@ def rollout_one_timestep_with_metrics(
             )
 
         if save_trajectory:
-            all_steps = pred_norm[0].detach().cpu().numpy()
+            all_steps_batch = pred_norm.detach().cpu().numpy()
             pred_norm = pred_norm[:, -1]
             channels = _eval_conf(conf).get("trajectory_channels", [int(_eval_conf(conf).get("channel", 0))])
             if isinstance(channels, int):
                 channels = [channels]
-            channels = [max(0, min(int(channel), all_steps.shape[1] - 1)) for channel in channels]
+            channels = [max(0, min(int(channel), all_steps_batch.shape[2] - 1)) for channel in channels]
             stride = max(1, int(_eval_conf(conf).get("trajectory_stride", 1)))
-            trajectory_values.append(all_steps[::stride, channels].astype(np.float32, copy=False))
+            for member_steps in all_steps_batch:
+                trajectory_values.append(member_steps[::stride, channels].astype(np.float32, copy=False))
             trajectory_channels = np.asarray(channels, dtype=np.int32)
 
-        pred_norm = pred_norm[0].detach().cpu().numpy()
-        pred_norm = pred_norm[:, :orig_h, :orig_w]
+        pred_norm_batch = pred_norm.detach().cpu().numpy()[:, :, :orig_h, :orig_w]
 
-        member_out_norm: Dict[str, np.ndarray] = {}
-        offset = 0
-        for var in dummy_dataset.precip_vars:
-            n_ch = dummy_dataset._mean_values[var].shape[0] if np.asarray(dummy_dataset._mean_values[var]).ndim > 0 else 1
-            member_out_norm[var] = pred_norm[offset : offset + n_ch].copy()
-            offset += n_ch
+        for batch_member_index, pred_norm_member in enumerate(pred_norm_batch):
+            ensemble_index = ensemble_start + batch_member_index
+            member_out_norm: Dict[str, np.ndarray] = {}
+            offset = 0
+            for var in dummy_dataset.precip_vars:
+                n_ch = dummy_dataset._mean_values[var].shape[0] if np.asarray(dummy_dataset._mean_values[var]).ndim > 0 else 1
+                member_out_norm[var] = pred_norm_member[offset : offset + n_ch].copy()
+                offset += n_ch
 
-        member_out = _denormalize_precip_target(
-            pred_norm,
-            mean_values=mean_values,
-            std_values=std_values,
-            concentration_specs=concentration_specs,
-            dummy_dataset=dummy_dataset,
-        )
-        pred_phys = _concat_var_dict(member_out, dummy_dataset.precip_vars)
+            member_out = _denormalize_precip_target(
+                pred_norm_member,
+                mean_values=mean_values,
+                std_values=std_values,
+                concentration_specs=concentration_specs,
+                dummy_dataset=dummy_dataset,
+            )
+            pred_phys = _concat_var_dict(member_out, dummy_dataset.precip_vars)
 
-        normalized_metrics = compute_masked_normalized_metrics(pred_norm, target_norm, pixel_mask)
-        physical_metrics = compute_masked_physical_metrics(pred_phys, target_phys, pixel_mask)
-        normalized_metrics_full = compute_masked_normalized_metrics(pred_norm, target_norm, full_mask)
-        physical_metrics_full = compute_masked_physical_metrics(pred_phys, target_phys, full_mask)
-        metrics_rows.append(
-            {
-                "time_index": int(time_index),
-                "ensemble_index": int(ensemble_index),
-                "normalized_mse_masked": normalized_metrics["mse"],
-                "normalized_mae_masked": normalized_metrics["mae"],
-                "normalized_ssim_masked": normalized_metrics["ssim"],
-                "normalized_mse_full": normalized_metrics_full["mse"],
-                "normalized_mae_full": normalized_metrics_full["mae"],
-                "normalized_ssim_full": normalized_metrics_full["ssim"],
-                "physical_mse_masked": physical_metrics["mse"],
-                "physical_mae_masked": physical_metrics["mae"],
-                "physical_mse_full": physical_metrics_full["mse"],
-                "physical_mae_full": physical_metrics_full["mae"],
-                "masked_fraction": normalized_metrics["masked_fraction"],
-                "mask_mode": mask_info["mode"],
-                "requested_mask_ratio": float(mask_info["requested_ratio"]),
-            }
-        )
+            normalized_metrics = compute_masked_normalized_metrics(pred_norm_member, target_norm, pixel_mask)
+            physical_metrics = compute_masked_physical_metrics(pred_phys, target_phys, pixel_mask)
+            normalized_metrics_full = compute_masked_normalized_metrics(pred_norm_member, target_norm, full_mask)
+            physical_metrics_full = compute_masked_physical_metrics(pred_phys, target_phys, full_mask)
+            metrics_rows.append(
+                {
+                    "time_index": int(time_index),
+                    "ensemble_index": int(ensemble_index),
+                    "normalized_mse_masked": normalized_metrics["mse"],
+                    "normalized_mae_masked": normalized_metrics["mae"],
+                    "normalized_ssim_masked": normalized_metrics["ssim"],
+                    "normalized_mse_full": normalized_metrics_full["mse"],
+                    "normalized_mae_full": normalized_metrics_full["mae"],
+                    "normalized_ssim_full": normalized_metrics_full["ssim"],
+                    "physical_mse_masked": physical_metrics["mse"],
+                    "physical_mae_masked": physical_metrics["mae"],
+                    "physical_mse_full": physical_metrics_full["mse"],
+                    "physical_mae_full": physical_metrics_full["mae"],
+                    "masked_fraction": normalized_metrics["masked_fraction"],
+                    "mask_mode": mask_info["mode"],
+                    "requested_mask_ratio": float(mask_info["requested_ratio"]),
+                }
+            )
 
-        for var, arr in member_out.items():
-            out_by_var[var].append(arr)
-        for var, arr in member_out_norm.items():
-            out_norm_by_var[var].append(arr)
+            for var, arr in member_out.items():
+                out_by_var[var].append(arr)
+            for var, arr in member_out_norm.items():
+                out_norm_by_var[var].append(arr)
 
     trajectory = None
     if trajectory_values:
@@ -602,6 +624,7 @@ def rollout_one_timestep_with_metrics(
 def run_rollout(args, conf: dict):
     eval_conf = _eval_conf(conf)
     requested_ensemble_size, ensemble_size, deterministic_ensemble, effective_eta = _resolve_eval_ensemble_size(conf)
+    eval_batch_size = _resolve_eval_batch_size(conf, ensemble_size)
     mode = str(eval_conf.get("mode", "none")).strip().lower()
     local_rank, world_rank, world_size = get_rank_info(mode)
     distributed = mode in {"ddp", "fsdp"}
@@ -616,6 +639,7 @@ def run_rollout(args, conf: dict):
         else:
             device = torch.device("cpu")
         logger.info("Running DiffMAE rollout+metrics on rank %d/%d device=%s", world_rank, world_size, device)
+        logger.info("Using eval ensemble_size=%d with eval_batch_size=%d", ensemble_size, eval_batch_size)
         if deterministic_ensemble and world_rank == 0:
             logger.info(
                 "Eval sampler=ddim with ddim_sampling_eta=%s is deterministic; forcing rollout ensemble_size=1 (requested %d).",
@@ -655,19 +679,28 @@ def run_rollout(args, conf: dict):
         rank_files = all_files[world_rank::world_size]
         logger.info("Processing %d/%d case files on rank %d", len(rank_files), len(all_files), world_rank)
 
-        for case_file in rank_files:
+        for case_index, case_file in enumerate(rank_files, start=1):
+            case_start_time = time.monotonic()
             case_stem = Path(case_file).stem.replace(".zarr", "")
             case_date = _extract_case_date(case_file) or "unknown"
             case_out_dir = os.path.join(out_dir, case_date)
             os.makedirs(case_out_dir, exist_ok=True)
             out_path = os.path.join(case_out_dir, f"{case_stem}_analysis.zarr")
             metrics_path = os.path.join(case_out_dir, f"{case_stem}_metrics.json")
+            logger.info(
+                "Rank %d starting case %d/%d: %s",
+                world_rank,
+                case_index,
+                len(rank_files),
+                case_stem,
+            )
 
             if os.path.exists(out_path) and not bool(eval_conf.get("overwrite", False)):
                 logger.info("Skipping %s (already exists)", out_path)
                 continue
 
             try:
+                io_start_time = time.monotonic()
                 all_vars = list(
                     set(
                         dummy_ds.background_vars
@@ -684,11 +717,22 @@ def run_rollout(args, conf: dict):
                     n_time = max(0, n_time - 1)
                 if args.max_times is not None:
                     n_time = min(n_time, int(args.max_times))
+                logger.info(
+                    "Rank %d case %s opened in %.1fs; processing %d timesteps, ensemble_size=%d, eval_batch_size=%d",
+                    world_rank,
+                    case_stem,
+                    time.monotonic() - io_start_time,
+                    n_time,
+                    ensemble_size,
+                    eval_batch_size,
+                )
 
                 if args.mask_file:
+                    logger.info("Rank %d case %s loading mask bundle: %s", world_rank, case_stem, args.mask_file)
                     mask_bundle = load_mask_bundle(args.mask_file)
                 else:
                     mask_seed = int(args.mask_seed if args.mask_seed is not None else conf.get("seed", 0))
+                    mask_start_time = time.monotonic()
                     mask_bundle = _write_case_mask_bundle(
                         out_dir=case_out_dir,
                         case_stem=case_stem,
@@ -697,6 +741,12 @@ def run_rollout(args, conf: dict):
                         seed=mask_seed,
                         case_file=case_file,
                         config_path=args.model_config,
+                    )
+                    logger.info(
+                        "Rank %d case %s wrote mask bundle in %.1fs",
+                        world_rank,
+                        case_stem,
+                        time.monotonic() - mask_start_time,
                     )
 
                 recon_by_var: Dict[str, List[np.ndarray]] = {v: [] for v in dummy_ds.precip_vars}
@@ -710,6 +760,18 @@ def run_rollout(args, conf: dict):
                 requested_mask_ratios: list[float] = []
 
                 for t_idx in range(n_time):
+                    timestep_start_time = time.monotonic()
+                    valid_time = str(ds["time"].values[t_idx]) if "time" in ds.coords else str(t_idx)
+                    logger.info(
+                        "Rank %d case %s timestep %d/%d valid_time=%s: sampling %d ensemble members in batches of %d",
+                        world_rank,
+                        case_stem,
+                        t_idx + 1,
+                        n_time,
+                        valid_time,
+                        ensemble_size,
+                        eval_batch_size,
+                    )
                     stop = t_idx + 2 if dummy_ds.mae_include_t1_refl else t_idx + 1
                     chunk = ds.isel(time=slice(t_idx, stop)).load()
                     try:
@@ -741,12 +803,20 @@ def run_rollout(args, conf: dict):
                         trajectory_channels = trajectory["channels"]
 
                     for metrics_row in extra["metrics"]:
-                        metrics_row["valid_time"] = str(ds["time"].values[t_idx]) if "time" in ds.coords else str(t_idx)
+                        metrics_row["valid_time"] = valid_time
                         metric_rows.append(metrics_row)
                     grouped_patch_masks.append(extra["mask"]["grouped_patch_mask"])
                     pixel_masks.append(extra["mask"]["pixel_mask"])
                     mask_modes.append(extra["mask"]["mask_mode"])
                     requested_mask_ratios.append(extra["mask"]["requested_mask_ratio"])
+                    logger.info(
+                        "Rank %d case %s timestep %d/%d finished in %.1fs",
+                        world_rank,
+                        case_stem,
+                        t_idx + 1,
+                        n_time,
+                        time.monotonic() - timestep_start_time,
+                    )
 
                 time_vals = ds["time"].values[:n_time] if "time" in ds.coords else np.arange(n_time)
                 data_vars = {}
@@ -777,14 +847,18 @@ def run_rollout(args, conf: dict):
                         "mask_file": str(args.mask_file) if args.mask_file else "",
                         "requested_ensemble_size": requested_ensemble_size,
                         "ensemble_size": ensemble_size,
+                        "eval_batch_size": eval_batch_size,
                         "deterministic_ensemble_override": int(deterministic_ensemble),
                     },
                 )
                 if os.path.exists(out_path):
                     shutil.rmtree(out_path)
+                write_start_time = time.monotonic()
+                logger.info("Rank %d case %s writing analysis zarr: %s", world_rank, case_stem, out_path)
                 analysis_ds.to_zarr(out_path, mode="w")
 
                 if bool(eval_conf.get("save_norm_output", True)):
+                    logger.info("Rank %d case %s writing normalized output group", world_rank, case_stem)
                     xr.Dataset(
                         data_vars={
                             var: (("time", "ensemble", "level", "y", "x"), np.stack(frames, axis=0).astype(np.float32))
@@ -795,6 +869,7 @@ def run_rollout(args, conf: dict):
                     ).to_zarr(out_path, mode="a", group="norm_output")
 
                 if trajectories:
+                    logger.info("Rank %d case %s writing denoise trajectory group", world_rank, case_stem)
                     traj_arr = np.stack(trajectories, axis=0).astype(np.float32)
                     channel_vars = []
                     channel_levels = []
@@ -863,8 +938,10 @@ def run_rollout(args, conf: dict):
                         "patch_size": int(conf["model"]["patch_size"]),
                     },
                 )
+                logger.info("Rank %d case %s writing mask group", world_rank, case_stem)
                 mask_ds.to_zarr(out_path, mode="a", group="mask")
 
+                logger.info("Rank %d case %s writing metrics JSON", world_rank, case_stem)
                 _write_case_metrics_json(
                     case_out_dir=case_out_dir,
                     case_stem=case_stem,
@@ -876,10 +953,19 @@ def run_rollout(args, conf: dict):
                         "config_copy": os.path.join(out_dir, Path(args.model_config).name),
                         "requested_ensemble_size": requested_ensemble_size,
                         "ensemble_size": ensemble_size,
+                        "eval_batch_size": eval_batch_size,
                         "deterministic_ensemble_override": bool(deterministic_ensemble),
                     },
                 )
-                logger.info("Wrote analysis to %s and metrics to %s", out_path, metrics_path)
+                logger.info(
+                    "Rank %d case %s complete in %.1fs; writes took %.1fs; analysis=%s metrics=%s",
+                    world_rank,
+                    case_stem,
+                    time.monotonic() - case_start_time,
+                    time.monotonic() - write_start_time,
+                    out_path,
+                    metrics_path,
+                )
             except Exception as exc:
                 logger.error("Failed to process %s: %s", case_file, exc, exc_info=True)
 

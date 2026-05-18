@@ -170,3 +170,5 @@ cython_debug/
 
 # Crash/core dumps
 core.*
+plots
+plots/*

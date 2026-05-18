@@ -43,12 +43,12 @@ CHECKPOINT="${CHECKPOINT:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/w
 
 START_DATE="${START_DATE:-20210425}"
 END_DATE="${END_DATE:-20210530}"
-OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_4x4patch_heightmask_v2/repaint_ddim_test2}"
+OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_4x4patch_heightmask_v2/repaint_test1}"
 
 MASK_FILE="${MASK_FILE:-}"
 MASK_SEED="${MASK_SEED:-1000}"
 
-MAX_FILES="${MAX_FILES:-8}"
+MAX_FILES="${MAX_FILES:-4}"
 MAX_TIMES="${MAX_TIMES:-1}"
 
 EVAL_MODE="${EVAL_MODE:-ddp}"

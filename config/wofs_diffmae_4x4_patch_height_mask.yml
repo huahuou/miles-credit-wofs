@@ -218,12 +218,14 @@ eval:
   # ensemble_size: number of independent samples saved on the "ensemble" dimension.
   # For sampler=ddim with ddim_sampling_eta=0, rollout is deterministic and forces ensemble_size=1.
   ensemble_size: 4
+  # eval_batch_size: number of ensemble members sampled together per timestep. Increase for speed until GPU memory is limiting.
+  eval_batch_size: 4
   # sampler options: ddim, ddpm, repaint, repaint_ddim.
   # ddim uses a sparse deterministic/stochastic DDIM path; ddpm uses all diffusion steps.
   # repaint uses DDPM-style forward/backward jumps; repaint_ddim uses DDIM steps with inner RePaint resampling.
-  sampler: repaint_ddim
+  sampler: repaint
   # sampling_timesteps: DDIM/repaint_ddim step count. For repaint, this caps the starting time at sampling_timesteps - 1.
-  sampling_timesteps: 100
+  sampling_timesteps: 400
   # ddim_sampling_eta: DDIM stochasticity; 0 is deterministic, larger values add noise. Used by ddim only.
   ddim_sampling_eta: 0.02
   # repaint_jump_length: adjacent forward noising steps in each DDPM-style repaint jump. Ignored by repaint_ddim.
@@ -249,7 +251,7 @@ eval:
   # overwrite: remove an existing analysis zarr store before writing.
   overwrite: true
   # save_denoise_trajectory: write selected normalized reverse-process states to group "denoise_trajectory".
-  save_denoise_trajectory: true
+  save_denoise_trajectory: false
   # trajectory_channels: global precip channel indices [0, 17, 34, 51, 68, 85, 102, 119] to save when save_denoise_trajectory=true.
   trajectory_channels: [0, 17, 40, 57, 78, 95, 112, 129]
   # trajectory_stride: save every Nth reverse-process state in the denoise trajectory.
