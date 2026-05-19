@@ -24,7 +24,7 @@
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=192
 #SBATCH --mem=0
-#SBATCH --time=01:29:00
+#SBATCH --time=01:39:00
 #SBATCH --output=/home/Zhanxiang.Hua/job_log/%x-%j.out
 #SBATCH --error=/home/Zhanxiang.Hua/job_log/%x-%j.err
 #SBATCH --exclusive
@@ -39,11 +39,11 @@ CONDA_ENV="${CONDA_ENV:-credit-wofs}"
 PROJECT_DIR="${PROJECT_DIR:-/home/Zhanxiang.Hua/miles-credit-wofs}"
 CONFIG="${CONFIG:-/home/Zhanxiang.Hua/miles-credit-wofs/config/wofs_diffmae_4x4_patch_height_mask.yml}"
 ROLLOUT_MODULE="${ROLLOUT_MODULE:-applications.rollout_wrf_wofs_mae_da_metrics}"
-CHECKPOINT="${CHECKPOINT:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask_v2/checkpoint.pt}"
+CHECKPOINT="${CHECKPOINT:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask_v3/checkpoint.pt}"
 
 START_DATE="${START_DATE:-20210425}"
 END_DATE="${END_DATE:-20210530}"
-OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_4x4patch_heightmask_v2/repaint_test1}"
+OUT_DIR="${OUT_DIR:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_4x4patch_heightmask_v3/ddim_test2}"
 
 MASK_FILE="${MASK_FILE:-}"
 MASK_SEED="${MASK_SEED:-1000}"

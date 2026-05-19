@@ -256,6 +256,38 @@ def _grouped_patch_to_pixel_mask(
     return np.concatenate(expanded, axis=0).astype(np.float32, copy=False)
 
 
+def _blend_mask_boundary(
+    pred_norm: torch.Tensor,
+    pixel_mask: torch.Tensor,
+    width_px: int,
+    strength: float,
+    passes: int,
+) -> torch.Tensor:
+    """Optionally smooth the hard data-consistency seam in normalized space."""
+    width_px = int(width_px)
+    if width_px <= 0:
+        return pred_norm
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return pred_norm
+    passes = max(1, int(passes))
+
+    mask = pixel_mask.to(device=pred_norm.device, dtype=pred_norm.dtype)
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(0)
+    visible = 1.0 - mask
+    kernel = 2 * width_px + 1
+    dilated_mask = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=width_px)
+    dilated_visible = F.max_pool2d(visible, kernel_size=kernel, stride=1, padding=width_px)
+    boundary_band = (dilated_mask * dilated_visible).clamp(0.0, 1.0)
+
+    out = pred_norm
+    for _ in range(passes):
+        smoothed = F.avg_pool2d(out, kernel_size=kernel, stride=1, padding=width_px)
+        out = out * (1.0 - strength * boundary_band) + smoothed * (strength * boundary_band)
+    return out
+
+
 def _stack_precip_target(batch: Dict[str, torch.Tensor], dummy_dataset: WoFSMAEDataset) -> np.ndarray:
     return torch.cat([batch[var] for var in dummy_dataset.precip_vars], dim=1)[0].detach().cpu().numpy().astype(np.float32)
 
@@ -475,6 +507,7 @@ def rollout_one_timestep_with_metrics(
     eta = _eval_conf(conf).get("ddim_sampling_eta", None)
     repaint_jump_length = int(_eval_conf(conf).get("repaint_jump_length", 10))
     repaint_jump_n_sample = int(_eval_conf(conf).get("repaint_jump_n_sample", 10))
+    clamp_final_visible = bool(_eval_conf(conf).get("clamp_final_visible_precip", True))
     save_trajectory = bool(_eval_conf(conf).get("save_denoise_trajectory", False))
     _, ensemble_size, _, _ = _resolve_eval_ensemble_size(conf)
     eval_batch_size = _resolve_eval_batch_size(conf, ensemble_size)
@@ -536,6 +569,7 @@ def rollout_one_timestep_with_metrics(
                 sampler=sampler,
                 repaint_jump_length=repaint_jump_length,
                 repaint_jump_n_sample=repaint_jump_n_sample,
+                clamp_final_visible=clamp_final_visible,
                 return_all_timesteps=save_trajectory,
             )
 
@@ -550,6 +584,17 @@ def rollout_one_timestep_with_metrics(
             for member_steps in all_steps_batch:
                 trajectory_values.append(member_steps[::stride, channels].astype(np.float32, copy=False))
             trajectory_channels = np.asarray(channels, dtype=np.int32)
+
+        blend_width_px = int(_eval_conf(conf).get("visible_blend_width_px", 0))
+        if blend_width_px > 0:
+            pixel_mask_batch = core.expand_patch_mask(precip_mask_batch, target.shape[-2], target.shape[-1]).to(pred_norm.dtype)
+            pred_norm = _blend_mask_boundary(
+                pred_norm,
+                pixel_mask_batch,
+                width_px=blend_width_px,
+                strength=float(_eval_conf(conf).get("visible_blend_strength", 0.5)),
+                passes=int(_eval_conf(conf).get("visible_blend_passes", 1)),
+            )
 
         pred_norm_batch = pred_norm.detach().cpu().numpy()[:, :, :orig_h, :orig_w]
 

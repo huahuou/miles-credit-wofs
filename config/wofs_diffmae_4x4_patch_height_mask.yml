@@ -217,35 +217,46 @@ eval:
   mode: ddp
   # ensemble_size: number of independent samples saved on the "ensemble" dimension.
   # For sampler=ddim with ddim_sampling_eta=0, rollout is deterministic and forces ensemble_size=1.
-  ensemble_size: 4
+  ensemble_size: 8
   # eval_batch_size: number of ensemble members sampled together per timestep. Increase for speed until GPU memory is limiting.
-  eval_batch_size: 4
+  eval_batch_size: 8
   # sampler options: ddim, ddpm, repaint, repaint_ddim.
   # ddim uses a sparse deterministic/stochastic DDIM path; ddpm uses all diffusion steps.
   # repaint uses DDPM-style forward/backward jumps; repaint_ddim uses DDIM steps with inner RePaint resampling.
-  sampler: repaint
+  sampler: ddim
   # sampling_timesteps: DDIM/repaint_ddim step count. For repaint, this caps the starting time at sampling_timesteps - 1.
-  sampling_timesteps: 400
+  sampling_timesteps: 100
   # ddim_sampling_eta: DDIM stochasticity; 0 is deterministic, larger values add noise. Used by ddim only.
   ddim_sampling_eta: 0.02
   # repaint_jump_length: adjacent forward noising steps in each DDPM-style repaint jump. Ignored by repaint_ddim.
   repaint_jump_length: 10
   # repaint_jump_n_sample: RePaint resampling count. For repaint_ddim this is the paper's [https://arxiv.org/pdf/2304.03760] inner loop count U.
-  repaint_jump_n_sample: 10
+  repaint_jump_n_sample: 5
   # precip_mask_ratio: fraction of eligible precip patch elements to inpaint.
   precip_mask_ratio: 0.75
   # precip_mask_mode options: spatial_patch, channel_patch, height_patch, mixed, mixed_height.
   # spatial_patch shares one x/y mask; channel_patch masks precip groups independently.
   # height_patch masks group-level-patch elements; mixed_height samples among spatial/channel/height modes.
-  precip_mask_mode: mixed_height
+  precip_mask_mode: spatial_patch
   # mixed_height_*_probability: nonnegative weights used only when precip_mask_mode=mixed_height.
   mixed_height_spatial_probability: 1.0
   mixed_height_channel_probability: 1.0
   mixed_height_height_probability: 1.0
   # height_visible_levels: zero-based vertical levels kept visible/excluded from height_patch masking.
-  height_visible_levels: [15,16,17]
-  # clamp_visible_precip: when true, visible precip is re-noised to each diffusion timestep and reinserted during sampling.
+  height_visible_levels: [14,15,16]
+  # clamp_visible_precip: when true, eval passes true precip as visible context;
+  # visible pixels are re-noised/reinserted at each diffusion step and replaced
+  # by clean truth at the final step. When false, no visible precip is inserted.
   clamp_visible_precip: true
+  # clamp_final_visible_precip: when clamp_visible_precip=true, controls only
+  # the final clean-truth replacement. Set false to keep intermediate visible
+  # noising/reinsertion but let the denoiser's final visible pixels pass through.
+  clamp_final_visible_precip: true
+  # visible_blend_*: optional normalized-space seam smoothing after sampling.
+  # Set width > 0 to trade exact visible-pixel preservation for smoother mask boundaries.
+  visible_blend_width_px: 1
+  visible_blend_strength: 0.25
+  visible_blend_passes: 1
   # save_norm_output: also write normalized model-space output in the zarr group "norm_output".
   save_norm_output: true
   # overwrite: remove an existing analysis zarr store before writing.

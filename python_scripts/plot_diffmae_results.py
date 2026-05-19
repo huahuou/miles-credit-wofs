@@ -479,13 +479,13 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 # python python_scripts/plot_diffmae_results.py \
-#   --exp-path /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_4x4patch_heightmask_v2/ddim_test4/20210427 \
-#   --file-name wofs_20210427_0030_mem01 \
+#   --exp-path /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_4x4patch_heightmask_v3/ddim_test1/20210427 \
+#   --file-name wofs_20210427_0000_mem01 \
 #   --time-index 0 \
 #   --ensemble-index 0 \
 #   --level-index 0 \
 #   --precip-vars QRAIN QNRAIN \
-#   --out-dir /home/Zhanxiang.Hua/miles-credit-wofs/plots/wofs_diffmae_pretrain_4x4patch/ddim_test4/20210427/plots
+#   --out-dir /home/Zhanxiang.Hua/miles-credit-wofs/plots/wofs_diffmae_pretrain_4x4patch_v3/ddim_test1/20210427/plots
 
 # python python_scripts/plot_diffmae_results.py \
 #   --exp-path /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_rollouts/wofs_diffmae_pretrain_latest2-2/ddim-r070-s500-e001/20210416 \
