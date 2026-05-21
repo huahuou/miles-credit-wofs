@@ -157,6 +157,25 @@ def test_ddim_update_matches_reference_formula():
     assert torch.allclose(ours, reference, atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_ddim_timestep_schedule_is_rounded_unique_and_descending():
+    model = _small_model()
+    times = model._ddim_timesteps(7)
+    assert times == sorted(set(times), reverse=True)
+    assert times[0] == model.num_timesteps - 1
+    assert times[-1] == 0
+    assert len(times) == 7
+
+
+def test_stochastic_ddim_sampling_is_finite():
+    model = _small_model()
+    precip = torch.randn(2, 3, 16, 16)
+    cond = _cond()
+    mask = model.random_precip_mask(2, 0.75, precip.device)
+    sample = model.sample_precip(cond, mask, sampling_timesteps=7, eta=0.5, sampler="ddim")
+    assert sample.shape == precip.shape
+    assert torch.isfinite(sample).all()
+
+
 def test_forward_loss_and_sampling_shapes_are_finite():
     model = _small_model()
     precip = torch.randn(2, 3, 16, 16)
@@ -197,7 +216,7 @@ def test_masked_noisy_state_affects_prediction():
     assert not torch.allclose(y1, y2)
 
 
-def test_visible_precip_is_reimposed_during_sampling():
+def test_visible_precip_conditions_sampling_without_hard_reimposition():
     model = _small_model()
     cond = _cond(batch=1)
     visible = torch.randn(1, 3, 16, 16)
@@ -205,23 +224,23 @@ def test_visible_precip_is_reimposed_during_sampling():
     mask[:, :4] = 0.0
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     pixel_mask = model.expand_patch_mask(mask, 16, 16)
-    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+    assert sample.shape == visible.shape
+    assert torch.isfinite(sample).all()
+    assert not torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
 
 
-def test_ddpm_sampling_reimposes_visible_precip():
+def test_ddpm_sampling_accepts_visible_precip_conditioning():
     model = _small_model()
     cond = _cond(batch=1)
     visible = torch.randn(1, 3, 16, 16)
     mask = torch.ones(1, 16)
     mask[:, :4] = 0.0
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampler="ddpm")
-    pixel_mask = model.expand_patch_mask(mask, 16, 16)
     assert sample.shape == visible.shape
     assert torch.isfinite(sample).all()
-    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
 
 
-def test_repaint_sampling_reimposes_visible_precip_and_returns_trajectory():
+def test_repaint_sampling_accepts_visible_precip_and_returns_trajectory():
     model = _small_model()
     cond = _cond(batch=1)
     visible = torch.randn(1, 3, 16, 16)
@@ -237,13 +256,10 @@ def test_repaint_sampling_reimposes_visible_precip_and_returns_trajectory():
         repaint_jump_n_sample=2,
         return_all_timesteps=True,
     )
-    pixel_mask = model.expand_patch_mask(mask, 16, 16)
-    final = sample[:, -1]
     assert sample.ndim == 5
     assert sample.shape[0] == 1
     assert sample.shape[2:] == visible.shape[1:]
     assert torch.isfinite(sample).all()
-    assert torch.allclose(final * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
 
 
 def test_rollout_condition_builder_uses_stacked_forcing():
@@ -317,7 +333,8 @@ def test_channel_patch_mask_supports_channel_specific_corrections():
     assert torch.isfinite(losses["loss"])
 
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
-    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+    assert sample.shape == precip.shape
+    assert torch.isfinite(sample).all()
 
 
 def test_grouped_precip_tokenization_supports_group_specific_masks():
@@ -345,7 +362,7 @@ def test_grouped_precip_tokenization_supports_group_specific_masks():
 
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     assert sample.shape == precip.shape
-    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+    assert torch.isfinite(sample).all()
 
 
 def test_grouped_cross_self_decoder_supports_group_specific_masks():
@@ -380,7 +397,8 @@ def test_grouped_height_mask_supports_level_specific_visible_precip():
     assert torch.isfinite(losses["loss"])
 
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
-    assert torch.allclose(sample * (1.0 - pixel_mask), visible * (1.0 - pixel_mask), atol=1.0e-6)
+    assert sample.shape == precip.shape
+    assert torch.isfinite(sample).all()
 
 
 def test_anti_patch_refiner_is_initially_identity_and_checkpoint_compatible():

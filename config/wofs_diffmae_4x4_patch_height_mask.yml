@@ -28,7 +28,7 @@
 #   unset to allow all levels except height_visible_levels.
 # - precip_mask_ratio: fraction sampled from eligible group-level-patch elements.
 
-save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_heightmask_v3
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev2
 seed: 1002
 data:
   save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
@@ -177,7 +177,7 @@ trainer:
   mixed_height_spatial_probability: 1.0
   mixed_height_channel_probability: 1.0
   mixed_height_height_probability: 1.0
-  height_visible_levels: [15,16,17]
+  height_visible_levels: [14,15,16]
   val_mask_ratio: 1.0
   val_mask_mode: spatial_patch
   denoise_snapshot:
@@ -191,7 +191,7 @@ trainer:
     sampling_use_visible_precip: true
     sampling_timesteps: 200
     channel: 3
-  load_weights: true
+  load_weights: false
   load_optimizer: false
   load_scheduler: false
   load_scaler: false
@@ -206,10 +206,10 @@ trainer:
     scheduler_type: cosine-annealing-restarts
     first_cycle_steps: 800
     cycle_mult: 2.0
-    max_lr: 5.0e-05
-    min_lr: 1.0e-06
+    max_lr: 1.0e-04
+    min_lr: 5.0e-06
     warmup_steps: 400
-    gamma: 0.7
+    gamma: 0.85
   residual_prediction: false
   update_learning_rate: false
 eval:
@@ -244,17 +244,18 @@ eval:
   mixed_height_height_probability: 1.0
   # height_visible_levels: zero-based vertical levels kept visible/excluded from height_patch masking.
   height_visible_levels: [14,15,16]
-  # clamp_visible_precip: when true, eval passes true precip as visible context;
-  # visible pixels are re-noised/reinserted at each diffusion step and replaced
-  # by clean truth at the final step. When false, no visible precip is inserted.
+  # visible_precip_conditioning: when true, eval passes clean visible precip as
+  # context tokens. The model internally zeros masked precip before tokenizing,
+  # so masked truth is not exposed.
+  visible_precip_conditioning: true
+  # clamp_visible_precip is kept as a backward-compatible alias for
+  # visible_precip_conditioning.
   clamp_visible_precip: true
-  # clamp_final_visible_precip: when clamp_visible_precip=true, controls only
-  # the final clean-truth replacement. Set false to keep intermediate visible
-  # noising/reinsertion but let the denoiser's final visible pixels pass through.
-  clamp_final_visible_precip: true
-  # visible_blend_*: optional normalized-space seam smoothing after sampling.
-  # Set width > 0 to trade exact visible-pixel preservation for smoother mask boundaries.
-  visible_blend_width_px: 1
+  # Strict DiffMAE sampling does not paste visible pixels into the sample state.
+  # This flag is accepted by older call sites but ignored by WoFSDiffMAE.
+  clamp_final_visible_precip: false
+  # visible_blend_*: optional normalized-space smoothing after sampling.
+  visible_blend_width_px: 0
   visible_blend_strength: 0.25
   visible_blend_passes: 1
   # save_norm_output: also write normalized model-space output in the zarr group "norm_output".

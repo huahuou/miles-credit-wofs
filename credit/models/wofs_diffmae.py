@@ -300,6 +300,13 @@ class WoFSDiffMAE(BaseModel):
                 image_size=adapter_image_size,
             )
 
+        self.visible_precip_adapter = WoFSInputAdapter(
+            num_channels=self.channels,
+            patch_size=self.patch_size,
+            embed_dim=self.embed_dim,
+            image_size=self.image_size,
+        )
+
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         trunc_normal_(self.mask_token, std=0.02)
 
@@ -353,7 +360,9 @@ class WoFSDiffMAE(BaseModel):
         pos_emb = build_2d_sincos_posemb(n_h, n_w, self.embed_dim)
         self.register_buffer("target_pos_emb", pos_emb)
         self.target_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.visible_precip_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         trunc_normal_(self.target_modality_emb, std=0.02)
+        trunc_normal_(self.visible_precip_modality_emb, std=0.02)
 
         diffusion_conf = diffusion or {}
         self.objective = diffusion_conf.get("objective", "pred_v")
@@ -588,7 +597,26 @@ class WoFSDiffMAE(BaseModel):
             return precip_mask.amax(dim=1)
         return precip_mask
 
-    def _legacy_forward(self, noisy_precip: torch.Tensor, t: torch.Tensor, cond: Dict[str, torch.Tensor], precip_mask: torch.Tensor) -> torch.Tensor:
+    def _visible_precip_condition_image(
+        self,
+        precip_visible: Optional[torch.Tensor],
+        precip_mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if precip_visible is None:
+            return None
+        pixel_mask = self.expand_patch_mask(precip_mask, precip_visible.shape[-2], precip_visible.shape[-1]).to(
+            precip_visible.dtype
+        )
+        return precip_visible * (1.0 - pixel_mask)
+
+    def _legacy_forward(
+        self,
+        noisy_precip: torch.Tensor,
+        t: torch.Tensor,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         b, _, orig_h, orig_w = noisy_precip.shape
         noisy_tokens = self.legacy_precip_adapter(noisy_precip)
         token_mask = self.token_mask_from_precip_mask(precip_mask).to(noisy_tokens.dtype).unsqueeze(-1)
@@ -596,7 +624,7 @@ class WoFSDiffMAE(BaseModel):
         pos = rearrange(self.target_pos_emb.to(noisy_precip.dtype), "b d h w -> b (h w) d")
         target_tokens = target_tokens + pos + self.target_modality_emb
 
-        cond_tokens = self._condition_tokens(cond)
+        cond_tokens = self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
         tokens = self._decode_target_tokens(target_tokens, cond_tokens, t)
         patches = self.legacy_out_proj(tokens)
         n_h = self.image_size[0] // self.patch_size
@@ -627,16 +655,35 @@ class WoFSDiffMAE(BaseModel):
             tokens = block(tokens)
         return self.norm(tokens[:, : target_tokens.shape[1]])
 
-    def _condition_tokens(self, cond: Dict[str, torch.Tensor]) -> list[torch.Tensor]:
+    def _condition_tokens(
+        self,
+        cond: Dict[str, torch.Tensor],
+        precip_visible: Optional[torch.Tensor] = None,
+        precip_mask: Optional[torch.Tensor] = None,
+    ) -> list[torch.Tensor]:
         cond_tokens = []
         for mod in self.conditioned_modalities:
             if mod in cond:
                 cond_tokens.append(self.condition_adapters[mod](cond[mod]))
+        if precip_visible is not None:
+            if precip_mask is None:
+                raise ValueError("precip_mask is required when precip_visible is used for conditioning")
+            visible_img = self._visible_precip_condition_image(precip_visible, precip_mask)
+            visible_tokens = self.visible_precip_adapter(visible_img)
+            pos = rearrange(self.target_pos_emb.to(visible_img.dtype), "b d h w -> b (h w) d")
+            cond_tokens.append(visible_tokens + pos + self.visible_precip_modality_emb)
         return cond_tokens
 
-    def _grouped_forward(self, noisy_precip: torch.Tensor, t: torch.Tensor, cond: Dict[str, torch.Tensor], precip_mask: torch.Tensor) -> torch.Tensor:
+    def _grouped_forward(
+        self,
+        noisy_precip: torch.Tensor,
+        t: torch.Tensor,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         b, _, orig_h, orig_w = noisy_precip.shape
-        cond_tokens = self._condition_tokens(cond)
+        cond_tokens = self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
         if self.grouped_decoder_scope == "joint":
             return self._grouped_forward_joint(noisy_precip, t, cond_tokens, precip_mask)
 
@@ -735,8 +782,15 @@ class WoFSDiffMAE(BaseModel):
             - extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
         )
 
-    def model_predictions(self, x_t: torch.Tensor, t: torch.Tensor, cond: Dict[str, torch.Tensor], precip_mask: torch.Tensor):
-        model_out = self.forward(x_t, t, cond, precip_mask)
+    def model_predictions(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
+    ):
+        model_out = self.forward(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         if self.objective == "pred_noise":
             pred_noise = model_out
             pred_x_start = self.predict_start_from_noise(x_t, t, pred_noise)
@@ -757,29 +811,17 @@ class WoFSDiffMAE(BaseModel):
         posterior_log_variance = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance
 
-    def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, cond: Dict[str, torch.Tensor], precip_mask: torch.Tensor):
-        _, x_start = self.model_predictions(x_t, t, cond, precip_mask)
+    def p_mean_variance(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
+    ):
+        _, x_start = self.model_predictions(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x_t, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
-
-    def _apply_visible_precip(
-        self,
-        img: torch.Tensor,
-        precip_visible: Optional[torch.Tensor],
-        pixel_mask: torch.Tensor,
-        time: Optional[int],
-        clamp_clean: bool = True,
-    ) -> torch.Tensor:
-        if precip_visible is None:
-            return img
-        if time is None or time < 0:
-            if not clamp_clean:
-                return img
-            visible_t = precip_visible
-        else:
-            t = torch.full((img.shape[0],), int(time), device=img.device, dtype=torch.long)
-            visible_t = self.q_sample(precip_visible, t)
-        return img * pixel_mask + visible_t * (1.0 - pixel_mask)
 
     def _repaint_times(self, start_time: int, jump_length: int, jump_n_sample: int) -> list[int]:
         jump_length = max(1, int(jump_length))
@@ -810,6 +852,62 @@ class WoFSDiffMAE(BaseModel):
             img = (1.0 - beta).sqrt() * img + beta.sqrt() * torch.randn_like(img)
         return img
 
+    def _ddim_timesteps(self, total_steps: int) -> list[int]:
+        total_steps = max(1, min(int(total_steps), self.num_timesteps))
+        if total_steps == self.num_timesteps:
+            return list(reversed(range(self.num_timesteps)))
+
+        grid = torch.linspace(0, self.num_timesteps - 1, steps=total_steps, device=self.device)
+        rounded = torch.round(grid).long().tolist()
+
+        deduped: list[int] = []
+        seen: set[int] = set()
+        for time in rounded:
+            time = int(time)
+            if time not in seen:
+                deduped.append(time)
+                seen.add(time)
+
+        return list(reversed(deduped))
+
+    def _ddim_step(
+        self,
+        img: torch.Tensor,
+        time: int,
+        time_next: int,
+        cond: Dict[str, torch.Tensor],
+        precip_mask: torch.Tensor,
+        eta: float,
+        precip_visible: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        time_cond = torch.full((img.shape[0],), time, device=img.device, dtype=torch.long)
+        pred_noise, x_start = self.model_predictions(
+            img,
+            time_cond,
+            cond,
+            precip_mask,
+            precip_visible=precip_visible,
+        )
+
+        if time_next < 0:
+            return x_start, x_start, pred_noise
+
+        alpha_t = self.alphas_cumprod[time].to(device=img.device, dtype=img.dtype)
+        alpha_prev = self.alphas_cumprod[time_next].to(device=img.device, dtype=img.dtype)
+        eps = torch.finfo(img.dtype).eps if img.dtype.is_floating_point else 1.0e-8
+        alpha_t = alpha_t.clamp(min=eps, max=1.0 - eps)
+        alpha_prev = alpha_prev.clamp(min=eps, max=1.0 - eps)
+
+        one_minus_alpha_t = (1.0 - alpha_t).clamp_min(0.0)
+        one_minus_alpha_prev = (1.0 - alpha_prev).clamp_min(0.0)
+        sigma_sq = (eta**2) * (one_minus_alpha_prev / one_minus_alpha_t) * (1.0 - alpha_t / alpha_prev)
+        sigma_sq = sigma_sq.clamp_min(0.0)
+        sigma = torch.sqrt(sigma_sq)
+        c = torch.sqrt((one_minus_alpha_prev - sigma_sq).clamp_min(0.0))
+        noise = torch.randn_like(img) if eta > 0 else torch.zeros_like(img)
+        img_prev = torch.sqrt(alpha_prev) * x_start + c * pred_noise + sigma * noise
+        return img_prev, x_start, pred_noise
+
     def p_losses(
         self,
         x_start: torch.Tensor,
@@ -817,14 +915,17 @@ class WoFSDiffMAE(BaseModel):
         precip_mask: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
+        precip_visible: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         b = x_start.shape[0]
         if t is None:
             t = torch.randint(0, self.num_timesteps, (b,), device=x_start.device).long()
         if noise is None:
             noise = torch.randn_like(x_start)
+        if precip_visible is None:
+            precip_visible = x_start
         x_t = self.q_sample(x_start, t, noise)
-        model_out = self.forward(x_t, t, cond, precip_mask)
+        model_out = self.forward(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         if self.objective == "pred_noise":
             target = noise
         elif self.objective == "pred_x0":
@@ -845,10 +946,11 @@ class WoFSDiffMAE(BaseModel):
         t: torch.Tensor,
         cond: Dict[str, torch.Tensor],
         precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.grouped_precip:
-            return self._grouped_forward(noisy_precip, t, cond, precip_mask)
-        return self._legacy_forward(noisy_precip, t, cond, precip_mask)
+            return self._grouped_forward(noisy_precip, t, cond, precip_mask, precip_visible=precip_visible)
+        return self._legacy_forward(noisy_precip, t, cond, precip_mask, precip_visible=precip_visible)
 
     @torch.no_grad()
     def sample_precip(
@@ -864,11 +966,11 @@ class WoFSDiffMAE(BaseModel):
         return_all_timesteps: bool = False,
         clamp_final_visible: bool = True,
     ) -> torch.Tensor:
+        del clamp_final_visible
         first = next(iter(cond.values()))
         b, _, h, w = first.shape
         shape = (b, self.channels, h, w)
         img = torch.randn(shape, device=first.device, dtype=first.dtype)
-        pixel_mask = self.expand_patch_mask(precip_mask, h, w).to(first.dtype)
 
         sampler = str(sampler).strip().lower()
         if sampler not in {"ddim", "ddpm", "repaint", "repaint_ddim"}:
@@ -878,16 +980,20 @@ class WoFSDiffMAE(BaseModel):
         start_time = self.num_timesteps - 1
         if sampler == "repaint" and sampling_timesteps is not None:
             start_time = min(start_time, max(0, int(sampling_timesteps) - 1))
-        img = self._apply_visible_precip(img, precip_visible, pixel_mask, start_time)
         imgs = [img] if return_all_timesteps else None
 
         if sampler == "ddpm":
             for time in reversed(range(self.num_timesteps)):
                 time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
-                model_mean, _, model_log_variance, _ = self.p_mean_variance(img, time_cond, cond, precip_mask)
+                model_mean, _, model_log_variance, _ = self.p_mean_variance(
+                    img,
+                    time_cond,
+                    cond,
+                    precip_mask,
+                    precip_visible=precip_visible,
+                )
                 noise = torch.randn_like(img) if time > 0 else torch.zeros_like(img)
                 img = model_mean + (0.5 * model_log_variance).exp() * noise
-                img = self._apply_visible_precip(img, precip_visible, pixel_mask, time - 1, clamp_clean=clamp_final_visible)
                 if imgs is not None:
                     imgs.append(img)
             return torch.stack(imgs, dim=1) if imgs is not None else img
@@ -899,63 +1005,59 @@ class WoFSDiffMAE(BaseModel):
             for time, time_next in zip(times[:-1], times[1:]):
                 if time_next > time:
                     img = self._repaint_forward_step(img, time, time_next)
-                    img = self._apply_visible_precip(img, precip_visible, pixel_mask, time_next)
                     if imgs is not None:
                         imgs.append(img)
                     continue
                 time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
-                model_mean, _, model_log_variance, _ = self.p_mean_variance(img, time_cond, cond, precip_mask)
+                model_mean, _, model_log_variance, _ = self.p_mean_variance(
+                    img,
+                    time_cond,
+                    cond,
+                    precip_mask,
+                    precip_visible=precip_visible,
+                )
                 noise = torch.randn_like(img) if time > 0 else torch.zeros_like(img)
                 img = model_mean + (0.5 * model_log_variance).exp() * noise
-                img = self._apply_visible_precip(img, precip_visible, pixel_mask, time_next, clamp_clean=clamp_final_visible)
                 if imgs is not None:
                     imgs.append(img)
             return torch.stack(imgs, dim=1) if imgs is not None else img
 
         if sampler == "repaint_ddim":
-            times = torch.linspace(-1, self.num_timesteps - 1, steps=total_steps + 1, device=first.device)
-            times = list(reversed(times.int().tolist()))
+            times = self._ddim_timesteps(total_steps)
             repaint_n_sample = max(1, int(repaint_jump_n_sample))
-            for time, time_next in zip(times[:-1], times[1:]):
-                time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
+            for idx, time in enumerate(times):
+                time_next = times[idx + 1] if idx + 1 < len(times) else -1
                 pred_noise = None
                 x_start = None
                 for resample_idx in range(repaint_n_sample):
-                    pred_noise, x_start = self.model_predictions(img, time_cond, cond, precip_mask)
-                    if precip_visible is not None and (time_next >= 0 or clamp_final_visible):
-                        x_start = x_start * pixel_mask + precip_visible * (1.0 - pixel_mask)
-                        pred_noise = self.predict_noise_from_start(img, time_cond, x_start)
+                    img, x_start, pred_noise = self._ddim_step(
+                        img,
+                        time,
+                        time_next,
+                        cond,
+                        precip_mask,
+                        eta,
+                        precip_visible=precip_visible,
+                    )
                     if resample_idx < repaint_n_sample - 1:
-                        alpha = self.alphas_cumprod[time]
+                        alpha = self.alphas_cumprod[time].to(device=img.device, dtype=img.dtype)
                         img = alpha.sqrt() * x_start + (1.0 - alpha).sqrt() * torch.randn_like(img)
-
-                if time_next < 0:
-                    img = x_start
-                else:
-                    alpha_next = self.alphas_cumprod[time_next]
-                    img = alpha_next.sqrt() * x_start + (1.0 - alpha_next).sqrt() * pred_noise
-                img = self._apply_visible_precip(img, precip_visible, pixel_mask, time_next, clamp_clean=clamp_final_visible)
                 if imgs is not None:
                     imgs.append(img)
             return torch.stack(imgs, dim=1) if imgs is not None else img
 
-        times = torch.linspace(-1, self.num_timesteps - 1, steps=total_steps + 1, device=first.device)
-        times = list(reversed(times.int().tolist()))
-        for time, time_next in zip(times[:-1], times[1:]):
-            time_cond = torch.full((b,), time, device=first.device, dtype=torch.long)
-            pred_noise, x_start = self.model_predictions(img, time_cond, cond, precip_mask)
-            if precip_visible is not None and (time_next >= 0 or clamp_final_visible):
-                x_start = x_start * pixel_mask + precip_visible * (1.0 - pixel_mask)
-                pred_noise = self.predict_noise_from_start(img, time_cond, x_start)
-            if time_next < 0:
-                img = x_start
-            else:
-                alpha = self.alphas_cumprod[time]
-                alpha_next = self.alphas_cumprod[time_next]
-                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-                c = (1 - alpha_next - sigma**2).sqrt()
-                img = x_start * alpha_next.sqrt() + c * pred_noise + sigma * torch.randn_like(img)
-            img = self._apply_visible_precip(img, precip_visible, pixel_mask, time_next, clamp_clean=clamp_final_visible)
+        times = self._ddim_timesteps(total_steps)
+        for idx, time in enumerate(times):
+            time_next = times[idx + 1] if idx + 1 < len(times) else -1
+            img, x_start, _ = self._ddim_step(
+                img,
+                time,
+                time_next,
+                cond,
+                precip_mask,
+                eta,
+                precip_visible=precip_visible,
+            )
             if imgs is not None:
                 imgs.append(img)
         return torch.stack(imgs, dim=1) if imgs is not None else img

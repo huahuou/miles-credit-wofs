@@ -174,6 +174,7 @@ class TrainerDiffMAE(BaseTrainer):
                 losses["t"][:1],
                 self._condition_dict({k: v[:1] for k, v in batch.items()}),
                 losses["precip_mask"][:1],
+                precip_visible=batch["precip"][:1],
             )
             sample = None
             if bool(snapshot_conf.get("save_sampling_figure", False)):
@@ -241,7 +242,12 @@ class TrainerDiffMAE(BaseTrainer):
             precip_mask = self._sample_mask(batch["precip"].shape[0], trainer_conf, batch["precip"].device)
 
             with autocast(enabled=amp):
-                losses = model.p_losses(batch["precip"], self._condition_dict(batch), precip_mask)
+                losses = model.p_losses(
+                    batch["precip"],
+                    self._condition_dict(batch),
+                    precip_mask,
+                    precip_visible=batch["precip"],
+                )
                 loss = losses["loss"]
 
             scaler.scale(loss / grad_accum_every).backward()
@@ -304,7 +310,12 @@ class TrainerDiffMAE(BaseTrainer):
                 model = self._unwrap_model()
                 precip_mask = self._sample_mask(batch["precip"].shape[0], trainer_conf, batch["precip"].device, validation=True)
                 with autocast(enabled=amp):
-                    losses = model.p_losses(batch["precip"], self._condition_dict(batch), precip_mask)
+                    losses = model.p_losses(
+                        batch["precip"],
+                        self._condition_dict(batch),
+                        precip_mask,
+                        precip_visible=batch["precip"],
+                    )
                     loss = losses["loss"]
                 loss_t = torch.tensor([loss.item()], device=self.device)
                 if distributed:

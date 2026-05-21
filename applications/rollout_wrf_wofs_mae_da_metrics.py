@@ -501,13 +501,16 @@ def rollout_one_timestep_with_metrics(
 
     core = _unwrap_model(model)
     target = batch["precip"]
-    precip_visible = target if bool(_eval_conf(conf).get("clamp_visible_precip", True)) else None
+    use_visible_precip = bool(
+        _eval_conf(conf).get("visible_precip_conditioning", _eval_conf(conf).get("clamp_visible_precip", True))
+    )
+    precip_visible = target if use_visible_precip else None
     sampler = str(_eval_conf(conf).get("sampler", "ddim")).strip().lower()
     sampling_timesteps = int(_eval_conf(conf).get("sampling_timesteps", getattr(core, "sampling_timesteps", 50)))
     eta = _eval_conf(conf).get("ddim_sampling_eta", None)
     repaint_jump_length = int(_eval_conf(conf).get("repaint_jump_length", 10))
     repaint_jump_n_sample = int(_eval_conf(conf).get("repaint_jump_n_sample", 10))
-    clamp_final_visible = bool(_eval_conf(conf).get("clamp_final_visible_precip", True))
+    clamp_final_visible = bool(_eval_conf(conf).get("clamp_final_visible_precip", False))
     save_trajectory = bool(_eval_conf(conf).get("save_denoise_trajectory", False))
     _, ensemble_size, _, _ = _resolve_eval_ensemble_size(conf)
     eval_batch_size = _resolve_eval_batch_size(conf, ensemble_size)

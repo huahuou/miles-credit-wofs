@@ -332,7 +332,8 @@ def rollout_one_timestep(
     core = _unwrap_model(model)
     target = batch["precip"]
     precip_mask = _sample_mask(model, eval_conf, target.shape[0], device)
-    precip_visible = target if bool(eval_conf.get("clamp_visible_precip", True)) else None
+    use_visible_precip = bool(eval_conf.get("visible_precip_conditioning", eval_conf.get("clamp_visible_precip", True)))
+    precip_visible = target if use_visible_precip else None
     sampler = str(eval_conf.get("sampler", "ddim")).strip().lower()
     sampling_timesteps = int(eval_conf.get("sampling_timesteps", getattr(core, "sampling_timesteps", 50)))
     eta = eval_conf.get("ddim_sampling_eta", None)
