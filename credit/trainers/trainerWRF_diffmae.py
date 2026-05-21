@@ -149,8 +149,12 @@ class TrainerDiffMAE(BaseTrainer):
 
         if sample is not None:
             sample_1 = sample[0]
-            self._plot_field(axes[0, 5], sample_1.mean(dim=0), "sample mean")
-            self._plot_field(axes[1, 5], sample_1[ch], f"sample ch{ch}")
+            sample_mask = mask_img_full[0]
+            if sample_mask.shape[0] == 1:
+                sample_mask = sample_mask.expand_as(sample_1)
+            composite_sample = sample_1 * sample_mask + target_1 * (1.0 - sample_mask)
+            self._plot_field(axes[0, 5], composite_sample.mean(dim=0), "composite sample mean")
+            self._plot_field(axes[1, 5], composite_sample[ch], f"composite sample ch{ch}")
 
         fig.savefig(out_path, dpi=140)
         plt.close(fig)

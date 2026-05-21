@@ -4,8 +4,8 @@
 # variable group still contributes one token per x/y patch, so target attention
 # does not multiply by the number of vertical levels. The 4-D mask
 # (batch, group, level, patch) is used for loss weighting and visible-precip
-# clamping. A grouped token is marked as masked when any level in that group
-# and patch is masked.
+# conditioning. A grouped token is marked as masked when any level in that
+# group and patch is masked.
 #
 # Important options:
 # - model.grouped_decoder_scope: per_group decodes each precip group separately.
@@ -23,12 +23,12 @@
 #   per-level precip masks. mixed_height randomly selects spatial_patch,
 #   channel_patch, or height_patch using the mixed_height_*_probability values.
 # - height_visible_levels: zero-based vertical levels that should stay visible
-#   and be reinserted from precip_visible during sampling.
+#   and be provided as clean visible-precip conditioning.
 # - height_mask_levels: optional zero-based levels eligible for masking. Leave
 #   unset to allow all levels except height_visible_levels.
 # - precip_mask_ratio: fraction sampled from eligible group-level-patch elements.
 
-save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev2
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev3
 seed: 1002
 data:
   save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip

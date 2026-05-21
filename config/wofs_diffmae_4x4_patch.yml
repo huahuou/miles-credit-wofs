@@ -238,7 +238,10 @@ eval:
   precip_mask_ratio: 0.75
   # precip_mask_mode options: spatial_patch, channel_patch. spatial_patch shares x/y mask; channel_patch masks variable groups independently.
   precip_mask_mode: spatial_patch
-  # clamp_visible_precip: when true, visible precip is re-noised to each diffusion timestep and reinserted during sampling.
+  # visible_precip_conditioning: when true, clean visible precip is encoded once as conditioning.
+  # The visible precip is not mixed into the diffusion state; only masked precip is sampled.
+  visible_precip_conditioning: true
+  # Backward-compatible alias for visible_precip_conditioning.
   clamp_visible_precip: true
   # save_norm_output: also write normalized model-space output in the zarr group "norm_output".
   save_norm_output: true
