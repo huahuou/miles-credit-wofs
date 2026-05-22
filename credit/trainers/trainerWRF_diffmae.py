@@ -72,13 +72,13 @@ class TrainerDiffMAE(BaseTrainer):
         mode_key = "val_mask_mode" if validation else "precip_mask_mode"
         mode = str(trainer_conf.get(mode_key, trainer_conf.get("precip_mask_mode", "spatial_patch"))).strip().lower()
 
-        if mode in {"mixed", "spatial_or_channel"} and not validation:
+        if mode == "mixed" and not validation:
             channel_prob = float(trainer_conf.get("channel_patch_mask_probability", 0.5))
             mode = "channel_patch" if torch.rand((), device=device).item() < channel_prob else "spatial_patch"
-        elif mode in {"mixed_height", "mixed_with_height", "spatial_channel_height"}:
+        elif mode == "mixed_height":
             mode = _choose_mixed_height_mode(trainer_conf, device)
 
-        if mode in {"height_patch", "height", "level_patch", "vertical_patch"}:
+        if mode == "height_patch":
             return model.random_height_precip_mask(
                 batch_size,
                 ratio,
@@ -86,9 +86,9 @@ class TrainerDiffMAE(BaseTrainer):
                 masked_levels=trainer_conf.get("height_mask_levels"),
                 visible_levels=trainer_conf.get("height_visible_levels"),
             )
-        if mode in {"channel_patch", "random_channel", "channel"}:
+        if mode == "channel_patch":
             return model.random_channel_precip_mask(batch_size, ratio, device)
-        if mode in {"spatial_patch", "spatial", "patch"}:
+        if mode == "spatial_patch":
             return model.random_precip_mask(batch_size, ratio, device)
         raise ValueError(f"Unsupported precip mask mode: {mode!r}")
 

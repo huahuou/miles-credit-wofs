@@ -217,18 +217,14 @@ eval:
   # precip_mask_ratio: fraction of eligible precip patch elements to inpaint.
   precip_mask_ratio: 0.75
   # precip_mask_mode options: spatial_patch, channel_patch, height_patch, mixed, mixed_height.
-  # height_patch masks level-patch elements. The model does not use variable-level masks in this setup.
+  # height_patch masks level-patch elements only.
   precip_mask_mode: height_patch
   height_visible_levels: [14,15,16]
-  # visible_precip_conditioning: when true, eval passes clean visible precip as
-  # context tokens. The model internally zeros masked precip before tokenizing,
-  # so masked truth is not exposed.
+  # visible_precip_conditioning: pass clean visible precip as context tokens.
   visible_precip_conditioning: true
-  # clamp_visible_precip is kept as a backward-compatible alias for
-  # visible_precip_conditioning.
+  # clamp_visible_precip is retained for older rollout code paths.
   clamp_visible_precip: true
-  # Strict DiffMAE sampling does not paste visible pixels into the sample state.
-  # This flag is accepted by older call sites but ignored by WoFSDiffMAE.
+  # DiffMAE sampling keeps the Markov state on the masked region only.
   clamp_final_visible_precip: false
   # visible_blend_*: optional normalized-space smoothing after sampling.
   visible_blend_width_px: 0

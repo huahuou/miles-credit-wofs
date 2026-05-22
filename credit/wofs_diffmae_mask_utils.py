@@ -6,11 +6,11 @@ from typing import Any
 import numpy as np
 
 
-SPATIAL_MASK_MODES = {"spatial_patch", "spatial", "patch"}
-CHANNEL_MASK_MODES = {"channel_patch", "random_channel", "channel", "group_patch", "variable_patch", "grouped"}
-HEIGHT_MASK_MODES = {"height_patch", "height", "level_patch", "vertical_patch"}
-MIXED_MASK_MODES = {"mixed", "spatial_or_channel"}
-MIXED_HEIGHT_MASK_MODES = {"mixed_height", "mixed_with_height", "spatial_channel_height"}
+SPATIAL_MASK_MODES = {"spatial_patch"}
+CHANNEL_MASK_MODES = {"channel_patch"}
+HEIGHT_MASK_MODES = {"height_patch"}
+MIXED_MASK_MODES = {"mixed"}
+MIXED_HEIGHT_MASK_MODES = {"mixed_height"}
 
 
 def normalize_mask_mode(mask_mode: str) -> str:
@@ -31,24 +31,25 @@ def normalize_mask_mode(mask_mode: str) -> str:
 def resolve_precip_group_layout(conf: dict) -> tuple[list[str], list[int]]:
     model_conf = conf["model"]
     data_conf = conf["data"]
-    grouped = str(model_conf.get("precip_grouping", "")).strip().lower() == "grouped"
-    if grouped:
-        group_names = list(model_conf.get("precip_group_names") or data_conf.get("precip_vars", []))
-        group_channels = model_conf.get("precip_group_channels")
-        if not group_channels:
-            total_channels = int(model_conf["modality_channels"]["precip"])
-            if total_channels % len(group_names) != 0:
-                raise ValueError(
-                    "Could not infer precip_group_channels because precip channels do not divide evenly "
-                    "across precip_group_names."
-                )
-            group_channels = [total_channels // len(group_names)] * len(group_names)
-        if len(group_names) != len(group_channels):
-            raise ValueError("precip_group_names and precip_group_channels must have the same length")
-        return group_names, [int(v) for v in group_channels]
+    grouping = str(model_conf.get("precip_grouping", "")).strip().lower()
+    if grouping != "level":
+        raise ValueError(f"Unsupported precip_grouping {grouping!r}; only 'level' is supported.")
 
-    total_channels = int(model_conf["modality_channels"]["precip"])
-    return [f"channel_{idx}" for idx in range(total_channels)], [1] * total_channels
+    group_names = list(model_conf.get("precip_group_names") or data_conf.get("precip_vars", []))
+    if not group_names:
+        raise ValueError("precip_group_names or data.precip_vars must be provided for level tokenization")
+    group_channels = model_conf.get("precip_group_channels")
+    if not group_channels:
+        total_channels = int(model_conf["modality_channels"]["precip"])
+        if total_channels % len(group_names) != 0:
+            raise ValueError(
+                "Could not infer precip_group_channels because precip channels do not divide evenly "
+                "across precip_group_names."
+            )
+        group_channels = [total_channels // len(group_names)] * len(group_names)
+    if len(group_names) != len(group_channels):
+        raise ValueError("precip_group_names and precip_group_channels must have the same length")
+    return group_names, [int(v) for v in group_channels]
 
 
 def token_grid_shape(conf: dict) -> tuple[int, int]:
