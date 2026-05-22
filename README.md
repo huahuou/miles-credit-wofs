@@ -19,6 +19,8 @@ to be under active development. Please contact [the MILES group](mailto:milescor
 MILES CREDIT also provides more detailed [documentation](https://miles-credit.readthedocs.io/en/latest/) with installation
 instructions, how to get started training and deploying models, how to interpret the config files, and full API docs. 
 
+For a config-specific DiffMAE walkthrough, see [docs/wofs_diffmae_architecture.md](docs/wofs_diffmae_architecture.md).
+
 ## Citing CREDIT
 If you are interested in using CREDIT as part of your research, please cite the following paper:
 Schreck, J.S., Sha, Y., Chapman, W. et al. Community Research Earth Digital Intelligence Twin: a scalable framework 

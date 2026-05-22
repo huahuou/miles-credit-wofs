@@ -129,8 +129,8 @@ trainer:
   mode: ddp
   ddp_find_unused_parameters: false
   use_file_locality_sampler: true
-  train_batch_size: 6
-  valid_batch_size: 6
+  train_batch_size: 8
+  valid_batch_size: 8
   epochs: 500
   start_epoch: 0
   stopping_patience: 100
@@ -139,13 +139,13 @@ trainer:
   reload_epoch: true
   train_one_epoch: false
   stop_after_epoch: false
-  thread_workers: 1
-  valid_thread_workers: 1
+  thread_workers: 4
+  valid_thread_workers: 4
   prefetch_factor: 1
   pin_memory: true
   persistent_workers: true
   dataloader_timeout_s: 180
-  no_hang_debug: true
+  no_hang_debug: false
   no_hang_thread_workers: 1
   no_hang_valid_thread_workers: 1
   no_hang_prefetch_factor: 1
@@ -164,15 +164,16 @@ trainer:
   val_mask_ratio: 0.7
   val_mask_mode: cube_patch
   denoise_snapshot:
-    enabled: false
+    enabled: true
     every_steps: 3000
     every_epoch: true
+    first_step: 1
     dir: denoise_snapshots
-    save_snapshot: false
+    save_snapshot: true
     save_figure: true
     save_sampling_figure: true
     sampling_use_visible_precip: true
-    sampling_timesteps: 200
+    sampling_timesteps: 100
     channel: 3
   load_weights: false
   load_optimizer: false
@@ -182,7 +183,7 @@ trainer:
   save_best_weights: true
   training_metric: valid_loss
   training_metric_direction: min
-  skip_validation: true
+  skip_validation: false
   save_metric_vars: [precip]
   use_scheduler: true
   scheduler:

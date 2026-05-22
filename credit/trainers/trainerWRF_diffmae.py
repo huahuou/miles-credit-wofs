@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Optional
@@ -105,13 +106,19 @@ class TrainerDiffMAE(BaseTrainer):
         sample: Optional[torch.Tensor] = None,
         channel: int = 0,
     ) -> None:
+        logger.info("Denoise snapshot figure start: path=%s target=%s mask=%s sample=%s",
+                    out_path, tuple(target.shape), tuple(precip_mask.shape), None if sample is None else tuple(sample.shape))
+        t0 = time.perf_counter()
         model = self._unwrap_model()
         mask_img_full = model.expand_patch_mask(precip_mask[:1], target.shape[-2], target.shape[-1])
         mask_img = mask_img_full.amax(dim=1, keepdim=True)
+        precip_mask_img = mask_img_full.repeat_interleave(model.level_variable_count, dim=1)
+        logger.info("Denoise snapshot masks expanded: level_mask=%s precip_mask=%s elapsed=%.3fs",
+                    tuple(mask_img_full.shape), tuple(precip_mask_img.shape), time.perf_counter() - t0)
         target_1 = target[0]
         noisy_1 = noisy[0]
         pred_1 = pred_x0[0]
-        masked_abs_err = (pred_1 - target_1).abs() * mask_img_full[0]
+        masked_abs_err = (pred_1 - target_1).abs() * precip_mask_img[0]
 
         summary_target = target_1.mean(dim=0)
         summary_noisy = noisy_1.mean(dim=0)
@@ -119,6 +126,7 @@ class TrainerDiffMAE(BaseTrainer):
         summary_err = masked_abs_err.mean(dim=0)
 
         ncols = 6 if sample is not None else 5
+        t_fig = time.perf_counter()
         fig, axes = plt.subplots(2, ncols, figsize=(3.2 * ncols, 6.0), constrained_layout=True)
 
         self._plot_field(axes[0, 0], summary_target, "target mean")
@@ -131,21 +139,23 @@ class TrainerDiffMAE(BaseTrainer):
         self._plot_field(axes[1, 0], target_1[ch], f"target ch{ch}")
         self._plot_field(axes[1, 1], noisy_1[ch], f"noisy ch{ch}")
         self._plot_field(axes[1, 2], pred_1[ch], f"pred x0 ch{ch}")
-        ch_mask = mask_img_full[0, ch if mask_img_full.shape[1] > 1 else 0]
+        ch_mask = precip_mask_img[0, ch]
         self._plot_field(axes[1, 3], (pred_1[ch] - target_1[ch]).abs() * ch_mask, f"masked err ch{ch}", cmap="magma")
         self._plot_field(axes[1, 4], ch_mask, f"mask ch{ch}", cmap="gray")
 
         if sample is not None:
             sample_1 = sample[0]
-            sample_mask = mask_img_full[0]
-            if sample_mask.shape[0] == 1:
-                sample_mask = sample_mask.expand_as(sample_1)
+            sample_mask = mask_img[0].expand_as(sample_1)
             composite_sample = sample_1 * sample_mask + target_1 * (1.0 - sample_mask)
             self._plot_field(axes[0, 5], composite_sample.mean(dim=0), "composite sample mean")
             self._plot_field(axes[1, 5], composite_sample[ch], f"composite sample ch{ch}")
 
+        logger.info("Denoise snapshot figure populated: path=%s elapsed=%.3fs", out_path, time.perf_counter() - t_fig)
+        t_save = time.perf_counter()
         fig.savefig(out_path, dpi=140)
         plt.close(fig)
+        logger.info("Denoise snapshot figure saved: path=%s elapsed=%.3fs total=%.3fs",
+                    out_path, time.perf_counter() - t_save, time.perf_counter() - t0)
 
     def _maybe_save_denoise_snapshot(self, epoch: int, step: int, conf: dict, batch: dict, losses: dict) -> None:
         snapshot_conf = conf["trainer"].get("denoise_snapshot", {})
@@ -153,14 +163,30 @@ class TrainerDiffMAE(BaseTrainer):
             return
         every = int(snapshot_conf.get("every_steps", 0))
         every_epoch = bool(snapshot_conf.get("every_epoch", False))
-        should_save_step = every > 0 and step % every == 0
-        should_save_epoch = every_epoch and step == 0
+        first_step = max(0, int(snapshot_conf.get("first_step", 1)))
+        should_save_step = every > 0 and step >= first_step and step % every == 0
+        should_save_epoch = every_epoch and step == first_step
         if not (should_save_step or should_save_epoch):
             return
         out_dir = Path(conf["save_loc"]) / snapshot_conf.get("dir", "denoise_snapshots")
         out_dir.mkdir(parents=True, exist_ok=True)
         model = self._unwrap_model()
+        logger.info(
+            "Denoise snapshot start: epoch=%s step=%s out_dir=%s save_snapshot=%s save_figure=%s "
+            "save_sampling_figure=%s sampling_timesteps=%s",
+            epoch,
+            step,
+            out_dir,
+            bool(snapshot_conf.get("save_snapshot", True)),
+            bool(snapshot_conf.get("save_figure", True)),
+            bool(snapshot_conf.get("save_sampling_figure", False)),
+            int(snapshot_conf.get("sampling_timesteps", 8)),
+        )
+        t_total = time.perf_counter()
         with torch.no_grad():
+            t_pred = time.perf_counter()
+            logger.info("Denoise snapshot model_predictions start: x_t=%s t=%s mask=%s",
+                        tuple(losses["x_t"][:1].shape), tuple(losses["t"][:1].shape), tuple(losses["precip_mask"][:1].shape))
             pred_noise, pred_x0 = model.model_predictions(
                 losses["x_t"][:1],
                 losses["t"][:1],
@@ -168,17 +194,27 @@ class TrainerDiffMAE(BaseTrainer):
                 losses["precip_mask"][:1],
                 precip_visible=batch["precip"][:1],
             )
+            logger.info("Denoise snapshot model_predictions done: pred_noise=%s pred_x0=%s elapsed=%.3fs",
+                        tuple(pred_noise.shape), tuple(pred_x0.shape), time.perf_counter() - t_pred)
             sample = None
             if bool(snapshot_conf.get("save_sampling_figure", False)):
                 sampling_steps = int(snapshot_conf.get("sampling_timesteps", 8))
                 sample_visible = batch["precip"][:1] if bool(snapshot_conf.get("sampling_use_visible_precip", True)) else None
+                t_sample = time.perf_counter()
+                logger.info("Denoise snapshot sampling start: sampling_timesteps=%s visible=%s",
+                            sampling_steps, sample_visible is not None)
                 sample = model.sample_precip(
                     self._condition_dict({k: v[:1] for k, v in batch.items()}),
                     losses["precip_mask"][:1],
                     precip_visible=sample_visible,
                     sampling_timesteps=sampling_steps,
                 )
+                logger.info("Denoise snapshot sampling done: sample=%s elapsed=%.3fs",
+                            tuple(sample.shape), time.perf_counter() - t_sample)
             if bool(snapshot_conf.get("save_snapshot", True)):
+                t_save_tensor = time.perf_counter()
+                tensor_path = out_dir / f"epoch{epoch:04d}_step{step:06d}.pt"
+                logger.info("Denoise snapshot tensor save start: path=%s", tensor_path)
                 torch.save(
                     {
                         "epoch": epoch,
@@ -190,11 +226,16 @@ class TrainerDiffMAE(BaseTrainer):
                         "precip_mask": losses["precip_mask"][:1].detach().cpu(),
                         "sample": None if sample is None else sample[:1].detach().cpu(),
                     },
-                    out_dir / f"epoch{epoch:04d}_step{step:06d}.pt",
+                    tensor_path,
                 )
+                logger.info("Denoise snapshot tensor save done: path=%s elapsed=%.3fs",
+                            tensor_path, time.perf_counter() - t_save_tensor)
             if bool(snapshot_conf.get("save_figure", True)):
+                t_render = time.perf_counter()
+                figure_path = out_dir / f"epoch{epoch:04d}_step{step:06d}.png"
+                logger.info("Denoise snapshot render start: path=%s", figure_path)
                 self._save_denoise_figure(
-                    out_dir / f"epoch{epoch:04d}_step{step:06d}.png",
+                    figure_path,
                     target=batch["precip"][:1],
                     noisy=losses["x_t"][:1],
                     pred_x0=pred_x0[:1],
@@ -202,6 +243,9 @@ class TrainerDiffMAE(BaseTrainer):
                     sample=None if sample is None else sample[:1],
                     channel=int(snapshot_conf.get("channel", 0)),
                 )
+                logger.info("Denoise snapshot render done: path=%s elapsed=%.3fs",
+                            figure_path, time.perf_counter() - t_render)
+        logger.info("Denoise snapshot done: epoch=%s step=%s total=%.3fs", epoch, step, time.perf_counter() - t_total)
 
     def train_one_epoch(self, epoch, conf, trainloader, optimizer, criterion, scaler, scheduler, metrics):
         trainer_conf = conf["trainer"]
