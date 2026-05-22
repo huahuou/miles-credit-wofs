@@ -61,6 +61,45 @@ def linear_beta_schedule(timesteps: int) -> torch.Tensor:
     return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float64)
 
 
+def build_3d_sincos_posemb(levels: int, h: int, w: int, embed_dim: int = 768, temperature: float = 10000.0) -> torch.Tensor:
+    """Return fixed 3-D sin-cos embeddings shaped (1, levels * h * w, embed_dim)."""
+
+    def _axis_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
+        if dim <= 0:
+            return values.new_zeros(values.numel(), 0)
+        if dim % 2 != 0:
+            raise ValueError(f"axis positional dimension must be even, got {dim}")
+        half = dim // 2
+        omega = torch.arange(half, dtype=torch.float32) / max(half, 1)
+        omega = 1.0 / (temperature ** omega)
+        out = torch.einsum("m,d->md", values.flatten(), omega)
+        return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+
+    base = (embed_dim // 3) // 2 * 2
+    x_dim = base
+    y_dim = base
+    z_dim = embed_dim - x_dim - y_dim
+    if z_dim % 2 != 0:
+        z_dim -= 1
+        x_dim += 1
+    if x_dim % 2 != 0 or y_dim % 2 != 0 or z_dim % 2 != 0:
+        raise ValueError(f"embed_dim={embed_dim} cannot be split into even 3D sin-cos dimensions")
+
+    level_grid = torch.arange(levels, dtype=torch.float32)
+    y_grid = torch.arange(h, dtype=torch.float32)
+    x_grid = torch.arange(w, dtype=torch.float32)
+    level_grid, y_grid, x_grid = torch.meshgrid(level_grid, y_grid, x_grid, indexing="ij")
+    pos = torch.cat(
+        [
+            _axis_embedding(x_grid, x_dim),
+            _axis_embedding(y_grid, y_dim),
+            _axis_embedding(level_grid, z_dim),
+        ],
+        dim=1,
+    )
+    return pos[None, :, :]
+
+
 class CrossSelfDecoderBlock(nn.Module):
     """DiffMAE decoder block: target tokens cross-attend context, then self-attend."""
 
@@ -255,6 +294,7 @@ class WoFSDiffMAE(BaseModel):
         self.target_modality = target_modality
         self.precip_grouping = str(precip_grouping).strip().lower()
         self.grouped_precip = self.precip_grouping in {"grouped", "by_variable", "factorized"}
+        self.level_precip = self.precip_grouping == "level"
         self.decoder_type = str(decoder_type).strip().lower()
         if self.decoder_type not in {"concat_self", "cross_self"}:
             raise ValueError(f"Unsupported decoder_type: {decoder_type}")
@@ -305,6 +345,7 @@ class WoFSDiffMAE(BaseModel):
                 groups=int(refiner_conf.get("groups", 1)),
             )
 
+        self.level_count = 0
         sf_h = math.ceil(self.image_size[0] / self.surface_forcing_stride) * self.surface_forcing_stride
         sf_w = math.ceil(self.image_size[1] / self.surface_forcing_stride) * self.surface_forcing_stride
         sf_image_size = (sf_h, sf_w)
@@ -365,7 +406,14 @@ class WoFSDiffMAE(BaseModel):
         self.precip_group_adapters = nn.ModuleDict()
         self.precip_group_out_proj = nn.ModuleDict()
         self.precip_group_embeds = nn.ParameterDict()
-        if self.grouped_precip:
+        self.level_token_adapter = None
+        self.level_token_out_proj = None
+        self.level_token_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.level_variable_count = 0
+        trunc_normal_(self.level_token_emb, std=0.02)
+        if self.level_precip:
+            self._init_level_precip_tokenization()
+        elif self.grouped_precip:
             self._init_grouped_precip_tokenization()
         else:
             self.legacy_precip_adapter = WoFSInputAdapter(
@@ -379,6 +427,13 @@ class WoFSDiffMAE(BaseModel):
         n_h, n_w = self.target_grid_size
         pos_emb = build_2d_sincos_posemb(n_h, n_w, self.embed_dim)
         self.register_buffer("target_pos_emb", pos_emb)
+        if self.level_precip:
+            level_pos_emb = build_3d_sincos_posemb(self.level_count, n_h, n_w, self.embed_dim)
+            self.register_buffer("target_level_pos_emb", level_pos_emb)
+            self.register_buffer("visible_level_pos_emb", level_pos_emb.clone())
+        else:
+            self.register_buffer("target_level_pos_emb", torch.empty(0))
+            self.register_buffer("visible_level_pos_emb", torch.empty(0))
         self.target_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.visible_precip_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         trunc_normal_(self.target_modality_emb, std=0.02)
@@ -463,6 +518,108 @@ class WoFSDiffMAE(BaseModel):
             self.precip_group_embeds[name] = emb
             start = stop
 
+    def _init_level_precip_tokenization(self) -> None:
+        if not self.precip_group_names:
+            raise ValueError("precip_group_names must be provided when precip_grouping is level")
+        if not self.precip_group_channels:
+            if self.channels % len(self.precip_group_names) != 0:
+                raise ValueError(
+                    "precip_group_channels must be provided unless precip channels divide evenly "
+                    "across precip_group_names"
+                )
+            group_size = self.channels // len(self.precip_group_names)
+            self.precip_group_channels = [group_size] * len(self.precip_group_names)
+        if len(self.precip_group_names) != len(self.precip_group_channels):
+            raise ValueError("precip_group_names and precip_group_channels must have the same length")
+        if sum(self.precip_group_channels) != self.channels:
+            raise ValueError(
+                f"Level precip channels sum to {sum(self.precip_group_channels)} but target has {self.channels}"
+            )
+        if len(set(self.precip_group_channels)) != 1:
+            raise ValueError("Level precip grouping requires all variable groups to have the same number of levels")
+
+        self.level_count = int(self.precip_group_channels[0])
+        self.level_variable_count = len(self.precip_group_names)
+        if self.level_count <= 0:
+            raise ValueError("Level precip grouping requires a positive level count")
+        start = 0
+        for n_ch in self.precip_group_channels:
+            stop = start + int(n_ch)
+            self.precip_group_slices.append((start, stop))
+            start = stop
+        self.level_token_adapter = WoFSInputAdapter(
+            num_channels=self.level_variable_count,
+            patch_size=self.patch_size,
+            embed_dim=self.embed_dim,
+            image_size=self.image_size,
+            use_pos_emb=False,
+            use_modality_emb=False,
+        )
+        self.level_token_out_proj = nn.Linear(self.embed_dim, self.level_variable_count * self.patch_size * self.patch_size)
+
+    def _level_group_index_for_channel(self, channel_idx: int) -> int:
+        if not self.level_precip:
+            raise ValueError("Level grouping is not enabled")
+        for group_idx, (start, stop) in enumerate(self.precip_group_slices):
+            if start <= channel_idx < stop:
+                return group_idx
+        raise IndexError(f"channel index {channel_idx} outside level slices")
+
+    def _level_tokens(
+        self,
+        x: torch.Tensor,
+        precip_mask: torch.Tensor,
+        use_visible: bool = False,
+    ) -> torch.Tensor:
+        if not self.level_precip or self.level_token_adapter is None:
+            raise ValueError("Level precip tokenization is not enabled")
+        b, _, _, _ = x.shape
+        level_inputs = []
+        for level_idx in range(self.level_count):
+            level_inputs.append(torch.cat([x[:, start + level_idx : start + level_idx + 1] for start, _ in self.precip_group_slices], dim=1))
+        level_x = torch.cat(level_inputs, dim=0)
+        level_tokens = self.level_token_adapter(level_x)
+        level_tokens = rearrange(level_tokens, "(b l) hw d -> b l hw d", b=b, l=self.level_count)
+        pos = self.visible_level_pos_emb if use_visible else self.target_level_pos_emb
+        pos = pos.to(device=x.device, dtype=x.dtype)
+        pos = rearrange(pos, "b (l hw) d -> b l hw d", l=self.level_count)
+        level_tokens = level_tokens + pos + self.level_token_emb
+
+        if not use_visible:
+            token_mask = self.token_mask_from_precip_mask(precip_mask)
+            if token_mask.dim() == 2:
+                token_mask = token_mask[:, None, :]
+            elif token_mask.dim() != 3:
+                raise ValueError(f"Unsupported token_mask shape {tuple(token_mask.shape)} for level tokenization")
+            token_mask = token_mask[:, :, :, None].to(level_tokens.dtype)
+            level_tokens = level_tokens + self.mask_token * token_mask
+        return level_tokens
+
+    def _level_forward_with_condition_tokens(
+        self,
+        noisy_precip: torch.Tensor,
+        t: torch.Tensor,
+        cond_tokens: list[torch.Tensor],
+        precip_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        b, _, orig_h, orig_w = noisy_precip.shape
+        target_tokens = self._level_tokens(noisy_precip, precip_mask, use_visible=False)
+        n_h = self.image_size[0] // self.patch_size
+        n_w = self.image_size[1] // self.patch_size
+        target_tokens = rearrange(target_tokens, "b l hw d -> (b l) hw d")
+        cond_tokens_expanded = [tokens.repeat_interleave(self.level_count, dim=0) for tokens in cond_tokens]
+        t_expanded = t.repeat_interleave(self.level_count)
+        tokens = self._decode_target_tokens(target_tokens, cond_tokens_expanded, t_expanded)
+        patches = self.level_token_out_proj(tokens)
+        patches = patches.reshape(b, self.level_count, n_h, n_w, self.level_variable_count, self.patch_size, self.patch_size)
+        x = patches.permute(0, 4, 1, 2, 5, 3, 6).reshape(
+            b,
+            self.level_variable_count * self.level_count,
+            n_h * self.patch_size,
+            n_w * self.patch_size,
+        )
+        return self.anti_patch_refiner(x[:, :, :orig_h, :orig_w])
+
     @property
     def device(self) -> torch.device:
         return self.betas.device
@@ -476,6 +633,27 @@ class WoFSDiffMAE(BaseModel):
     def expand_patch_mask(self, patch_mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
         n_h = self.image_size[0] // self.patch_size
         n_w = self.image_size[1] // self.patch_size
+        if self.level_precip:
+            if patch_mask.dim() == 4:
+                if patch_mask.shape[1] != self.level_variable_count or patch_mask.shape[2] != self.level_count:
+                    raise ValueError(
+                        "Level precip 4-D masks must have shape "
+                        f"(B, {self.level_variable_count}, {self.level_count}, tokens), got {tuple(patch_mask.shape)}"
+                    )
+                mask = patch_mask.amax(dim=1)
+            elif patch_mask.dim() == 3:
+                if patch_mask.shape[1] == self.level_count:
+                    mask = patch_mask
+                elif patch_mask.shape[1] == self.level_variable_count * self.level_count:
+                    mask = patch_mask.reshape(patch_mask.shape[0], self.level_variable_count, self.level_count, -1).amax(dim=1)
+                else:
+                    raise ValueError(f"Unsupported level precip mask shape {tuple(patch_mask.shape)}")
+            else:
+                raise ValueError(f"Unsupported level precip mask shape {tuple(patch_mask.shape)}")
+            mask = mask.reshape(mask.shape[0], self.level_count, n_h, n_w)
+            mask = mask.repeat_interleave(self.level_variable_count, dim=1)
+            mask = mask.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
+            return mask[:, :, :height, :width]
         if patch_mask.dim() == 4:
             if not self.grouped_precip:
                 raise ValueError("4-D height masks require grouped precip tokenization")
@@ -510,6 +688,8 @@ class WoFSDiffMAE(BaseModel):
         return mask[:, :, :height, :width]
 
     def precip_group_index_for_channel(self, channel_idx: int) -> int:
+        if self.level_precip:
+            return self._level_group_index_for_channel(channel_idx)
         if not self.grouped_precip:
             return 0
         for group_idx, (start, stop) in enumerate(self.precip_group_slices):
@@ -532,6 +712,8 @@ class WoFSDiffMAE(BaseModel):
         return (ranks < n_mask[:, None]).float()
 
     def random_channel_precip_mask(self, batch_size: int, mask_ratio: float | tuple[float, float], device: torch.device) -> torch.Tensor:
+        if self.level_precip:
+            raise ValueError("channel masks are not supported when precip_grouping='level'")
         if self.grouped_precip:
             return self.random_group_precip_mask(batch_size, mask_ratio, device)
         n_tokens = (self.image_size[0] // self.patch_size) * (self.image_size[1] // self.patch_size)
@@ -572,6 +754,36 @@ class WoFSDiffMAE(BaseModel):
         visible_levels: Optional[list[int]] = None,
     ) -> torch.Tensor:
         n_tokens = (self.image_size[0] // self.patch_size) * (self.image_size[1] // self.patch_size)
+        if self.level_precip:
+            n_levels = self.level_count
+            if isinstance(mask_ratio, (list, tuple)):
+                lo, hi = float(mask_ratio[0]), float(mask_ratio[1])
+                ratios = torch.empty(batch_size, device=device).uniform_(lo, hi)
+            else:
+                ratios = torch.full((batch_size,), float(mask_ratio), device=device)
+            ratios = ratios.clamp(0.0, 1.0)
+            eligible = torch.ones(n_levels, device=device, dtype=torch.bool)
+            if masked_levels is not None:
+                eligible = torch.zeros(n_levels, device=device, dtype=torch.bool)
+                for level in masked_levels:
+                    if 0 <= int(level) < n_levels:
+                        eligible[int(level)] = True
+            if visible_levels is not None:
+                for level in visible_levels:
+                    if 0 <= int(level) < n_levels:
+                        eligible[int(level)] = False
+            n_eligible = int(eligible.sum().item())
+            mask = torch.zeros(batch_size, n_levels, n_tokens, device=device)
+            if n_eligible == 0:
+                return mask
+            n_elements = n_eligible * n_tokens
+            noise = torch.rand(batch_size, n_elements, device=device)
+            ids = torch.argsort(noise, dim=1)
+            ranks = torch.argsort(ids, dim=1)
+            n_mask = torch.round(ratios * n_elements).long().clamp(0, n_elements)
+            sampled = (ranks < n_mask[:, None]).float().reshape(batch_size, n_eligible, n_tokens)
+            mask[:, eligible, :] = sampled
+            return mask
         if not self.grouped_precip:
             return self.random_channel_precip_mask(batch_size, mask_ratio, device)
         group_channels = [stop - start for start, stop in self.precip_group_slices]
@@ -611,6 +823,12 @@ class WoFSDiffMAE(BaseModel):
         return mask
 
     def token_mask_from_precip_mask(self, precip_mask: torch.Tensor) -> torch.Tensor:
+        if self.level_precip:
+            if precip_mask.dim() == 4:
+                return precip_mask.amax(dim=1)
+            if precip_mask.dim() == 3:
+                return precip_mask
+            return precip_mask[:, None, :]
         if precip_mask.dim() == 4:
             return precip_mask.amax(dim=(1, 2))
         if precip_mask.dim() == 3:
@@ -702,9 +920,13 @@ class WoFSDiffMAE(BaseModel):
             if precip_mask is None:
                 raise ValueError("precip_mask is required when precip_visible is used for conditioning")
             visible_img = self._visible_precip_condition_image(precip_visible, precip_mask)
-            visible_tokens = self.visible_precip_adapter(visible_img)
-            pos = rearrange(self.target_pos_emb.to(visible_img.dtype), "b d h w -> b (h w) d")
-            cond_tokens.append(visible_tokens + pos + self.visible_precip_modality_emb)
+            if self.level_precip:
+                visible_tokens = rearrange(self._level_tokens(visible_img, precip_mask, use_visible=True), "b l hw d -> b (l hw) d")
+            else:
+                visible_tokens = self.visible_precip_adapter(visible_img)
+                pos = rearrange(self.target_pos_emb.to(visible_img.dtype), "b d h w -> b (h w) d")
+                visible_tokens = visible_tokens + pos
+            cond_tokens.append(visible_tokens + self.visible_precip_modality_emb)
         return cond_tokens
 
     def _encode_condition_tokens(self, cond_tokens: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -1045,6 +1267,8 @@ class WoFSDiffMAE(BaseModel):
         precip_mask: torch.Tensor,
         precip_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.level_precip:
+            return self._level_forward(noisy_precip, t, cond, precip_mask, precip_visible=precip_visible)
         if self.grouped_precip:
             return self._grouped_forward(noisy_precip, t, cond, precip_mask, precip_visible=precip_visible)
         return self._legacy_forward(noisy_precip, t, cond, precip_mask, precip_visible=precip_visible)
@@ -1056,6 +1280,8 @@ class WoFSDiffMAE(BaseModel):
         cond_tokens: list[torch.Tensor],
         precip_mask: torch.Tensor,
     ) -> torch.Tensor:
+        if self.level_precip:
+            return self._level_forward_with_condition_tokens(noisy_precip, t, cond_tokens, precip_mask)
         if self.grouped_precip:
             return self._grouped_forward_with_condition_tokens(noisy_precip, t, cond_tokens, precip_mask)
         return self._legacy_forward_with_condition_tokens(noisy_precip, t, cond_tokens, precip_mask)

@@ -184,12 +184,16 @@ class WoFSInputAdapter(nn.Module):
         patch_size: int = 8,
         embed_dim: int = 768,
         image_size: Tuple[int, int] = (304, 304),
+        use_pos_emb: bool = True,
+        use_modality_emb: bool = True,
     ):
         super().__init__()
         self.num_channels = num_channels
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.image_size = image_size  # (H_pad, W_pad)
+        self.use_pos_emb = bool(use_pos_emb)
+        self.use_modality_emb = bool(use_modality_emb)
 
         N_H = image_size[0] // patch_size
         N_W = image_size[1] // patch_size
@@ -202,12 +206,13 @@ class WoFSInputAdapter(nn.Module):
         )
 
         # Fixed 2D sin-cos positional embedding (1, embed_dim, N_H, N_W)
-        pos_emb = build_2d_sincos_posemb(N_H, N_W, embed_dim)
+        pos_emb = build_2d_sincos_posemb(N_H, N_W, embed_dim) if self.use_pos_emb else torch.empty(0)
         self.register_buffer("pos_emb", pos_emb)
 
         # Learnable modality embedding (broadcast over all tokens)
         self.modality_emb = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        trunc_normal_(self.modality_emb, std=0.02)
+        if self.use_modality_emb:
+            trunc_normal_(self.modality_emb, std=0.02)
 
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -244,19 +249,21 @@ class WoFSInputAdapter(nn.Module):
         tokens = self.proj(x)
 
         # Add positional embedding
-        pos = F.interpolate(
-            self.pos_emb,
-            size=tokens.shape[-2:],
-            mode="bicubic",
-            align_corners=False,
-        ).to(x.dtype)
-        tokens = tokens + pos
+        if self.use_pos_emb:
+            pos = F.interpolate(
+                self.pos_emb,
+                size=tokens.shape[-2:],
+                mode="bicubic",
+                align_corners=False,
+            ).to(x.dtype)
+            tokens = tokens + pos
 
         # Reshape to sequence
         tokens = rearrange(tokens, "b d nh nw -> b (nh nw) d")
 
         # Add modality embedding and normalize
-        tokens = tokens + self.modality_emb
+        if self.use_modality_emb:
+            tokens = tokens + self.modality_emb
         tokens = self.norm(tokens)
         return tokens
 

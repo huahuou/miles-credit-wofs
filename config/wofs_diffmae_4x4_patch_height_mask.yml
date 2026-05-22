@@ -1,14 +1,14 @@
-# WoFS DiffMAE 4x4 patch configuration with height-aware precip masking.
+# WoFS DiffMAE 4x4 patch configuration with level-aware precip masking.
 #
 # DiffMAE alignment:
 # - Only masked precip pixels are diffused.
 # - Clean visible precip is encoded as conditioning, not pasted into the sampled state.
 # - The context encoder is evaluated once during sampling and reused for all reverse steps.
 # - cross_self decoder blocks cross-attend encoder latents in reverse U-shaped order.
+# - Target precip tokens are organized as (level, lat/lon patch), not variable groups.
 #
 # Lightweight choices:
 # - condition_encoder_depth is 4; decoder depth is independent.
-# - grouped_decoder_scope=per_group avoids joint attention over all precip groups.
 # - target_attention_window_size limits target self-attention to local 15x15 patch windows.
 
 save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev4
@@ -93,15 +93,13 @@ model:
     reflectivity: 17
     surface: 0
     forcing: 12
-  precip_grouping: grouped
+  precip_grouping: level
   precip_group_names: [QRAIN, QNRAIN, QHAIL, QNHAIL, QGRAUP, QNGRAUPEL, QSNOW, QNSNOW]
   precip_group_channels: [17, 17, 17, 17, 17, 17, 17, 17]
   conditioned_modalities: [background, forcing, reflectivity]
   target_modality: precip
   decoder_type: cross_self
-  grouped_decoder_scope: per_group
   # Encoder depth for visible/context tokens only. This does not set decoder depth.
-  # If encoder and decoder depths differ, decoder layers use reverse proportional encoder skips.
   condition_encoder_depth: 4
   condition_encoder_mlp_ratio: 4.0
   target_attention_window_size: 15
@@ -160,13 +158,10 @@ trainer:
   grad_max_norm: 1.0
   grad_accum_every: 1
   precip_mask_ratio: [0.6, 1.0]
-  precip_mask_mode: mixed_height
-  mixed_height_spatial_probability: 1.0
-  mixed_height_channel_probability: 1.0
-  mixed_height_height_probability: 1.0
+  precip_mask_mode: height_patch
   height_visible_levels: [14,15,16]
   val_mask_ratio: 1.0
-  val_mask_mode: spatial_patch
+  val_mask_mode: height_patch
   denoise_snapshot:
     enabled: true
     every_steps: 3000
@@ -222,14 +217,8 @@ eval:
   # precip_mask_ratio: fraction of eligible precip patch elements to inpaint.
   precip_mask_ratio: 0.75
   # precip_mask_mode options: spatial_patch, channel_patch, height_patch, mixed, mixed_height.
-  # spatial_patch shares one x/y mask; channel_patch masks precip groups independently.
-  # height_patch masks group-level-patch elements; mixed_height samples among spatial/channel/height modes.
-  precip_mask_mode: spatial_patch
-  # mixed_height_*_probability: nonnegative weights used only when precip_mask_mode=mixed_height.
-  mixed_height_spatial_probability: 1.0
-  mixed_height_channel_probability: 1.0
-  mixed_height_height_probability: 1.0
-  # height_visible_levels: zero-based vertical levels kept visible/excluded from height_patch masking.
+  # height_patch masks level-patch elements. The model does not use variable-level masks in this setup.
+  precip_mask_mode: height_patch
   height_visible_levels: [14,15,16]
   # visible_precip_conditioning: when true, eval passes clean visible precip as
   # context tokens. The model internally zeros masked precip before tokenizing,
