@@ -1,34 +1,17 @@
-# WoFS DiffMAE 6x6 patch configuration with height-aware precip masking.
+# WoFS DiffMAE 4x4 patch configuration with height-aware precip masking.
 #
-# Height masking keeps the existing cheap spatial tokenization: each precip
-# variable group still contributes one token per x/y patch, so target attention
-# does not multiply by the number of vertical levels. The 4-D mask
-# (batch, group, level, patch) is used for loss weighting and visible-precip
-# conditioning. A grouped token is marked as masked when any level in that
-# group and patch is masked.
+# DiffMAE alignment:
+# - Only masked precip pixels are diffused.
+# - Clean visible precip is encoded as conditioning, not pasted into the sampled state.
+# - The context encoder is evaluated once during sampling and reused for all reverse steps.
+# - cross_self decoder blocks cross-attend encoder latents in reverse U-shaped order.
 #
-# Important options:
-# - model.grouped_decoder_scope: per_group decodes each precip group separately.
-#   This is the main group-query-style compute reduction versus joint group
-#   target self-attention.
-# - model.decoder_type: cross_self lets target tokens cross-attend context
-#   tokens, then self-attend only within target tokens.
-# - model.target_attention_window_size: 0 means global target self-attention.
-#   A positive value uses local non-overlapping target windows of that many
-#   patch tokens per side. With patch_size=6 and image_size=300, window 10
-#   attends over 10x10 patch windows instead of the full 50x50 grid.
-# - model.anti_patch_refiner: optional zero-initialized residual CNN applied
-#   after patch tiling to reduce patch-edge discontinuities during fine-tuning.
-# - trainer.precip_mask_mode/eval.precip_mask_mode: height_patch enables
-#   per-level precip masks. mixed_height randomly selects spatial_patch,
-#   channel_patch, or height_patch using the mixed_height_*_probability values.
-# - height_visible_levels: zero-based vertical levels that should stay visible
-#   and be provided as clean visible-precip conditioning.
-# - height_mask_levels: optional zero-based levels eligible for masking. Leave
-#   unset to allow all levels except height_visible_levels.
-# - precip_mask_ratio: fraction sampled from eligible group-level-patch elements.
+# Lightweight choices:
+# - condition_encoder_depth is 4; decoder depth is independent.
+# - grouped_decoder_scope=per_group avoids joint attention over all precip groups.
+# - target_attention_window_size limits target self-attention to local 15x15 patch windows.
 
-save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev3
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev4
 seed: 1002
 data:
   save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
@@ -117,18 +100,22 @@ model:
   target_modality: precip
   decoder_type: cross_self
   grouped_decoder_scope: per_group
+  # Encoder depth for visible/context tokens only. This does not set decoder depth.
+  # If encoder and decoder depths differ, decoder layers use reverse proportional encoder skips.
+  condition_encoder_depth: 4
+  condition_encoder_mlp_ratio: 4.0
   target_attention_window_size: 15
   anti_patch_refiner:
     enabled: true
-    hidden_channels: 64
-    depth: 3
+    hidden_channels: 48
+    depth: 2
     kernel_size: 5
     groups: 1
   patch_size: 4
   surface_forcing_stride: 16
   image_size: [300, 300]
-  embed_dim: 384
-  depth: 8
+  embed_dim: 320
+  depth: 4
   num_heads: 8
   mlp_ratio: 4.0
   drop_path_rate: 0.05
@@ -206,7 +193,7 @@ trainer:
     scheduler_type: cosine-annealing-restarts
     first_cycle_steps: 800
     cycle_mult: 2.0
-    max_lr: 1.0e-04
+    max_lr: 5.0e-04
     min_lr: 5.0e-06
     warmup_steps: 400
     gamma: 0.85

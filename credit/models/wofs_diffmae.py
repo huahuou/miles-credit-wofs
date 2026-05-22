@@ -236,6 +236,8 @@ class WoFSDiffMAE(BaseModel):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         drop_path_rate: float = 0.0,
+        condition_encoder_depth: int = 0,
+        condition_encoder_mlp_ratio: Optional[float] = None,
         target_attention_window_size: int = 0,
         anti_patch_refiner: Optional[dict] = None,
         diffusion: Optional[dict] = None,
@@ -273,6 +275,24 @@ class WoFSDiffMAE(BaseModel):
         self.condition = True
         self.target_grid_size = (self.image_size[0] // self.patch_size, self.image_size[1] // self.patch_size)
         self.target_attention_window_size = int(target_attention_window_size)
+        self.condition_encoder_depth = int(condition_encoder_depth)
+        self.condition_encoder = nn.ModuleList()
+        self.condition_encoder_norm = nn.Identity()
+        if self.condition_encoder_depth > 0:
+            condition_mlp_ratio = float(condition_encoder_mlp_ratio or mlp_ratio)
+            condition_dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.condition_encoder_depth)]
+            self.condition_encoder = nn.ModuleList(
+                [
+                    Block(
+                        self.embed_dim,
+                        num_heads=num_heads,
+                        mlp_ratio=condition_mlp_ratio,
+                        drop_path=condition_dpr[i],
+                    )
+                    for i in range(self.condition_encoder_depth)
+                ]
+            )
+            self.condition_encoder_norm = nn.LayerNorm(self.embed_dim)
         refiner_conf = anti_patch_refiner or {}
         self.anti_patch_refiner_enabled = bool(refiner_conf.get("enabled", False))
         self.anti_patch_refiner = nn.Identity()
@@ -622,7 +642,7 @@ class WoFSDiffMAE(BaseModel):
         precip_mask: torch.Tensor,
         precip_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cond_tokens = self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        cond_tokens = self._condition_tokens_once(cond, precip_visible=precip_visible, precip_mask=precip_mask)
         return self._legacy_forward_with_condition_tokens(noisy_precip, t, cond_tokens, precip_mask)
 
     def _legacy_forward_with_condition_tokens(
@@ -656,10 +676,9 @@ class WoFSDiffMAE(BaseModel):
         time_tokens = self.time_mlp(t).unsqueeze(1)
         if self.decoder_type == "cross_self":
             target_tokens = target_tokens + time_tokens
-            context = target_tokens.new_zeros(target_tokens.shape[0], 0, target_tokens.shape[-1])
-            if cond_tokens:
-                context = torch.cat(cond_tokens, dim=1)
-            for block in self.blocks:
+            empty_context = target_tokens.new_zeros(target_tokens.shape[0], 0, target_tokens.shape[-1])
+            for block_idx, block in enumerate(self.blocks):
+                context = self._decoder_context_for_block(cond_tokens, block_idx, empty_context)
                 target_tokens = block(target_tokens, context)
             return self.norm(target_tokens)
 
@@ -688,6 +707,44 @@ class WoFSDiffMAE(BaseModel):
             cond_tokens.append(visible_tokens + pos + self.visible_precip_modality_emb)
         return cond_tokens
 
+    def _encode_condition_tokens(self, cond_tokens: list[torch.Tensor]) -> list[torch.Tensor]:
+        if not cond_tokens or self.condition_encoder_depth <= 0:
+            return cond_tokens
+        encoded = torch.cat(cond_tokens, dim=1)
+        encoded_by_layer = []
+        for block in self.condition_encoder:
+            encoded = block(encoded)
+            encoded_by_layer.append(encoded)
+        encoded_by_layer[-1] = self.condition_encoder_norm(encoded_by_layer[-1])
+        return encoded_by_layer
+
+    def _decoder_context_for_block(
+        self,
+        cond_tokens: list[torch.Tensor],
+        decoder_block_idx: int,
+        empty_context: torch.Tensor,
+    ) -> torch.Tensor:
+        if not cond_tokens:
+            return empty_context
+        if self.condition_encoder_depth <= 0:
+            return torch.cat(cond_tokens, dim=1)
+        if len(cond_tokens) == 1:
+            return cond_tokens[0]
+        if len(cond_tokens) == len(self.blocks):
+            return cond_tokens[-1 - decoder_block_idx]
+        encoder_idx = round((len(cond_tokens) - 1) * (len(self.blocks) - 1 - decoder_block_idx) / max(len(self.blocks) - 1, 1))
+        return cond_tokens[int(encoder_idx)]
+
+    def _condition_tokens_once(
+        self,
+        cond: Dict[str, torch.Tensor],
+        precip_visible: Optional[torch.Tensor] = None,
+        precip_mask: Optional[torch.Tensor] = None,
+    ) -> list[torch.Tensor]:
+        return self._encode_condition_tokens(
+            self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        )
+
     def _grouped_forward(
         self,
         noisy_precip: torch.Tensor,
@@ -696,7 +753,7 @@ class WoFSDiffMAE(BaseModel):
         precip_mask: torch.Tensor,
         precip_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cond_tokens = self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        cond_tokens = self._condition_tokens_once(cond, precip_visible=precip_visible, precip_mask=precip_mask)
         return self._grouped_forward_with_condition_tokens(noisy_precip, t, cond_tokens, precip_mask)
 
     def _grouped_forward_with_condition_tokens(
@@ -1031,7 +1088,7 @@ class WoFSDiffMAE(BaseModel):
         start_time = self.num_timesteps - 1
         if sampler == "repaint" and sampling_timesteps is not None:
             start_time = min(start_time, max(0, int(sampling_timesteps) - 1))
-        cond_tokens = self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        cond_tokens = self._condition_tokens_once(cond, precip_visible=precip_visible, precip_mask=precip_mask)
         imgs = [img] if return_all_timesteps else None
 
         if sampler == "ddpm":
