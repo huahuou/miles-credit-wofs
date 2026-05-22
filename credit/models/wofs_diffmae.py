@@ -62,41 +62,22 @@ def linear_beta_schedule(timesteps: int) -> torch.Tensor:
 
 def build_3d_sincos_posemb(levels: int, h: int, w: int, embed_dim: int = 768, temperature: float = 10000.0) -> torch.Tensor:
     """Return fixed 3-D sin-cos embeddings shaped (1, levels * h * w, embed_dim)."""
-
-    def _axis_embedding(values: torch.Tensor, dim: int) -> torch.Tensor:
-        if dim <= 0:
-            return values.new_zeros(values.numel(), 0)
-        if dim % 2 != 0:
-            raise ValueError(f"axis positional dimension must be even, got {dim}")
-        half = dim // 2
-        omega = torch.arange(half, dtype=torch.float32) / max(half, 1)
-        omega = 1.0 / (temperature ** omega)
-        out = torch.einsum("m,d->md", values.flatten(), omega)
-        return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
-
-    base = (embed_dim // 3) // 2 * 2
-    x_dim = base
-    y_dim = base
-    z_dim = embed_dim - x_dim - y_dim
-    if z_dim % 2 != 0:
-        z_dim -= 1
-        x_dim += 1
-    if x_dim % 2 != 0 or y_dim % 2 != 0 or z_dim % 2 != 0:
-        raise ValueError(f"embed_dim={embed_dim} cannot be split into even 3D sin-cos dimensions")
-
-    level_grid = torch.arange(levels, dtype=torch.float32)
-    y_grid = torch.arange(h, dtype=torch.float32)
-    x_grid = torch.arange(w, dtype=torch.float32)
-    level_grid, y_grid, x_grid = torch.meshgrid(level_grid, y_grid, x_grid, indexing="ij")
-    pos = torch.cat(
-        [
-            _axis_embedding(x_grid, x_dim),
-            _axis_embedding(y_grid, y_dim),
-            _axis_embedding(level_grid, z_dim),
-        ],
-        dim=1,
+    device = torch.device("cpu")
+    z, y, x = torch.meshgrid(
+        torch.arange(levels, device=device),
+        torch.arange(h, device=device),
+        torch.arange(w, device=device),
+        indexing="ij",
     )
-    return pos[None, :, :]
+    fourier_dim = max(1, embed_dim // 6)
+    omega = torch.arange(fourier_dim, device=device, dtype=torch.float32)
+    omega = 1.0 / (temperature ** (omega / max(fourier_dim - 1, 1)))
+    z = z.flatten()[:, None].float() * omega[None, :]
+    y = y.flatten()[:, None].float() * omega[None, :]
+    x = x.flatten()[:, None].float() * omega[None, :]
+    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos(), z.sin(), z.cos()), dim=1)
+    pe = F.pad(pe, (0, embed_dim - pe.shape[1]))
+    return pe[None, :, :]
 
 
 class CrossSelfDecoderBlock(nn.Module):
@@ -111,8 +92,8 @@ class CrossSelfDecoderBlock(nn.Module):
         drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float = 0.0,
-        target_grid_size: Optional[Tuple[int, int]] = None,
-        target_window_size: int = 0,
+        target_grid_size: Optional[Tuple[int, ...]] = None,
+        target_window_size: int | Tuple[int, int, int] = 0,
         norm_layer=nn.LayerNorm,
     ):
         super().__init__()
@@ -126,18 +107,30 @@ class CrossSelfDecoderBlock(nn.Module):
             proj_drop=drop,
         )
         self.norm_self = norm_layer(dim)
-        if target_window_size and target_window_size > 0:
+        use_window = any(int(v) > 0 for v in target_window_size) if isinstance(target_window_size, (list, tuple)) else int(target_window_size) > 0
+        if use_window:
             if target_grid_size is None:
                 raise ValueError("target_grid_size is required when target_window_size > 0")
-            self.self_attn = WindowAttention2D(
-                dim,
-                num_heads=num_heads,
-                grid_size=target_grid_size,
-                window_size=int(target_window_size),
-                qkv_bias=qkv_bias,
-                attn_drop=attn_drop,
-                proj_drop=drop,
-            )
+            if len(target_grid_size) == 3:
+                self.self_attn = WindowAttention3D(
+                    dim,
+                    num_heads=num_heads,
+                    grid_size=target_grid_size,
+                    window_size=target_window_size,
+                    qkv_bias=qkv_bias,
+                    attn_drop=attn_drop,
+                    proj_drop=drop,
+                )
+            else:
+                self.self_attn = WindowAttention2D(
+                    dim,
+                    num_heads=num_heads,
+                    grid_size=target_grid_size,
+                    window_size=int(target_window_size),
+                    qkv_bias=qkv_bias,
+                    attn_drop=attn_drop,
+                    proj_drop=drop,
+                )
         else:
             self.self_attn = Attention(
                 dim,
@@ -213,6 +206,119 @@ class WindowAttention2D(nn.Module):
         return x_grid[:, :grid_h, :grid_w].reshape(b, n, d)
 
 
+class WindowAttention3D(nn.Module):
+    """Local self-attention over a 3-D target-token grid."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        grid_size: Tuple[int, int, int],
+        window_size: int | Tuple[int, int, int],
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.grid_size = (int(grid_size[0]), int(grid_size[1]), int(grid_size[2]))
+        if isinstance(window_size, (list, tuple)):
+            self.window_size = tuple(max(1, int(v)) for v in window_size)
+        else:
+            w = max(1, int(window_size))
+            self.window_size = (w, w, w)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, d = x.shape
+        grid_z, grid_h, grid_w = self.grid_size
+        if n != grid_z * grid_h * grid_w:
+            raise ValueError(f"WindowAttention3D expected {grid_z * grid_h * grid_w} tokens, got {n}")
+        wz, wh, ww = self.window_size
+        x_grid = x.reshape(b, grid_z, grid_h, grid_w, d)
+        pad_z = (wz - grid_z % wz) % wz
+        pad_h = (wh - grid_h % wh) % wh
+        pad_w = (ww - grid_w % ww) % ww
+        if pad_z or pad_h or pad_w:
+            x_grid = F.pad(x_grid, (0, 0, 0, pad_w, 0, pad_h, 0, pad_z))
+        padded_z, padded_h, padded_w = x_grid.shape[1], x_grid.shape[2], x_grid.shape[3]
+        x_windows = x_grid.reshape(
+            b,
+            padded_z // wz,
+            wz,
+            padded_h // wh,
+            wh,
+            padded_w // ww,
+            ww,
+            d,
+        )
+        x_windows = x_windows.permute(0, 1, 3, 5, 2, 4, 6, 7).reshape(-1, wz * wh * ww, d)
+        x_windows = self.attn(x_windows)
+        x_grid = x_windows.reshape(b, padded_z // wz, padded_h // wh, padded_w // ww, wz, wh, ww, d)
+        x_grid = x_grid.permute(0, 1, 4, 2, 5, 3, 6, 7).reshape(b, padded_z, padded_h, padded_w, d)
+        return x_grid[:, :grid_z, :grid_h, :grid_w].reshape(b, n, d)
+
+
+class Precip3DPatchAdapter(nn.Module):
+    """Patch precip as variables over a vertical-lat-lon cube grid."""
+
+    def __init__(
+        self,
+        variable_count: int,
+        level_count: int,
+        patch_size: Tuple[int, int, int],
+        embed_dim: int,
+        image_size: Tuple[int, int],
+    ):
+        super().__init__()
+        self.variable_count = int(variable_count)
+        self.level_count = int(level_count)
+        self.patch_size = tuple(int(v) for v in patch_size)
+        self.embed_dim = int(embed_dim)
+        self.image_size = tuple(int(v) for v in image_size)
+        self.grid_size = (
+            math.ceil(self.level_count / self.patch_size[0]),
+            math.ceil(self.image_size[0] / self.patch_size[1]),
+            math.ceil(self.image_size[1] / self.patch_size[2]),
+        )
+        self.padded_size = (
+            self.grid_size[0] * self.patch_size[0],
+            self.grid_size[1] * self.patch_size[1],
+            self.grid_size[2] * self.patch_size[2],
+        )
+        self.proj = nn.Conv3d(
+            self.variable_count,
+            self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
+        self.norm = nn.LayerNorm(self.embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        expected_channels = self.variable_count * self.level_count
+        if c != expected_channels:
+            raise ValueError(f"Expected {expected_channels} precip channels, got {c}")
+        x = x.reshape(b, self.variable_count, self.level_count, h, w)
+        pad_d = self.padded_size[0] - self.level_count
+        pad_h = self.padded_size[1] - h
+        pad_w = self.padded_size[2] - w
+        if pad_d < 0 or pad_h < 0 or pad_w < 0:
+            raise ValueError(
+                f"Input shape {(self.level_count, h, w)} exceeds configured padded size {self.padded_size}"
+            )
+        if pad_d or pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_d))
+        x = self.proj(x)
+        x = rearrange(x, "b d z h w -> b (z h w) d")
+        return self.norm(x)
+
+
 class ResidualConvRefiner(nn.Module):
     """Small zero-initialized residual CNN for reducing patch-edge artifacts."""
 
@@ -265,6 +371,8 @@ class WoFSDiffMAE(nn.Module):
         decoder_type: str = "concat_self",
         precip_group_names: Optional[list[str]] = None,
         precip_group_channels: Optional[list[int]] = None,
+        level_group_size: int = 1,
+        precip_patch_size: Optional[Tuple[int, int, int] | list[int]] = None,
         patch_size: int = 8,
         surface_forcing_stride: int = 16,
         image_size: Tuple[int, int] = (304, 304),
@@ -298,7 +406,14 @@ class WoFSDiffMAE(nn.Module):
             raise ValueError(f"Unsupported decoder_type: {decoder_type}")
         self.precip_group_names = list(precip_group_names or [])
         self.precip_group_channels = list(precip_group_channels or [])
+        self.level_group_size = max(1, int(level_group_size))
         self.patch_size = int(patch_size)
+        if precip_patch_size is None:
+            self.precip_patch_size = (self.level_group_size, self.patch_size, self.patch_size)
+        else:
+            if len(precip_patch_size) != 3:
+                raise ValueError(f"precip_patch_size must have 3 entries, got {precip_patch_size}")
+            self.precip_patch_size = tuple(int(v) for v in precip_patch_size)
         self.surface_forcing_stride = int(surface_forcing_stride)
         self.image_size = tuple(image_size)
         self.embed_dim = int(embed_dim)
@@ -309,7 +424,11 @@ class WoFSDiffMAE(nn.Module):
         self.self_condition = False
         self.condition = True
         self.target_grid_size = (self.image_size[0] // self.patch_size, self.image_size[1] // self.patch_size)
-        self.target_attention_window_size = int(target_attention_window_size)
+        self.precip_grid_size = (1, self.target_grid_size[0], self.target_grid_size[1])
+        if isinstance(target_attention_window_size, (list, tuple)):
+            self.target_attention_window_size = tuple(int(v) for v in target_attention_window_size)
+        else:
+            self.target_attention_window_size = int(target_attention_window_size)
         self.condition_encoder_depth = int(condition_encoder_depth)
         self.condition_encoder = nn.ModuleList()
         self.condition_encoder_norm = nn.Identity()
@@ -341,6 +460,7 @@ class WoFSDiffMAE(nn.Module):
             )
 
         self.level_count = 0
+        self.level_token_count = 0
         sf_h = math.ceil(self.image_size[0] / self.surface_forcing_stride) * self.surface_forcing_stride
         sf_w = math.ceil(self.image_size[1] / self.surface_forcing_stride) * self.surface_forcing_stride
         sf_image_size = (sf_h, sf_w)
@@ -367,6 +487,23 @@ class WoFSDiffMAE(nn.Module):
             nn.Linear(time_dim, self.embed_dim),
         )
 
+        self.precip_group_slices: list[Tuple[int, int]] = []
+        self.precip_token_adapter = None
+        self.precip_token_out_proj = None
+        self.level_token_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.level_variable_count = 0
+        trunc_normal_(self.level_token_emb, std=0.02)
+        self._init_precip_3d_tokenization()
+
+        n_z, n_h, n_w = self.precip_grid_size
+        level_pos_emb = build_3d_sincos_posemb(n_z, n_h, n_w, self.embed_dim)
+        self.register_buffer("target_level_pos_emb", level_pos_emb)
+        self.register_buffer("visible_level_pos_emb", level_pos_emb.clone())
+        self.target_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.visible_precip_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        trunc_normal_(self.target_modality_emb, std=0.02)
+        trunc_normal_(self.visible_precip_modality_emb, std=0.02)
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         if self.decoder_type == "cross_self":
             self.blocks = nn.ModuleList(
@@ -376,7 +513,7 @@ class WoFSDiffMAE(nn.Module):
                         num_heads=num_heads,
                         mlp_ratio=mlp_ratio,
                         drop_path=dpr[i],
-                        target_grid_size=self.target_grid_size,
+                        target_grid_size=self.precip_grid_size,
                         target_window_size=self.target_attention_window_size,
                     )
                     for i in range(depth)
@@ -387,23 +524,6 @@ class WoFSDiffMAE(nn.Module):
                 [Block(self.embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_path=dpr[i]) for i in range(depth)]
             )
         self.norm = nn.LayerNorm(self.embed_dim)
-
-        self.precip_group_slices: list[Tuple[int, int]] = []
-        self.level_token_adapter = None
-        self.level_token_out_proj = None
-        self.level_token_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-        self.level_variable_count = 0
-        trunc_normal_(self.level_token_emb, std=0.02)
-        self._init_level_precip_tokenization()
-
-        n_h, n_w = self.target_grid_size
-        level_pos_emb = build_3d_sincos_posemb(self.level_count, n_h, n_w, self.embed_dim)
-        self.register_buffer("target_level_pos_emb", level_pos_emb)
-        self.register_buffer("visible_level_pos_emb", level_pos_emb.clone())
-        self.target_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-        self.visible_precip_modality_emb = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-        trunc_normal_(self.target_modality_emb, std=0.02)
-        trunc_normal_(self.visible_precip_modality_emb, std=0.02)
 
         diffusion_conf = diffusion or {}
         self.objective = diffusion_conf.get("objective", "pred_v")
@@ -450,7 +570,7 @@ class WoFSDiffMAE(nn.Module):
         self.register_buffer("posterior_mean_coef1", (betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)).float())
         self.register_buffer("posterior_mean_coef2", ((1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)).float())
 
-    def _init_level_precip_tokenization(self) -> None:
+    def _init_precip_3d_tokenization(self) -> None:
         if not self.precip_group_names:
             raise ValueError("precip_group_names must be provided when precip_grouping is level")
         if not self.precip_group_channels:
@@ -474,20 +594,28 @@ class WoFSDiffMAE(nn.Module):
         self.level_variable_count = len(self.precip_group_names)
         if self.level_count <= 0:
             raise ValueError("Level precip grouping requires a positive level count")
+        self.level_group_size = int(self.precip_patch_size[0])
+        self.level_token_count = math.ceil(self.level_count / self.level_group_size)
         start = 0
         for n_ch in self.precip_group_channels:
             stop = start + int(n_ch)
             self.precip_group_slices.append((start, stop))
             start = stop
-        self.level_token_adapter = WoFSInputAdapter(
-            num_channels=self.level_variable_count,
-            patch_size=self.patch_size,
+        self.precip_token_adapter = Precip3DPatchAdapter(
+            variable_count=self.level_variable_count,
+            level_count=self.level_count,
+            patch_size=self.precip_patch_size,
             embed_dim=self.embed_dim,
             image_size=self.image_size,
-            use_pos_emb=False,
-            use_modality_emb=False,
         )
-        self.level_token_out_proj = nn.Linear(self.embed_dim, self.level_variable_count * self.patch_size * self.patch_size)
+        self.precip_grid_size = self.precip_token_adapter.grid_size
+        self.precip_token_out_proj = nn.Linear(
+            self.embed_dim,
+            self.level_variable_count
+            * self.precip_patch_size[0]
+            * self.precip_patch_size[1]
+            * self.precip_patch_size[2],
+        )
 
     def _variable_index_for_channel(self, channel_idx: int) -> int:
         for group_idx, (start, stop) in enumerate(self.precip_group_slices):
@@ -495,35 +623,26 @@ class WoFSDiffMAE(nn.Module):
                 return group_idx
         raise IndexError(f"channel index {channel_idx} outside level slices")
 
-    def _level_tokens(
+    def _precip_3d_tokens(
         self,
         x: torch.Tensor,
         precip_mask: torch.Tensor,
         use_visible: bool = False,
     ) -> torch.Tensor:
-        if self.level_token_adapter is None:
-            raise ValueError("Level precip tokenization is not enabled")
-        b, _, _, _ = x.shape
-        level_inputs = []
-        for level_idx in range(self.level_count):
-            level_inputs.append(torch.cat([x[:, start + level_idx : start + level_idx + 1] for start, _ in self.precip_group_slices], dim=1))
-        level_x = torch.cat(level_inputs, dim=0)
-        level_tokens = self.level_token_adapter(level_x)
-        level_tokens = rearrange(level_tokens, "(b l) hw d -> b l hw d", b=b, l=self.level_count)
+        if self.precip_token_adapter is None:
+            raise ValueError("3D precip tokenization is not enabled")
+        tokens = self.precip_token_adapter(x)
         pos = self.visible_level_pos_emb if use_visible else self.target_level_pos_emb
-        pos = pos.to(device=x.device, dtype=x.dtype)
-        pos = rearrange(pos, "b (l hw) d -> b l hw d", l=self.level_count)
-        level_tokens = level_tokens + pos + self.level_token_emb
+        tokens = tokens + pos.to(device=x.device, dtype=x.dtype) + self.level_token_emb
 
         if not use_visible:
             token_mask = self.token_mask_from_precip_mask(precip_mask)
-            if token_mask.dim() == 2:
-                token_mask = token_mask[:, None, :]
-            elif token_mask.dim() != 3:
-                raise ValueError(f"Unsupported token_mask shape {tuple(token_mask.shape)} for level tokenization")
-            token_mask = token_mask[:, :, :, None].to(level_tokens.dtype)
-            level_tokens = level_tokens + self.mask_token * token_mask
-        return level_tokens
+            if token_mask.dim() == 3:
+                token_mask = token_mask.reshape(token_mask.shape[0], -1)
+            if token_mask.dim() != 2:
+                raise ValueError(f"Unsupported token_mask shape {tuple(token_mask.shape)} for 3D tokenization")
+            tokens = tokens + self.mask_token * token_mask[:, :, None].to(tokens.dtype)
+        return tokens
 
     def _level_forward_with_condition_tokens(
         self,
@@ -533,62 +652,68 @@ class WoFSDiffMAE(nn.Module):
         precip_mask: torch.Tensor,
     ) -> torch.Tensor:
         b, _, orig_h, orig_w = noisy_precip.shape
-        target_tokens = self._level_tokens(noisy_precip, precip_mask, use_visible=False)
-        n_h = self.image_size[0] // self.patch_size
-        n_w = self.image_size[1] // self.patch_size
-        target_tokens = rearrange(target_tokens, "b l hw d -> (b l) hw d")
-        cond_tokens_expanded = [tokens.repeat_interleave(self.level_count, dim=0) for tokens in cond_tokens]
-        t_expanded = t.repeat_interleave(self.level_count)
-        tokens = self._decode_target_tokens(target_tokens, cond_tokens_expanded, t_expanded)
-        patches = self.level_token_out_proj(tokens)
-        patches = patches.reshape(b, self.level_count, n_h, n_w, self.level_variable_count, self.patch_size, self.patch_size)
-        x = patches.permute(0, 4, 1, 2, 5, 3, 6).reshape(
+        target_tokens = self._precip_3d_tokens(noisy_precip, precip_mask, use_visible=False)
+        tokens = self._decode_target_tokens(target_tokens, cond_tokens, t)
+        patches = self.precip_token_out_proj(tokens)
+        p_d, p_h, p_w = self.precip_patch_size
+        n_z, n_h, n_w = self.precip_grid_size
+        patches = patches.reshape(
+            b,
+            n_z,
+            n_h,
+            n_w,
+            self.level_variable_count,
+            p_d,
+            p_h,
+            p_w,
+        )
+        x = patches.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(
+            b,
+            self.level_variable_count,
+            n_z * p_d,
+            n_h * p_h,
+            n_w * p_w,
+        )
+        x = x[:, :, : self.level_count, :orig_h, :orig_w].reshape(
             b,
             self.level_variable_count * self.level_count,
-            n_h * self.patch_size,
-            n_w * self.patch_size,
+            orig_h,
+            orig_w,
         )
-        return self.anti_patch_refiner(x[:, :, :orig_h, :orig_w])
+        return self.anti_patch_refiner(x)
 
     @property
     def device(self) -> torch.device:
         return self.betas.device
 
     def patchify_mask(self, mask: torch.Tensor) -> torch.Tensor:
-        if mask.dim() == 3:
+        if mask.dim() == 4:
             mask = mask[:, None]
-        pooled = F.max_pool2d(mask.float(), kernel_size=self.patch_size, stride=self.patch_size)
-        return rearrange(pooled, "b 1 h w -> b (h w)")
+        if mask.dim() != 5:
+            raise ValueError(f"Expected 5-D precip mask, got shape {tuple(mask.shape)}")
+        pad_d = (self.precip_patch_size[0] - mask.shape[2] % self.precip_patch_size[0]) % self.precip_patch_size[0]
+        pad_h = (self.precip_patch_size[1] - mask.shape[3] % self.precip_patch_size[1]) % self.precip_patch_size[1]
+        pad_w = (self.precip_patch_size[2] - mask.shape[4] % self.precip_patch_size[2]) % self.precip_patch_size[2]
+        if pad_d or pad_h or pad_w:
+            mask = F.pad(mask.float(), (0, pad_w, 0, pad_h, 0, pad_d))
+        pooled = F.max_pool3d(mask.float(), kernel_size=self.precip_patch_size, stride=self.precip_patch_size)
+        return rearrange(pooled, "b 1 z h w -> b (z h w)")
 
     def expand_patch_mask(self, patch_mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        n_h = self.image_size[0] // self.patch_size
-        n_w = self.image_size[1] // self.patch_size
-        if patch_mask.dim() == 4:
-            if patch_mask.shape[1] != self.level_variable_count or patch_mask.shape[2] != self.level_count:
-                raise ValueError(
-                    "Level precip 4-D masks must have shape "
-                    f"(B, {self.level_variable_count}, {self.level_count}, tokens), got {tuple(patch_mask.shape)}"
-                )
-            mask = patch_mask.amax(dim=1)
-        elif patch_mask.dim() == 3:
-            if patch_mask.shape[1] == self.level_count:
-                mask = patch_mask
-            elif patch_mask.shape[1] == self.level_variable_count * self.level_count:
-                mask = patch_mask.reshape(patch_mask.shape[0], self.level_variable_count, self.level_count, -1).amax(dim=1)
-            else:
-                raise ValueError(f"Unsupported level precip mask shape {tuple(patch_mask.shape)}")
-        else:
-            raise ValueError(f"Unsupported level precip mask shape {tuple(patch_mask.shape)}")
-        mask = mask.reshape(mask.shape[0], self.level_count, n_h, n_w)
-        mask = mask.repeat_interleave(self.level_variable_count, dim=1)
-        mask = mask.repeat_interleave(self.patch_size, dim=2).repeat_interleave(self.patch_size, dim=3)
-        return mask[:, :, :height, :width]
+        if patch_mask.dim() != 2:
+            raise ValueError(f"Unsupported precip mask shape {tuple(patch_mask.shape)} for 3D expansion")
+        n_z, n_h, n_w = self.precip_grid_size
+        mask = patch_mask.reshape(patch_mask.shape[0], n_z, n_h, n_w)
+        mask = mask.repeat_interleave(self.precip_patch_size[0], dim=1)
+        mask = mask.repeat_interleave(self.precip_patch_size[1], dim=2)
+        mask = mask.repeat_interleave(self.precip_patch_size[2], dim=3)
+        return mask[:, : self.level_count, :height, :width]
 
     def precip_group_index_for_channel(self, channel_idx: int) -> int:
         return self._variable_index_for_channel(channel_idx)
 
     def random_precip_mask(self, batch_size: int, mask_ratio: float | tuple[float, float], device: torch.device) -> torch.Tensor:
-        n_tokens = (self.image_size[0] // self.patch_size) * (self.image_size[1] // self.patch_size)
+        n_tokens = self.precip_grid_size[0] * self.precip_grid_size[1] * self.precip_grid_size[2]
         if isinstance(mask_ratio, (list, tuple)):
             lo, hi = float(mask_ratio[0]), float(mask_ratio[1])
             ratios = torch.empty(batch_size, device=device).uniform_(lo, hi)
@@ -602,55 +727,15 @@ class WoFSDiffMAE(nn.Module):
         return (ranks < n_mask[:, None]).float()
 
     def random_channel_precip_mask(self, batch_size: int, mask_ratio: float | tuple[float, float], device: torch.device) -> torch.Tensor:
-        raise ValueError("channel masks are not supported in the level-token DiffMAE")
+        raise ValueError("channel masks are not supported in the 3D precip-token model")
 
-    def random_height_precip_mask(
-        self,
-        batch_size: int,
-        mask_ratio: float | tuple[float, float],
-        device: torch.device,
-        masked_levels: Optional[list[int]] = None,
-        visible_levels: Optional[list[int]] = None,
-    ) -> torch.Tensor:
-        n_tokens = (self.image_size[0] // self.patch_size) * (self.image_size[1] // self.patch_size)
-        n_levels = self.level_count
-        if isinstance(mask_ratio, (list, tuple)):
-            lo, hi = float(mask_ratio[0]), float(mask_ratio[1])
-            ratios = torch.empty(batch_size, device=device).uniform_(lo, hi)
-        else:
-            ratios = torch.full((batch_size,), float(mask_ratio), device=device)
-        ratios = ratios.clamp(0.0, 1.0)
-
-        eligible = torch.ones(n_levels, device=device, dtype=torch.bool)
-        if masked_levels is not None:
-            eligible = torch.zeros(n_levels, device=device, dtype=torch.bool)
-            for level in masked_levels:
-                if 0 <= int(level) < n_levels:
-                    eligible[int(level)] = True
-        if visible_levels is not None:
-            for level in visible_levels:
-                if 0 <= int(level) < n_levels:
-                    eligible[int(level)] = False
-        n_eligible = int(eligible.sum().item())
-        mask = torch.zeros(batch_size, n_levels, n_tokens, device=device)
-        if n_eligible == 0:
-            return mask
-
-        n_elements = n_eligible * n_tokens
-        noise = torch.rand(batch_size, n_elements, device=device)
-        ids = torch.argsort(noise, dim=1)
-        ranks = torch.argsort(ids, dim=1)
-        n_mask = torch.round(ratios * n_elements).long().clamp(0, n_elements)
-        sampled = (ranks < n_mask[:, None]).float().reshape(batch_size, n_eligible, n_tokens)
-        mask[:, eligible, :] = sampled
-        return mask
+    def random_height_precip_mask(self, *args, **kwargs) -> torch.Tensor:
+        raise ValueError("height-specific masks are not supported in the 3D precip-token model")
 
     def token_mask_from_precip_mask(self, precip_mask: torch.Tensor) -> torch.Tensor:
-        if precip_mask.dim() == 4:
-            return precip_mask.amax(dim=1)
-        if precip_mask.dim() == 3:
+        if precip_mask.dim() == 2:
             return precip_mask
-        return precip_mask
+        raise ValueError(f"Unsupported precip mask shape {tuple(precip_mask.shape)} for 3D tokenization")
 
     def _visible_precip_condition_image(
         self,
@@ -662,11 +747,13 @@ class WoFSDiffMAE(nn.Module):
         pixel_mask = self.expand_patch_mask(precip_mask, precip_visible.shape[-2], precip_visible.shape[-1]).to(
             precip_visible.dtype
         )
+        pixel_mask = pixel_mask.repeat_interleave(self.level_variable_count, dim=1)
         return precip_visible * (1.0 - pixel_mask)
 
     def _masked_diffusion_state(self, x: torch.Tensor, precip_mask: torch.Tensor) -> torch.Tensor:
         """Keep the diffusion Markov state on masked target pixels only."""
         pixel_mask = self.expand_patch_mask(precip_mask, x.shape[-2], x.shape[-1]).to(device=x.device, dtype=x.dtype)
+        pixel_mask = pixel_mask.repeat_interleave(self.level_variable_count, dim=1)
         return x * pixel_mask
 
     def _decode_target_tokens(
@@ -704,7 +791,7 @@ class WoFSDiffMAE(nn.Module):
             if precip_mask is None:
                 raise ValueError("precip_mask is required when precip_visible is used for conditioning")
             visible_img = self._visible_precip_condition_image(precip_visible, precip_mask)
-            visible_tokens = rearrange(self._level_tokens(visible_img, precip_mask, use_visible=True), "b l hw d -> b (l hw) d")
+            visible_tokens = self._precip_3d_tokens(visible_img, precip_mask, use_visible=True)
             cond_tokens.append(visible_tokens + self.visible_precip_modality_emb)
         return cond_tokens
 
@@ -934,8 +1021,6 @@ class WoFSDiffMAE(nn.Module):
             t = torch.randint(0, self.num_timesteps, (b,), device=x_start.device).long()
         if noise is None:
             noise = torch.randn_like(x_start)
-        if precip_visible is None:
-            precip_visible = x_start
         x_t = self._masked_diffusion_state(self.q_sample(x_start, t, noise), precip_mask)
         model_out = self.forward(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         if self.objective == "pred_noise":
@@ -945,6 +1030,7 @@ class WoFSDiffMAE(nn.Module):
         else:
             target = self.predict_v(x_start, t, noise)
         pixel_mask = self.expand_patch_mask(precip_mask, x_start.shape[-2], x_start.shape[-1]).to(x_start.dtype)
+        pixel_mask = pixel_mask.repeat_interleave(self.level_variable_count, dim=1)
         loss_raw = (model_out - target) ** 2
         denom = pixel_mask.sum()
         if pixel_mask.shape[1] == 1:

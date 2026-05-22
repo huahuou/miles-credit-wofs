@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 def _choose_mixed_height_mode(conf: dict, device: torch.device) -> str:
     probs = torch.tensor(
-        [
-            float(conf.get("mixed_height_spatial_probability", 1.0)),
-            float(conf.get("mixed_height_channel_probability", 1.0)),
-            float(conf.get("mixed_height_height_probability", 1.0)),
-        ],
+            [
+                float(conf.get("mixed_height_spatial_probability", 1.0)),
+                float(conf.get("mixed_height_channel_probability", 0.0)),
+                float(conf.get("mixed_height_height_probability", 1.0)),
+            ],
         device=device,
         dtype=torch.float32,
     )
@@ -72,24 +72,12 @@ class TrainerDiffMAE(BaseTrainer):
         mode_key = "val_mask_mode" if validation else "precip_mask_mode"
         mode = str(trainer_conf.get(mode_key, trainer_conf.get("precip_mask_mode", "spatial_patch"))).strip().lower()
 
-        if mode == "mixed" and not validation:
-            channel_prob = float(trainer_conf.get("channel_patch_mask_probability", 0.5))
-            mode = "channel_patch" if torch.rand((), device=device).item() < channel_prob else "spatial_patch"
-        elif mode == "mixed_height":
-            mode = _choose_mixed_height_mode(trainer_conf, device)
-
-        if mode == "height_patch":
-            return model.random_height_precip_mask(
-                batch_size,
-                ratio,
-                device,
-                masked_levels=trainer_conf.get("height_mask_levels"),
-                visible_levels=trainer_conf.get("height_visible_levels"),
-            )
-        if mode == "channel_patch":
-            return model.random_channel_precip_mask(batch_size, ratio, device)
-        if mode == "spatial_patch":
+        if mode in {"spatial_patch", "cube_patch", "patch", "3d_patch"}:
             return model.random_precip_mask(batch_size, ratio, device)
+        if mode in {"mixed", "mixed_height", "height_patch", "channel_patch"}:
+            raise ValueError(
+                f"Mask mode {mode!r} is no longer supported by WoFSDiffMAE; use 'cube_patch' for 3D precip patches."
+            )
         raise ValueError(f"Unsupported precip mask mode: {mode!r}")
 
     @staticmethod
@@ -244,13 +232,14 @@ class TrainerDiffMAE(BaseTrainer):
             batch = self._move_batch(batch)
             model = self._unwrap_model()
             precip_mask = self._sample_mask(batch["precip"].shape[0], trainer_conf, batch["precip"].device)
+            precip_visible = batch["precip"] if bool(trainer_conf.get("visible_precip_conditioning", False)) else None
 
             with autocast(enabled=amp):
                 losses = model.p_losses(
                     batch["precip"],
                     self._condition_dict(batch),
                     precip_mask,
-                    precip_visible=batch["precip"],
+                    precip_visible=precip_visible,
                 )
                 loss = losses["loss"]
 
@@ -313,12 +302,13 @@ class TrainerDiffMAE(BaseTrainer):
                 batch = self._move_batch(batch)
                 model = self._unwrap_model()
                 precip_mask = self._sample_mask(batch["precip"].shape[0], trainer_conf, batch["precip"].device, validation=True)
+                precip_visible = batch["precip"] if bool(trainer_conf.get("visible_precip_conditioning", False)) else None
                 with autocast(enabled=amp):
                     losses = model.p_losses(
                         batch["precip"],
                         self._condition_dict(batch),
                         precip_mask,
-                        precip_visible=batch["precip"],
+                        precip_visible=precip_visible,
                     )
                     loss = losses["loss"]
                 loss_t = torch.tensor([loss.item()], device=self.device)

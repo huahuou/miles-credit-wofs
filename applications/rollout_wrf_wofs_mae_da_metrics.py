@@ -391,7 +391,7 @@ def _write_case_mask_bundle(
         seed=seed,
         channel_patch_mask_probability=float(conf.get("trainer", {}).get("channel_patch_mask_probability", 0.5)),
         mixed_height_spatial_probability=float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
-        mixed_height_channel_probability=float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+        mixed_height_channel_probability=float(eval_conf.get("mixed_height_channel_probability", 0.0)),
         mixed_height_height_probability=float(eval_conf.get("mixed_height_height_probability", 1.0)),
         group_channels=group_channels,
         height_mask_levels=eval_conf.get("height_mask_levels"),
@@ -435,7 +435,7 @@ def _build_precip_mask_for_rollout(
             probs = torch.tensor(
                 [
                     float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
-                    float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+                    float(eval_conf.get("mixed_height_channel_probability", 0.0)),
                     float(eval_conf.get("mixed_height_height_probability", 1.0)),
                 ],
                 device=device,

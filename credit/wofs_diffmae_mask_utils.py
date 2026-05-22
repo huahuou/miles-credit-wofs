@@ -124,7 +124,7 @@ def build_grouped_patch_masks(
     seed: int,
     channel_patch_mask_probability: float = 0.5,
     mixed_height_spatial_probability: float = 1.0,
-    mixed_height_channel_probability: float = 1.0,
+    mixed_height_channel_probability: float = 0.0,
     mixed_height_height_probability: float = 1.0,
     group_channels: list[int] | tuple[int, ...] | None = None,
     height_mask_levels: list[int] | tuple[int, ...] | None = None,

@@ -11,7 +11,7 @@
 # - condition_encoder_depth is 4; decoder depth is independent.
 # - target_attention_window_size limits target self-attention to local 15x15 patch windows.
 
-save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev4
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev6
 seed: 1002
 data:
   save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
@@ -99,12 +99,13 @@ model:
   conditioned_modalities: [background, forcing, reflectivity]
   target_modality: precip
   decoder_type: cross_self
+  precip_patch_size: [3, 4, 4]
   # Encoder depth for visible/context tokens only. This does not set decoder depth.
   condition_encoder_depth: 4
   condition_encoder_mlp_ratio: 4.0
-  target_attention_window_size: 15
+  target_attention_window_size: [2, 9, 9]
   anti_patch_refiner:
-    enabled: true
+    enabled: false
     hidden_channels: 48
     depth: 2
     kernel_size: 5
@@ -112,7 +113,7 @@ model:
   patch_size: 4
   surface_forcing_stride: 16
   image_size: [300, 300]
-  embed_dim: 320
+  embed_dim: 192
   depth: 4
   num_heads: 8
   mlp_ratio: 4.0
@@ -128,8 +129,8 @@ trainer:
   mode: ddp
   ddp_find_unused_parameters: false
   use_file_locality_sampler: true
-  train_batch_size: 8
-  valid_batch_size: 8
+  train_batch_size: 6
+  valid_batch_size: 6
   epochs: 500
   start_epoch: 0
   stopping_patience: 100
@@ -138,13 +139,13 @@ trainer:
   reload_epoch: true
   train_one_epoch: false
   stop_after_epoch: false
-  thread_workers: 8
-  valid_thread_workers: 8
+  thread_workers: 1
+  valid_thread_workers: 1
   prefetch_factor: 1
   pin_memory: true
   persistent_workers: true
   dataloader_timeout_s: 180
-  no_hang_debug: false
+  no_hang_debug: true
   no_hang_thread_workers: 1
   no_hang_valid_thread_workers: 1
   no_hang_prefetch_factor: 1
@@ -158,12 +159,12 @@ trainer:
   grad_max_norm: 1.0
   grad_accum_every: 1
   precip_mask_ratio: [0.6, 1.0]
-  precip_mask_mode: height_patch
-  height_visible_levels: [14,15,16]
-  val_mask_ratio: 1.0
-  val_mask_mode: height_patch
+  precip_mask_mode: cube_patch
+  visible_precip_conditioning: true
+  val_mask_ratio: 0.7
+  val_mask_mode: cube_patch
   denoise_snapshot:
-    enabled: true
+    enabled: false
     every_steps: 3000
     every_epoch: true
     dir: denoise_snapshots
@@ -181,15 +182,15 @@ trainer:
   save_best_weights: true
   training_metric: valid_loss
   training_metric_direction: min
-  skip_validation: false
+  skip_validation: true
   save_metric_vars: [precip]
   use_scheduler: true
   scheduler:
     scheduler_type: cosine-annealing-restarts
     first_cycle_steps: 800
     cycle_mult: 2.0
-    max_lr: 5.0e-04
-    min_lr: 5.0e-06
+    max_lr: 8.0e-04
+    min_lr: 1.0e-05
     warmup_steps: 400
     gamma: 0.85
   residual_prediction: false
@@ -216,10 +217,8 @@ eval:
   repaint_jump_n_sample: 5
   # precip_mask_ratio: fraction of eligible precip patch elements to inpaint.
   precip_mask_ratio: 0.75
-  # precip_mask_mode options: spatial_patch, channel_patch, height_patch, mixed, mixed_height.
-  # height_patch masks level-patch elements only.
-  precip_mask_mode: height_patch
-  height_visible_levels: [14,15,16]
+  # precip_mask_mode options: cube_patch.
+  precip_mask_mode: cube_patch
   # visible_precip_conditioning: pass clean visible precip as context tokens.
   visible_precip_conditioning: true
   # clamp_visible_precip is retained for older rollout code paths.

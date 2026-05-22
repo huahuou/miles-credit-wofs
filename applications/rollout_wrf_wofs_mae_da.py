@@ -219,7 +219,7 @@ def _sample_mask(model: torch.nn.Module, eval_conf: dict, batch_size: int, devic
         probs = torch.tensor(
             [
                 float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
-                float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+                float(eval_conf.get("mixed_height_channel_probability", 0.0)),
                 float(eval_conf.get("mixed_height_height_probability", 1.0)),
             ],
             device=device,

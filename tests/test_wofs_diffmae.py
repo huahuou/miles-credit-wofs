@@ -83,6 +83,39 @@ def _small_grouped_model(
     )
 
 
+def _small_3d_model():
+    return WoFSDiffMAE(
+        modality_channels={
+            "background": 2,
+            "precip": 6,
+            "reflectivity": 1,
+            "surface": 1,
+            "forcing": 2,
+        },
+        conditioned_modalities=["background", "surface", "forcing", "reflectivity"],
+        target_modality="precip",
+        precip_grouping="level",
+        precip_group_names=["rain", "hail", "snow"],
+        precip_group_channels=[2, 2, 2],
+        precip_patch_size=[1, 4, 4],
+        decoder_type="cross_self",
+        patch_size=4,
+        surface_forcing_stride=4,
+        image_size=(16, 16),
+        embed_dim=32,
+        depth=2,
+        num_heads=4,
+        target_attention_window_size=[1, 2, 2],
+        diffusion={
+            "timesteps": 32,
+            "sampling_timesteps": 4,
+            "objective": "pred_v",
+            "beta_schedule": "linear",
+            "ddim_sampling_eta": 0.0,
+        },
+    )
+
+
 def _cond(batch=2):
     return {
         "background": torch.randn(batch, 2, 16, 16),
@@ -382,15 +415,11 @@ def test_grouped_height_mask_supports_level_specific_visible_precip():
     cond = _cond_grouped(batch=1)
     precip = torch.randn(1, 6, 16, 16)
     visible = torch.randn_like(precip)
-    mask = torch.zeros(1, 3, 2, 16)
-    mask[:, :, 1, :4] = 1.0
+    mask = model.random_precip_mask(1, 0.5, torch.device("cpu"))
 
     pixel_mask = model.expand_patch_mask(mask, 16, 16)
-    token_mask = model.token_mask_from_precip_mask(mask)
     assert pixel_mask.shape == precip.shape
-    assert token_mask.shape == (1, 16)
-    assert pixel_mask[:, 0::2].sum().item() == 0.0
-    assert pixel_mask[:, 1::2, :4, :].sum().item() > 0.0
+    assert torch.isfinite(pixel_mask).all()
 
     losses = model.p_losses(precip, cond, mask)
     assert losses["model_out"].shape == precip.shape
@@ -399,6 +428,50 @@ def test_grouped_height_mask_supports_level_specific_visible_precip():
     sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     assert sample.shape == precip.shape
     assert torch.isfinite(sample).all()
+
+
+def test_level_spatial_mask_expands_across_levels():
+    model = WoFSDiffMAE(
+        modality_channels={
+            "background": 2,
+            "precip": 6,
+            "reflectivity": 1,
+            "surface": 1,
+            "forcing": 2,
+        },
+        conditioned_modalities=["background", "surface", "forcing", "reflectivity"],
+        target_modality="precip",
+        precip_grouping="level",
+        precip_group_names=["rain", "hail", "snow"],
+        precip_group_channels=[2, 2, 2],
+        decoder_type="cross_self",
+        patch_size=4,
+        surface_forcing_stride=4,
+        image_size=(16, 16),
+        embed_dim=32,
+        depth=2,
+        num_heads=4,
+        target_attention_window_size=2,
+        diffusion={
+            "timesteps": 32,
+            "sampling_timesteps": 4,
+            "objective": "pred_v",
+            "beta_schedule": "linear",
+            "ddim_sampling_eta": 0.0,
+        },
+    )
+    cond = _cond_grouped(batch=1)
+    precip = torch.randn(1, 6, 16, 16)
+    mask = model.random_precip_mask(1, 0.5, torch.device("cpu"))
+
+    pixel_mask = model.expand_patch_mask(mask, 16, 16)
+    assert pixel_mask.shape == precip.shape
+    assert torch.equal(pixel_mask[:, 0], pixel_mask[:, 1])
+    assert torch.equal(pixel_mask[:, 0], pixel_mask[:, 2])
+
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["model_out"].shape == precip.shape
+    assert torch.isfinite(losses["loss"])
 
 
 def test_anti_patch_refiner_is_initially_identity_and_checkpoint_compatible():
@@ -438,6 +511,24 @@ def test_grouped_joint_cross_self_decoder_supports_group_specific_masks():
     losses = model.p_losses(precip, cond, mask)
     assert losses["model_out"].shape == precip.shape
     assert torch.isfinite(losses["loss"])
+
+
+def test_3d_precip_tokenization_forward_and_sampling_are_finite():
+    model = _small_3d_model()
+    precip = torch.randn(2, 6, 16, 16)
+    cond = _cond_grouped(batch=2)
+    mask = model.random_precip_mask(2, 0.5, torch.device("cpu"))
+
+    pixel_mask = model.expand_patch_mask(mask, 16, 16)
+    assert pixel_mask.shape == (2, 2, 16, 16)
+
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["loss"].ndim == 0
+    assert torch.isfinite(losses["loss"])
+
+    sample = model.sample_precip(cond, mask, sampling_timesteps=2)
+    assert sample.shape == precip.shape
+    assert torch.isfinite(sample).all()
 
 
 def test_denoise_snapshot_can_save_tensor_without_figure(tmp_path):

@@ -64,7 +64,7 @@ def primary_main():
         seed=int(args.seed),
         channel_patch_mask_probability=float(conf.get("trainer", {}).get("channel_patch_mask_probability", 0.5)),
         mixed_height_spatial_probability=float(eval_conf.get("mixed_height_spatial_probability", 1.0)),
-        mixed_height_channel_probability=float(eval_conf.get("mixed_height_channel_probability", 1.0)),
+        mixed_height_channel_probability=float(eval_conf.get("mixed_height_channel_probability", 0.0)),
         mixed_height_height_probability=float(eval_conf.get("mixed_height_height_probability", 1.0)),
         group_channels=group_channels,
         height_mask_levels=eval_conf.get("height_mask_levels"),
