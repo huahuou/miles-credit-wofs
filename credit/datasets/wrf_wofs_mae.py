@@ -381,6 +381,13 @@ class WoFSMAEDataset(Dataset):
         axis = self._pick_axis_by_size(values_arr, int(stats.shape[0]))
         if axis is not None:
             return axis
+        if var_name in self.reflectivity_vars and values_arr.ndim >= 3:
+            target_levels = int(self._prognostic_levels)
+            axis = self._pick_axis_by_size(values_arr, target_levels)
+            if axis is not None:
+                return axis
+            if values_arr.ndim == 3 and values_arr.shape[0] == target_levels:
+                return 0
         if var_name in CONCENTRATION_VARS and values_arr.ndim >= 3:
             target_levels = min(int(self._prognostic_levels), int(stats.shape[0]))
             if values_arr.ndim == 3 and values_arr.shape[0] == target_levels:
