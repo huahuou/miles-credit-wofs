@@ -198,14 +198,27 @@ class TrainerDiffMAE(BaseTrainer):
             if bool(snapshot_conf.get("save_sampling_figure", False)):
                 sampling_steps = int(snapshot_conf.get("sampling_timesteps", 8))
                 sample_visible = batch["precip"][:1] if bool(snapshot_conf.get("sampling_use_visible_precip", True)) else None
+                sampler = str(snapshot_conf.get("sampler", "ddim"))
+                inpaint_mode = str(snapshot_conf.get("inpaint_mode", "masked_only"))
+                eta = snapshot_conf.get("ddim_sampling_eta", None)
                 t_sample = time.perf_counter()
-                logger.info("Denoise snapshot sampling start: sampling_timesteps=%s visible=%s",
-                            sampling_steps, sample_visible is not None)
+                logger.info(
+                    "Denoise snapshot sampling start: sampler=%s sampling_timesteps=%s visible=%s inpaint_mode=%s",
+                    sampler,
+                    sampling_steps,
+                    sample_visible is not None,
+                    inpaint_mode,
+                )
                 sample = model.sample_precip(
                     self._condition_dict({k: v[:1] for k, v in batch.items()}),
                     losses["precip_mask"][:1],
                     precip_visible=sample_visible,
                     sampling_timesteps=sampling_steps,
+                    eta=eta,
+                    sampler=sampler,
+                    repaint_jump_length=int(snapshot_conf.get("repaint_jump_length", 10)),
+                    repaint_jump_n_sample=int(snapshot_conf.get("repaint_jump_n_sample", 10)),
+                    inpaint_mode=inpaint_mode,
                 )
                 logger.info("Denoise snapshot sampling done: sample=%s elapsed=%.3fs",
                             tuple(sample.shape), time.perf_counter() - t_sample)

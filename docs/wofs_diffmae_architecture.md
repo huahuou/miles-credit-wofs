@@ -20,8 +20,9 @@ The active model section is:
 ```yaml
 model:
   type: wofs-diffmae
-  conditioned_modalities: [background, forcing, reflectivity]
-  target_modality: precip
+conditioned_modalities: [background, forcing, reflectivity]
+condition_encoder_inputs: visible_precip
+target_modality: precip
   precip_grouping: level
   decoder_type: cross_self
   precip_patch_size: [3, 4, 4]
@@ -192,8 +193,13 @@ Target tokens receive:
 
 ## Condition Encoder
 
-`condition_encoder_depth: 4` adds a ViT-style encoder over the concatenated
-conditioning tokens. Each block is standard pre-norm self-attention plus MLP:
+`condition_encoder_depth: 4` adds a ViT-style encoder over the selected
+conditioning tokens. With `condition_encoder_inputs: visible_precip`, the
+background, forcing, and reflectivity tokens bypass the encoder and are passed
+straight to the decoder context, while visible precip tokens are encoded. If
+you set `condition_encoder_inputs: all`, every context token is encoded.
+
+Each encoder block is standard pre-norm self-attention plus MLP:
 
 ```text
 tokens = tokens + Attention(LayerNorm(tokens))
@@ -201,7 +207,7 @@ tokens = tokens + MLP(LayerNorm(tokens))
 ```
 
 The encoder stores the output after every block. The last output is
-LayerNormed. These four encoded context levels are later consumed by the
+LayerNormed. These encoded visible-precip levels are later consumed by the
 decoder in reverse order, giving the cross-self decoder a U-shaped connection
 pattern similar to the DiffMAE paper description.
 
@@ -461,12 +467,19 @@ The general sampling setup is:
    cond_tokens = _condition_tokens_once(cond, precip_visible, precip_mask)
    ```
 
-   These tokens are reused for every reverse step. This matches the paper's
-   statement that the encoder forwards visible patches only once during
-   inference.
+   These tokens are reused for every reverse step. With
+   `condition_encoder_inputs: visible_precip`, only the visible precip tokens
+   go through the encoder; the background, forcing, and reflectivity context
+   is appended directly to the decoder context.
 
 4. Iterate reverse diffusion steps, always reapplying `_masked_diffusion_state`
    after an update so the Markov state remains masked-only.
+
+The model also supports an alternate inpainting mode via `inpaint_mode`:
+
+- `masked_only`: keep the reverse process on masked pixels only.
+- `compose_visible`: inject noisy visible pixels into the current reverse
+  state before each denoising step.
 
 ### DDIM Sampling
 

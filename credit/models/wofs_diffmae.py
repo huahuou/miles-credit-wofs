@@ -383,6 +383,7 @@ class WoFSDiffMAE(nn.Module):
         drop_path_rate: float = 0.0,
         condition_encoder_depth: int = 0,
         condition_encoder_mlp_ratio: Optional[float] = None,
+        condition_encoder_inputs: str = "all",
         target_attention_window_size: int = 0,
         anti_patch_refiner: Optional[dict] = None,
         diffusion: Optional[dict] = None,
@@ -430,6 +431,12 @@ class WoFSDiffMAE(nn.Module):
         else:
             self.target_attention_window_size = int(target_attention_window_size)
         self.condition_encoder_depth = int(condition_encoder_depth)
+        self.condition_encoder_inputs = str(condition_encoder_inputs).strip().lower()
+        if self.condition_encoder_inputs not in {"all", "visible_precip"}:
+            raise ValueError(
+                "condition_encoder_inputs must be 'all' or 'visible_precip', "
+                f"got {condition_encoder_inputs!r}"
+            )
         self.condition_encoder = nn.ModuleList()
         self.condition_encoder_norm = nn.Identity()
         if self.condition_encoder_depth > 0:
@@ -780,6 +787,21 @@ class WoFSDiffMAE(nn.Module):
         known_state = self.q_sample(precip_visible, t, known_noise).to(reverse_state.dtype)
         return known_state * (1.0 - pixel_mask) + reverse_state * pixel_mask
 
+    def _prepare_reverse_state(
+        self,
+        reverse_state: torch.Tensor,
+        t: torch.Tensor,
+        precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor],
+        inpaint_mode: str = "masked_only",
+    ) -> torch.Tensor:
+        mode = str(inpaint_mode).strip().lower()
+        if mode in {"masked_only", "masked", "no_visible_noise"}:
+            return reverse_state
+        if mode in {"compose_visible", "visible_noise", "inpaint", "noisy_visible"}:
+            return self._compose_inpaint_state(reverse_state, t, precip_mask, precip_visible)
+        raise ValueError(f"Unsupported inpaint_mode: {inpaint_mode!r}")
+
     def _decode_target_tokens(
         self,
         target_tokens: torch.Tensor,
@@ -806,28 +828,42 @@ class WoFSDiffMAE(nn.Module):
         cond: Dict[str, torch.Tensor],
         precip_visible: Optional[torch.Tensor] = None,
         precip_mask: Optional[torch.Tensor] = None,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], list[bool]]:
         cond_tokens = []
+        encode_flags = []
         for mod in self.conditioned_modalities:
             if mod in cond:
                 cond_tokens.append(self.condition_adapters[mod](cond[mod]))
+                encode_flags.append(self.condition_encoder_inputs == "all")
         if precip_visible is not None:
             if precip_mask is None:
                 raise ValueError("precip_mask is required when precip_visible is used for conditioning")
             visible_img = self._visible_precip_condition_image(precip_visible, precip_mask)
             visible_tokens = self._precip_3d_tokens(visible_img, precip_mask, use_visible=True)
             cond_tokens.append(visible_tokens + self.visible_precip_modality_emb)
-        return cond_tokens
+            encode_flags.append(True)
+        return cond_tokens, encode_flags
 
-    def _encode_condition_tokens(self, cond_tokens: list[torch.Tensor]) -> list[torch.Tensor]:
+    def _encode_condition_tokens(self, cond_tokens: list[torch.Tensor], encode_flags: Optional[list[bool]] = None) -> list[torch.Tensor]:
         if not cond_tokens or self.condition_encoder_depth <= 0:
             return cond_tokens
-        encoded = torch.cat(cond_tokens, dim=1)
+        if encode_flags is None:
+            encode_flags = [True] * len(cond_tokens)
+        if len(encode_flags) != len(cond_tokens):
+            raise ValueError("encode_flags length must match cond_tokens length")
+        encoder_inputs = [tokens for tokens, should_encode in zip(cond_tokens, encode_flags) if should_encode]
+        decoder_only = [tokens for tokens, should_encode in zip(cond_tokens, encode_flags) if not should_encode]
+        if not encoder_inputs:
+            return decoder_only
+        encoded = torch.cat(encoder_inputs, dim=1)
         encoded_by_layer = []
         for block in self.condition_encoder:
             encoded = block(encoded)
             encoded_by_layer.append(encoded)
         encoded_by_layer[-1] = self.condition_encoder_norm(encoded_by_layer[-1])
+        if decoder_only:
+            decoder_context = torch.cat(decoder_only, dim=1)
+            encoded_by_layer = [torch.cat([layer_tokens, decoder_context], dim=1) for layer_tokens in encoded_by_layer]
         return encoded_by_layer
 
     def _decoder_context_for_block(
@@ -853,9 +889,8 @@ class WoFSDiffMAE(nn.Module):
         precip_visible: Optional[torch.Tensor] = None,
         precip_mask: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
-        return self._encode_condition_tokens(
-            self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
-        )
+        cond_tokens, encode_flags = self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        return self._encode_condition_tokens(cond_tokens, encode_flags)
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None:
@@ -932,8 +967,9 @@ class WoFSDiffMAE(nn.Module):
         precip_mask: torch.Tensor,
         precip_visible: Optional[torch.Tensor] = None,
         cond_tokens: Optional[list[torch.Tensor]] = None,
+        inpaint_mode: str = "masked_only",
     ):
-        x_t = self._compose_inpaint_state(x_t, t, precip_mask, precip_visible)
+        x_t = self._prepare_reverse_state(x_t, t, precip_mask, precip_visible, inpaint_mode=inpaint_mode)
         _, x_start = self.model_predictions(
             x_t,
             t,
@@ -1003,9 +1039,10 @@ class WoFSDiffMAE(nn.Module):
         eta: float,
         precip_visible: Optional[torch.Tensor] = None,
         cond_tokens: Optional[list[torch.Tensor]] = None,
+        inpaint_mode: str = "masked_only",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         time_cond = torch.full((img.shape[0],), time, device=img.device, dtype=torch.long)
-        img = self._compose_inpaint_state(img, time_cond, precip_mask, precip_visible)
+        img = self._prepare_reverse_state(img, time_cond, precip_mask, precip_visible, inpaint_mode=inpaint_mode)
         pred_noise, x_start = self.model_predictions(
             img,
             time_cond,
@@ -1095,6 +1132,7 @@ class WoFSDiffMAE(nn.Module):
         repaint_jump_n_sample: int = 10,
         return_all_timesteps: bool = False,
         clamp_final_visible: bool = True,
+        inpaint_mode: str = "masked_only",
     ) -> torch.Tensor:
         del clamp_final_visible
         first = next(iter(cond.values()))
@@ -1124,6 +1162,7 @@ class WoFSDiffMAE(nn.Module):
                     precip_mask,
                     precip_visible=precip_visible,
                     cond_tokens=cond_tokens,
+                    inpaint_mode=inpaint_mode,
                 )
                 noise = torch.randn_like(img) if time > 0 else torch.zeros_like(img)
                 img = model_mean + (0.5 * model_log_variance).exp() * noise
@@ -1152,6 +1191,7 @@ class WoFSDiffMAE(nn.Module):
                     precip_mask,
                     precip_visible=precip_visible,
                     cond_tokens=cond_tokens,
+                    inpaint_mode=inpaint_mode,
                 )
                 noise = torch.randn_like(img) if time > 0 else torch.zeros_like(img)
                 img = model_mean + (0.5 * model_log_variance).exp() * noise
@@ -1178,6 +1218,7 @@ class WoFSDiffMAE(nn.Module):
                         eta,
                         precip_visible=precip_visible,
                         cond_tokens=cond_tokens,
+                        inpaint_mode=inpaint_mode,
                     )
                     if resample_idx < repaint_n_sample - 1:
                         alpha = self.alphas_cumprod[time].to(device=img.device, dtype=img.dtype)
@@ -1200,6 +1241,7 @@ class WoFSDiffMAE(nn.Module):
                 eta,
                 precip_visible=precip_visible,
                 cond_tokens=cond_tokens,
+                inpaint_mode=inpaint_mode,
             )
             if imgs is not None:
                 imgs.append(img)

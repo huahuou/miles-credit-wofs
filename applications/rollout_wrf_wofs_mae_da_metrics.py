@@ -512,6 +512,7 @@ def rollout_one_timestep_with_metrics(
     repaint_jump_n_sample = int(_eval_conf(conf).get("repaint_jump_n_sample", 10))
     clamp_final_visible = bool(_eval_conf(conf).get("clamp_final_visible_precip", False))
     save_trajectory = bool(_eval_conf(conf).get("save_denoise_trajectory", False))
+    inpaint_mode = str(_eval_conf(conf).get("inpaint_mode", "masked_only"))
     _, ensemble_size, _, _ = _resolve_eval_ensemble_size(conf)
     eval_batch_size = _resolve_eval_batch_size(conf, ensemble_size)
 
@@ -573,6 +574,7 @@ def rollout_one_timestep_with_metrics(
                 repaint_jump_length=repaint_jump_length,
                 repaint_jump_n_sample=repaint_jump_n_sample,
                 clamp_final_visible=clamp_final_visible,
+                inpaint_mode=inpaint_mode,
                 return_all_timesteps=save_trajectory,
             )
 
