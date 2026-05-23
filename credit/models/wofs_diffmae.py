@@ -539,6 +539,9 @@ class WoFSDiffMAE(nn.Module):
         self.default_inpaint_mode = str(diffusion_conf.get("inpaint_mode", "masked_only")).strip().lower()
         if self.default_inpaint_mode not in {"masked_only", "masked", "no_visible_noise", "compose_visible", "visible_noise", "inpaint", "noisy_visible"}:
             raise ValueError(f"Unsupported diffusion.inpaint_mode: {self.default_inpaint_mode!r}")
+        self.default_decoder_input_mode = str(diffusion_conf.get("decoder_input_mode", self.default_inpaint_mode)).strip().lower()
+        if self.default_decoder_input_mode not in {"masked_only", "masked", "no_visible_noise", "compose_visible", "visible_noise", "inpaint", "noisy_visible"}:
+            raise ValueError(f"Unsupported diffusion.decoder_input_mode: {self.default_decoder_input_mode!r}")
         self.num_timesteps = int(diffusion_conf.get("timesteps", 1000))
         self.sampling_timesteps = int(diffusion_conf.get("sampling_timesteps", self.num_timesteps))
         self.ddim_sampling_eta = float(diffusion_conf.get("ddim_sampling_eta", 0.0))
@@ -654,15 +657,43 @@ class WoFSDiffMAE(nn.Module):
             tokens = tokens + self.mask_token * token_mask[:, :, None].to(tokens.dtype)
         return tokens
 
+    def _prepare_decoder_input(
+        self,
+        noisy_precip: torch.Tensor,
+        precip_mask: torch.Tensor,
+        decoder_input_mode: Optional[str] = None,
+        precip_visible: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        mode = self.default_decoder_input_mode if decoder_input_mode is None else str(decoder_input_mode).strip().lower()
+        if mode in {"compose_visible", "visible_noise", "inpaint", "noisy_visible"}:
+            if precip_visible is None:
+                return noisy_precip
+            if t is None:
+                return noisy_precip
+            return self._compose_inpaint_state(noisy_precip, t, precip_mask, precip_visible)
+        if mode in {"masked_only", "masked", "no_visible_noise"}:
+            return self._masked_diffusion_state(noisy_precip, precip_mask)
+        raise ValueError(f"Unsupported decoder_input_mode: {decoder_input_mode!r}")
+
     def _level_forward_with_condition_tokens(
         self,
         noisy_precip: torch.Tensor,
         t: torch.Tensor,
         cond_tokens: list[torch.Tensor],
         precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
+        decoder_input_mode: Optional[str] = None,
     ) -> torch.Tensor:
         b, _, orig_h, orig_w = noisy_precip.shape
-        target_tokens = self._precip_3d_tokens(noisy_precip, precip_mask, use_visible=False)
+        decoder_input = self._prepare_decoder_input(
+            noisy_precip,
+            precip_mask,
+            decoder_input_mode=decoder_input_mode,
+            precip_visible=precip_visible,
+            t=t,
+        )
+        target_tokens = self._precip_3d_tokens(decoder_input, precip_mask, use_visible=False)
         tokens = self._decode_target_tokens(target_tokens, cond_tokens, t)
         patches = self.precip_token_out_proj(tokens)
         p_d, p_h, p_w = self.precip_patch_size
@@ -935,13 +966,20 @@ class WoFSDiffMAE(nn.Module):
         precip_visible: Optional[torch.Tensor] = None,
         cond_tokens: Optional[list[torch.Tensor]] = None,
         compose_inpaint: bool = True,
+        decoder_input_mode: Optional[str] = None,
     ):
         if compose_inpaint:
             x_t = self._compose_inpaint_state(x_t, t, precip_mask, precip_visible)
         if cond_tokens is None:
             model_out = self.forward(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         else:
-            model_out = self._forward_with_condition_tokens(x_t, t, cond_tokens, precip_mask)
+            model_out = self._forward_with_condition_tokens(
+                x_t,
+                t,
+                cond_tokens,
+                precip_mask,
+                decoder_input_mode=decoder_input_mode,
+            )
         if self.objective == "pred_noise":
             pred_noise = model_out
             pred_x_start = self.predict_start_from_noise(x_t, t, pred_noise)
@@ -981,6 +1019,7 @@ class WoFSDiffMAE(nn.Module):
             precip_visible=precip_visible,
             cond_tokens=cond_tokens,
             compose_inpaint=False,
+            decoder_input_mode=inpaint_mode,
         )
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x_t, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
@@ -1054,6 +1093,7 @@ class WoFSDiffMAE(nn.Module):
             precip_visible=precip_visible,
             cond_tokens=cond_tokens,
             compose_inpaint=False,
+            decoder_input_mode=inpaint_mode,
         )
 
         if time_next < 0:
@@ -1111,7 +1151,13 @@ class WoFSDiffMAE(nn.Module):
         precip_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         cond_tokens = self._condition_tokens_once(cond, precip_visible=precip_visible, precip_mask=precip_mask)
-        return self._level_forward_with_condition_tokens(noisy_precip, t, cond_tokens, precip_mask)
+        return self._level_forward_with_condition_tokens(
+            noisy_precip,
+            t,
+            cond_tokens,
+            precip_mask,
+            precip_visible=precip_visible,
+        )
 
     def _forward_with_condition_tokens(
         self,
@@ -1119,8 +1165,17 @@ class WoFSDiffMAE(nn.Module):
         t: torch.Tensor,
         cond_tokens: list[torch.Tensor],
         precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor] = None,
+        decoder_input_mode: Optional[str] = None,
     ) -> torch.Tensor:
-        return self._level_forward_with_condition_tokens(noisy_precip, t, cond_tokens, precip_mask)
+        return self._level_forward_with_condition_tokens(
+            noisy_precip,
+            t,
+            cond_tokens,
+            precip_mask,
+            precip_visible=precip_visible,
+            decoder_input_mode=decoder_input_mode,
+        )
 
     @torch.no_grad()
     def sample_precip(

@@ -688,6 +688,24 @@ def test_mae_dataset_reduces_reflectivity_levels_for_16_level_config():
     assert norm.shape == (16, 3, 4)
 
 
+def test_diffmae_decoder_input_modes_switch_between_masked_only_and_compose_visible():
+    model = _build_simple_diffmae_model(
+        diffusion={"objective": "pred_x0", "timesteps": 4, "sampling_timesteps": 4, "inpaint_mode": "masked_only"}
+    )
+    model.default_decoder_input_mode = "masked_only"
+    precip = torch.randn(1, model.channels, 8, 8)
+    t = torch.tensor([1], dtype=torch.long)
+    mask = torch.zeros(1, 4, dtype=torch.float32)
+    mask[:, 0] = 1.0
+
+    masked = model._prepare_decoder_input(precip, mask, decoder_input_mode="masked_only")
+    composed = model._prepare_decoder_input(precip, mask, decoder_input_mode="compose_visible", precip_visible=precip, t=t)
+
+    pixel_mask = model._masked_diffusion_state(torch.ones_like(precip), mask)
+    assert torch.allclose(masked, precip * pixel_mask)
+    assert not torch.allclose(composed, masked)
+
+
 def test_grouped_mask_bundle_round_trip_and_runtime_conversion(tmp_path):
     bundle = build_grouped_patch_masks(
         n_times=3,
