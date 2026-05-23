@@ -50,6 +50,7 @@ Config keys (conf["data"]):
 
 import logging
 import time
+import copy
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
@@ -376,7 +377,50 @@ class WoFSMAEDataset(Dataset):
         stats = np.asarray(self._mean_values[var_name])
         if stats.ndim != 1:
             return None
-        return self._pick_axis_by_size(np.asarray(values), int(stats.shape[0]))
+        values_arr = np.asarray(values)
+        axis = self._pick_axis_by_size(values_arr, int(stats.shape[0]))
+        if axis is not None:
+            return axis
+        if var_name in CONCENTRATION_VARS and values_arr.ndim >= 3:
+            target_levels = min(int(self._prognostic_levels), int(stats.shape[0]))
+            if values_arr.ndim == 3 and values_arr.shape[0] == target_levels:
+                return 0
+            return self._pick_axis_by_size(values_arr, target_levels)
+        return None
+
+    def _level_slice_for_values(self, values: np.ndarray, var_name: str) -> tuple[int | None, int | None]:
+        level_axis = self._find_level_axis(np.asarray(values), var_name)
+        if level_axis is None:
+            return None, None
+        n_levels = int(np.asarray(values).shape[level_axis])
+        return level_axis, n_levels
+
+    @staticmethod
+    def _truncate_level_vector(values, n_levels: int):
+        arr = np.asarray(values)
+        if arr.ndim == 1 and arr.shape[0] > int(n_levels):
+            return arr[: int(n_levels)]
+        return values
+
+    def _spec_for_values(self, spec: dict, values: np.ndarray, var_name: str) -> dict:
+        _, n_levels = self._level_slice_for_values(values, var_name)
+        if n_levels is None:
+            return spec
+        out = copy.copy(spec)
+        for key in ("alpha", "mu", "sigma"):
+            out[key] = self._truncate_level_vector(out.get(key), n_levels)
+        if isinstance(out.get("levels"), list) and len(out["levels"]) > n_levels:
+            out["levels"] = out["levels"][:n_levels]
+        if isinstance(out.get("status"), list) and len(out["status"]) > n_levels:
+            out["status"] = out["status"][:n_levels]
+        return out
+
+    def _stats_for_values(self, stats: np.ndarray, values: np.ndarray, var_name: str) -> np.ndarray:
+        stats_arr = np.asarray(stats)
+        _, n_levels = self._level_slice_for_values(values, var_name)
+        if n_levels is not None and stats_arr.ndim == 1 and stats_arr.shape[0] > n_levels:
+            return stats_arr[:n_levels]
+        return stats_arr
 
     def _get_concentration_level_op(self, var_name: str, n_levels: int) -> dict | None:
         if var_name not in CONCENTRATION_VARS or not isinstance(self._concentration_level_ops, dict):
@@ -396,6 +440,15 @@ class WoFSMAEDataset(Dataset):
 
     def reduce_levels_for_var(self, var_values: np.ndarray, var_name: str, is_precip: bool = False) -> np.ndarray:
         values_arr = np.asarray(var_values)
+        if var_name in self.reflectivity_vars:
+            level_axis = self._find_level_axis(values_arr, var_name)
+            if level_axis is None:
+                return values_arr
+            level_first = np.moveaxis(values_arr, level_axis, 0).copy()
+            n_levels = level_first.shape[0]
+            if self._prognostic_levels < n_levels:
+                level_first = level_first[: self._prognostic_levels]
+            return np.moveaxis(level_first, 0, level_axis)
         if (not is_precip) or (var_name not in CONCENTRATION_VARS):
             return values_arr
         level_axis = self._find_level_axis(values_arr, var_name)
@@ -423,7 +476,7 @@ class WoFSMAEDataset(Dataset):
                 raise KeyError(f"Missing concentration transform spec for variable {var_name}")
             return forward_concentration_transform_numpy(
                 var_values,
-                spec,
+                self._spec_for_values(spec, var_values, var_name),
                 level_axis=self._find_level_axis(np.asarray(var_values), var_name),
             )
         return var_values
@@ -433,12 +486,15 @@ class WoFSMAEDataset(Dataset):
             mode = self._concentration_normalization_mode
             if mode == "transform_only":
                 return transformed_values
-            std = self._broadcast_stats(self._std_values[var_name], transformed_values)
+            std_values = self._stats_for_values(self._std_values[var_name], transformed_values, var_name)
+            std = self._broadcast_stats(std_values, transformed_values)
             if mode == "scale_only":
                 return transformed_values / std
 
-        mean = self._broadcast_stats(self._mean_values[var_name], transformed_values)
-        std = self._broadcast_stats(self._std_values[var_name], transformed_values)
+        mean_values = self._stats_for_values(self._mean_values[var_name], transformed_values, var_name)
+        std_values = self._stats_for_values(self._std_values[var_name], transformed_values, var_name)
+        mean = self._broadcast_stats(mean_values, transformed_values)
+        std = self._broadcast_stats(std_values, transformed_values)
         return (transformed_values - mean) / std
 
     def _normalize_array(self, arr: np.ndarray, var_name: str) -> np.ndarray:
@@ -476,7 +532,11 @@ class WoFSMAEDataset(Dataset):
         parts = []
         for var in var_list:
             raw = chunk[var].isel(time=time_idx).values  # (level, H, W)
-            raw = self.reduce_levels_for_var(raw, var_name=var, is_precip=var in self.precip_vars)
+            raw = self.reduce_levels_for_var(
+                raw,
+                var_name=var,
+                is_precip=(var in self.precip_vars) or (var in self.reflectivity_vars),
+            )
             norm = self._normalize_array(raw, var)
             parts.append(norm.astype(np.float32))
         return np.concatenate(parts, axis=0)  # (C=levels*nvars, H, W)

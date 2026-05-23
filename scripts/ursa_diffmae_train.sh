@@ -33,7 +33,7 @@ NPROC_PER_NODE_OVERRIDE="${NPROC_PER_NODE_OVERRIDE:-}"
 
 CONDA_ENV="${CONDA_ENV:-credit-wofs}"
 PROJECT_DIR="${PROJECT_DIR:-/home/Zhanxiang.Hua/miles-credit-wofs}"
-CONFIG="${PROJECT_DIR}/config/wofs_diffmae_4x4_patch_height_mask.yml"
+CONFIG="${PROJECT_DIR}/config/wofs_diffmae_4x4_patch_16level.yml"
 ##CONFIG="${CONFIG:-/scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev3_1/model.yml}"
 TRAINING_SCRIPT="${TRAINING_SCRIPT:-applications/train_wrf_wofs_mae.py}"
 

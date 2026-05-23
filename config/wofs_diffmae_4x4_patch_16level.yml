@@ -93,21 +93,21 @@ model:
   target_modality: precip
   decoder_type: cross_self
   precip_patch_size: [4, 4, 4]
-  condition_encoder_depth: 4
-  condition_encoder_mlp_ratio: 4.0
+  condition_encoder_depth: 3
+  condition_encoder_mlp_ratio: 3.0
   condition_encoder_inputs: visible_precip
-  target_attention_window_size: [2, 9, 9]
+  target_attention_window_size: [3, 9, 9]
   anti_patch_refiner:
-    enabled: false
+    enabled: true
     hidden_channels: 48
-    depth: 2
+    depth: 1
     kernel_size: 5
     groups: 1
   patch_size: 4
   surface_forcing_stride: 16
   image_size: [300, 300]
   embed_dim: 192
-  depth: 4
+  depth: 3
   num_heads: 8
   mlp_ratio: 4.0
   drop_path_rate: 0.05
@@ -151,7 +151,7 @@ trainer:
   amp: true
   grad_max_norm: 1.0
   grad_accum_every: 1
-  precip_mask_ratio: [0.6, 1.0]
+  precip_mask_ratio: [0.6, 0.9]
   precip_mask_mode: cube_patch
   visible_precip_conditioning: true
   val_mask_ratio: 0.7
@@ -162,7 +162,7 @@ trainer:
     every_epoch: true
     first_step: 1
     dir: denoise_snapshots
-    save_snapshot: true
+    save_snapshot: false
     save_figure: true
     save_sampling_figure: true
     sampling_use_visible_precip: true

@@ -634,6 +634,60 @@ def test_mae_dataset_uses_da_zero_inflated_normalization():
     assert np.allclose(out, expected, atol=1.0e-6, rtol=1.0e-6)
 
 
+def test_mae_dataset_truncates_concentration_stats_for_reduced_levels():
+    payload = {
+        "transform_type": "zero_inflated_lognormal_probit",
+        "zero_floor": 1.0e-11,
+        "probit_eps": 1.0e-6,
+        "variables": {
+            "QRAIN": {
+                "clip_max": 1.0,
+                "fallback_positive_fit": {"mu": -10.0, "sigma": 1.0},
+                "levels": [
+                    {"status": "ok", "alpha": 0.9, "mu": -9.0, "sigma": 0.8},
+                    {"status": "ok", "alpha": 0.8, "mu": -8.0, "sigma": 1.2},
+                    {"status": "ok", "alpha": 0.7, "mu": -7.0, "sigma": 1.5},
+                ],
+            }
+        },
+    }
+    spec = parse_concentration_transform_payload(payload, variables={"QRAIN"})["QRAIN"]
+    ds = WoFSMAEDataset.__new__(WoFSMAEDataset)
+    ds.precip_vars = ["QRAIN"]
+    ds._prognostic_levels = 2
+    ds._mean_values = {"QRAIN": np.array([0.1, -0.2, 0.3], dtype=np.float64)}
+    ds._std_values = {"QRAIN": np.array([0.9, 1.1, 1.3], dtype=np.float64)}
+    ds._concentration_transform_specs = {"QRAIN": spec}
+    ds._concentration_normalization_mode = "zscore"
+    ds._concentration_level_ops = {"QRAIN": {"ceiling_level": 2, "mode": "cutoff"}}
+
+    raw = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4) * 1.0e-6
+    out = ds._normalize_array(raw, "QRAIN")
+    latent = forward_concentration_transform_numpy(raw, ds._spec_for_values(spec, raw, "QRAIN"), level_axis=0)
+    expected = (latent - ds._mean_values["QRAIN"][:2, None, None]) / ds._std_values["QRAIN"][:2, None, None]
+    assert out.shape == raw.shape
+    assert np.allclose(out, expected, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_mae_dataset_reduces_reflectivity_levels_for_16_level_config():
+    ds = WoFSMAEDataset.__new__(WoFSMAEDataset)
+    ds.precip_vars = ["QRAIN"]
+    ds.reflectivity_vars = ["REFL_10CM"]
+    ds._prognostic_levels = 16
+    ds._mean_values = {"REFL_10CM": np.zeros(17, dtype=np.float64)}
+    ds._std_values = {"REFL_10CM": np.ones(17, dtype=np.float64)}
+    ds._concentration_transform_specs = {}
+    ds._concentration_normalization_mode = "zscore"
+    ds._concentration_level_ops = {}
+
+    raw = np.ones((17, 3, 4), dtype=np.float32)
+    reduced = ds.reduce_levels_for_var(raw, "REFL_10CM", is_precip=True)
+    norm = ds._normalize_array(reduced, "REFL_10CM")
+
+    assert reduced.shape == (16, 3, 4)
+    assert norm.shape == (16, 3, 4)
+
+
 def test_grouped_mask_bundle_round_trip_and_runtime_conversion(tmp_path):
     bundle = build_grouped_patch_masks(
         n_times=3,
