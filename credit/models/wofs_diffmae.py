@@ -756,6 +756,30 @@ class WoFSDiffMAE(nn.Module):
         pixel_mask = pixel_mask.repeat_interleave(self.level_variable_count, dim=1)
         return x * pixel_mask
 
+    def _precip_pixel_mask(self, precip_mask: torch.Tensor, height: int, width: int, dtype: torch.dtype) -> torch.Tensor:
+        pixel_mask = self.expand_patch_mask(precip_mask, height, width).to(device=precip_mask.device, dtype=dtype)
+        return pixel_mask.repeat_interleave(self.level_variable_count, dim=1)
+
+    def _compose_inpaint_state(
+        self,
+        reverse_state: torch.Tensor,
+        t: torch.Tensor,
+        precip_mask: torch.Tensor,
+        precip_visible: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Use noisy known pixels plus the current reverse state on masked pixels."""
+        if precip_visible is None:
+            return reverse_state
+        pixel_mask = self._precip_pixel_mask(
+            precip_mask,
+            reverse_state.shape[-2],
+            reverse_state.shape[-1],
+            reverse_state.dtype,
+        )
+        known_noise = torch.randn_like(precip_visible)
+        known_state = self.q_sample(precip_visible, t, known_noise).to(reverse_state.dtype)
+        return known_state * (1.0 - pixel_mask) + reverse_state * pixel_mask
+
     def _decode_target_tokens(
         self,
         target_tokens: torch.Tensor,
@@ -872,8 +896,10 @@ class WoFSDiffMAE(nn.Module):
         precip_mask: torch.Tensor,
         precip_visible: Optional[torch.Tensor] = None,
         cond_tokens: Optional[list[torch.Tensor]] = None,
+        compose_inpaint: bool = True,
     ):
-        x_t = self._masked_diffusion_state(x_t, precip_mask)
+        if compose_inpaint:
+            x_t = self._compose_inpaint_state(x_t, t, precip_mask, precip_visible)
         if cond_tokens is None:
             model_out = self.forward(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         else:
@@ -907,6 +933,7 @@ class WoFSDiffMAE(nn.Module):
         precip_visible: Optional[torch.Tensor] = None,
         cond_tokens: Optional[list[torch.Tensor]] = None,
     ):
+        x_t = self._compose_inpaint_state(x_t, t, precip_mask, precip_visible)
         _, x_start = self.model_predictions(
             x_t,
             t,
@@ -914,6 +941,7 @@ class WoFSDiffMAE(nn.Module):
             precip_mask,
             precip_visible=precip_visible,
             cond_tokens=cond_tokens,
+            compose_inpaint=False,
         )
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x_t, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
@@ -977,6 +1005,7 @@ class WoFSDiffMAE(nn.Module):
         cond_tokens: Optional[list[torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         time_cond = torch.full((img.shape[0],), time, device=img.device, dtype=torch.long)
+        img = self._compose_inpaint_state(img, time_cond, precip_mask, precip_visible)
         pred_noise, x_start = self.model_predictions(
             img,
             time_cond,
@@ -984,10 +1013,10 @@ class WoFSDiffMAE(nn.Module):
             precip_mask,
             precip_visible=precip_visible,
             cond_tokens=cond_tokens,
+            compose_inpaint=False,
         )
 
         if time_next < 0:
-            x_start = self._masked_diffusion_state(x_start, precip_mask)
             return x_start, x_start, pred_noise
 
         alpha_t = self.alphas_cumprod[time].to(device=img.device, dtype=img.dtype)
@@ -1021,7 +1050,7 @@ class WoFSDiffMAE(nn.Module):
             t = torch.randint(0, self.num_timesteps, (b,), device=x_start.device).long()
         if noise is None:
             noise = torch.randn_like(x_start)
-        x_t = self._masked_diffusion_state(self.q_sample(x_start, t, noise), precip_mask)
+        x_t = self.q_sample(x_start, t, noise)
         model_out = self.forward(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         if self.objective == "pred_noise":
             target = noise
@@ -1029,13 +1058,8 @@ class WoFSDiffMAE(nn.Module):
             target = x_start
         else:
             target = self.predict_v(x_start, t, noise)
-        pixel_mask = self.expand_patch_mask(precip_mask, x_start.shape[-2], x_start.shape[-1]).to(x_start.dtype)
-        pixel_mask = pixel_mask.repeat_interleave(self.level_variable_count, dim=1)
         loss_raw = (model_out - target) ** 2
-        denom = pixel_mask.sum()
-        if pixel_mask.shape[1] == 1:
-            denom = denom * x_start.shape[1]
-        loss = (loss_raw * pixel_mask).sum() / denom.clamp_min(1.0)
+        loss = loss_raw.mean()
         return {"loss": loss, "model_out": model_out, "target": target, "x_t": x_t, "t": t}
 
     def forward(

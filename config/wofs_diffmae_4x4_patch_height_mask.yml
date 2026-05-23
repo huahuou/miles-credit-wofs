@@ -11,7 +11,7 @@
 # - condition_encoder_depth is 4; decoder depth is independent.
 # - target_attention_window_size limits target self-attention to local 15x15 patch windows.
 
-save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev6
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_diffmae_pretrain_4x4patch_rev7
 seed: 1002
 data:
   save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip

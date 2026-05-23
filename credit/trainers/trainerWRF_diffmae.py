@@ -145,10 +145,8 @@ class TrainerDiffMAE(BaseTrainer):
 
         if sample is not None:
             sample_1 = sample[0]
-            sample_mask = mask_img[0].expand_as(sample_1)
-            composite_sample = sample_1 * sample_mask + target_1 * (1.0 - sample_mask)
-            self._plot_field(axes[0, 5], composite_sample.mean(dim=0), "composite sample mean")
-            self._plot_field(axes[1, 5], composite_sample[ch], f"composite sample ch{ch}")
+            self._plot_field(axes[0, 5], sample_1.mean(dim=0), "sample mean")
+            self._plot_field(axes[1, 5], sample_1[ch], f"sample ch{ch}")
 
         logger.info("Denoise snapshot figure populated: path=%s elapsed=%.3fs", out_path, time.perf_counter() - t_fig)
         t_save = time.perf_counter()
