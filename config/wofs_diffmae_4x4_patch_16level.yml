@@ -117,6 +117,7 @@ model:
     objective: pred_x0
     beta_schedule: sigmoid
     ddim_sampling_eta: 0.01
+    inpaint_mode: compose_visible
 trainer:
   type: standard-wrf-diffmae
   mode: ddp
@@ -169,7 +170,6 @@ trainer:
     sampling_timesteps: 100
     channel: 3
     sampler: ddim
-    inpaint_mode: masked_only
   load_weights: false
   load_optimizer: false
   load_scheduler: false
@@ -203,7 +203,7 @@ eval:
   precip_mask_ratio: 0.75
   precip_mask_mode: cube_patch
   visible_precip_conditioning: true
-  inpaint_mode: masked_only
+  inpaint_mode: compose_visible
   clamp_visible_precip: true
   clamp_final_visible_precip: false
   visible_blend_width_px: 0

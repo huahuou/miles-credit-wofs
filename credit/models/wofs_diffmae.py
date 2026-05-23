@@ -536,6 +536,9 @@ class WoFSDiffMAE(nn.Module):
         self.objective = diffusion_conf.get("objective", "pred_v")
         if self.objective not in {"pred_noise", "pred_x0", "pred_v"}:
             raise ValueError(f"Unsupported diffusion objective: {self.objective}")
+        self.default_inpaint_mode = str(diffusion_conf.get("inpaint_mode", "masked_only")).strip().lower()
+        if self.default_inpaint_mode not in {"masked_only", "masked", "no_visible_noise", "compose_visible", "visible_noise", "inpaint", "noisy_visible"}:
+            raise ValueError(f"Unsupported diffusion.inpaint_mode: {self.default_inpaint_mode!r}")
         self.num_timesteps = int(diffusion_conf.get("timesteps", 1000))
         self.sampling_timesteps = int(diffusion_conf.get("sampling_timesteps", self.num_timesteps))
         self.ddim_sampling_eta = float(diffusion_conf.get("ddim_sampling_eta", 0.0))
@@ -1132,9 +1135,11 @@ class WoFSDiffMAE(nn.Module):
         repaint_jump_n_sample: int = 10,
         return_all_timesteps: bool = False,
         clamp_final_visible: bool = True,
-        inpaint_mode: str = "masked_only",
+        inpaint_mode: Optional[str] = None,
     ) -> torch.Tensor:
         del clamp_final_visible
+        if inpaint_mode is None:
+            inpaint_mode = self.default_inpaint_mode
         first = next(iter(cond.values()))
         b, _, h, w = first.shape
         shape = (b, self.channels, h, w)

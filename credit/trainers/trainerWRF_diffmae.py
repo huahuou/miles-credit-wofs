@@ -199,7 +199,8 @@ class TrainerDiffMAE(BaseTrainer):
                 sampling_steps = int(snapshot_conf.get("sampling_timesteps", 8))
                 sample_visible = batch["precip"][:1] if bool(snapshot_conf.get("sampling_use_visible_precip", True)) else None
                 sampler = str(snapshot_conf.get("sampler", "ddim"))
-                inpaint_mode = str(snapshot_conf.get("inpaint_mode", "masked_only"))
+                inpaint_mode = snapshot_conf.get("inpaint_mode", None)
+                log_inpaint_mode = inpaint_mode if inpaint_mode is not None else getattr(model, "default_inpaint_mode", "masked_only")
                 eta = snapshot_conf.get("ddim_sampling_eta", None)
                 t_sample = time.perf_counter()
                 logger.info(
@@ -207,7 +208,7 @@ class TrainerDiffMAE(BaseTrainer):
                     sampler,
                     sampling_steps,
                     sample_visible is not None,
-                    inpaint_mode,
+                    log_inpaint_mode,
                 )
                 sample = model.sample_precip(
                     self._condition_dict({k: v[:1] for k, v in batch.items()}),

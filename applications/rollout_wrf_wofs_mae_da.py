@@ -340,7 +340,7 @@ def rollout_one_timestep(
     repaint_jump_length = int(eval_conf.get("repaint_jump_length", 10))
     repaint_jump_n_sample = int(eval_conf.get("repaint_jump_n_sample", 10))
     save_trajectory = bool(eval_conf.get("save_denoise_trajectory", False))
-    inpaint_mode = str(eval_conf.get("inpaint_mode", "masked_only"))
+    inpaint_mode = eval_conf.get("inpaint_mode", None)
 
     cond = _build_condition_dict(
         batch,
