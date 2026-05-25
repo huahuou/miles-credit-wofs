@@ -1,0 +1,229 @@
+# WoFS pure diffusion 4x4 patch configuration for a 16-level precip target.
+#
+# This is a template derived from config/wofs_diffmae_4x4_patch_height_mask.yml.
+# It keeps the same 4x4 horizontal patch size but changes the precip vertical
+# depth to 16 so a 4-level 3D cube patch can divide the level axis without padding.
+
+save_loc: /scratch3/NAGAPE/gpu-ai4wp/Zhanxiang.Hua/credit_runs/wofs_pure_diffusion_4x4patch_16level_v2
+seed: 1002
+data:
+  save_loc: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/cases/wofs_*.zarr.zip
+  mean_path: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/mean.nc
+  std_path: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/std.nc
+  log_transform_params_json: /scratch5/purged/Zhanxiang.Hua/wofs_preprocess_to_credit_0413/stats3/zero_inflated_transform_params.json
+  concentration_normalization_mode: zscore
+  background_vars:
+  - T
+  - QVAPOR
+  - U
+  - V
+  - W
+  - GEOPOT
+  precip_vars:
+  - QRAIN
+  - QNRAIN
+  - QHAIL
+  - QNHAIL
+  - QGRAUP
+  - QNGRAUPEL
+  - QSNOW
+  - QNSNOW
+  reflectivity_vars:
+  - REFL_10CM
+  surface_vars: []
+  dynamic_forcing_variables:
+  - cos_latitude
+  - sin_latitude
+  - cos_longitude
+  - sin_longitude
+  - cos_julian_day
+  - sin_julian_day
+  - cos_local_time
+  - sin_local_time
+  - cos_solar_zenith_angle
+  - insolation
+  - XLAND
+  - HGT
+  levels: 16
+  prognostic_levels: 16
+  mae_pad_to: 300
+  mae_include_t1_refl: false
+  concentration_level_ops:
+    QRAIN: {ceiling_level: 16, mode: cutoff}
+    QNRAIN: {ceiling_level: 16, mode: cutoff}
+    QHAIL: {ceiling_level: 16, mode: cutoff}
+    QNHAIL: {ceiling_level: 16, mode: cutoff}
+    QGRAUP: {ceiling_level: 16, mode: cutoff}
+    QNGRAUPEL: {ceiling_level: 16, mode: cutoff}
+    QSNOW: {ceiling_level: 16, mode: cutoff}
+    QNSNOW: {ceiling_level: 16, mode: cutoff}
+  train_years: [2019, 2020]
+  valid_years: [2021]
+  train_date_range: ['20190101', '20201231']
+  valid_date_range: ['20210415', '20210430']
+  zarr_time_chunk: 2
+  max_open_files_per_worker: 2
+  max_dataset_open_retries: 3
+  scaler_type: std-wrf
+  variables: []
+  surface_variables: []
+  forcing_variables: []
+  static_variables: []
+  diagnostic_variables: []
+  all_varnames: []
+  history_len: 0
+  valid_history_len: 0
+  forecast_len: 0
+  valid_forecast_len: 0
+  target_start_step: 0
+  lead_time_periods: 1
+  static_first: false
+model:
+  type: wofs-pure-diffusion
+  modality_channels:
+    background: 102
+    precip: 128
+    reflectivity: 16
+    surface: 0
+    forcing: 12
+  precip_grouping: level
+  precip_group_names: [QRAIN, QNRAIN, QHAIL, QNHAIL, QGRAUP, QNGRAUPEL, QSNOW, QNSNOW]
+  precip_group_channels: [16, 16, 16, 16, 16, 16, 16, 16]
+  conditioned_modalities: [background, forcing, reflectivity]
+  target_modality: precip
+  decoder_type: cross_self
+  precip_patch_size: [4, 4, 4]
+  condition_encoder_depth: 2
+  condition_encoder_mlp_ratio: 3.0
+  condition_encoder_inputs: reflectivity
+  pure_diffusion: true
+  pure_diffusion_encoder_modalities: [reflectivity]
+  target_attention_window_size: [3, 9, 9]
+  anti_patch_refiner:
+    enabled: false
+    hidden_channels: 48
+    depth: 1
+    kernel_size: 5
+    groups: 1
+  patch_size: 4
+  surface_forcing_stride: 16
+  image_size: [300, 300]
+  embed_dim: 256
+  depth: 2
+  num_heads: 8
+  mlp_ratio: 5.0
+  drop_path_rate: 0.05
+  diffusion:
+    timesteps: 1000
+    sampling_timesteps: 200
+    objective: pred_x0
+    beta_schedule: sigmoid
+    ddim_sampling_eta: 0.01
+    inpaint_mode: compose_visible
+trainer:
+  type: standard-wrf-pure-diffusion
+  mode: ddp
+  ddp_find_unused_parameters: false
+  use_file_locality_sampler: true
+  train_batch_size: 8
+  valid_batch_size: 8
+  epochs: 500
+  start_epoch: 0
+  stopping_patience: 100
+  batches_per_epoch: 7000
+  valid_batches_per_epoch: 100
+  reload_epoch: true
+  train_one_epoch: false
+  stop_after_epoch: false
+  thread_workers: 4
+  valid_thread_workers: 4
+  prefetch_factor: 1
+  pin_memory: false
+  persistent_workers: true
+  dataloader_timeout_s: 180
+  no_hang_debug: false
+  no_hang_thread_workers: 1
+  no_hang_valid_thread_workers: 1
+  no_hang_prefetch_factor: 1
+  no_hang_valid_prefetch_factor: 1
+  no_hang_pin_memory: false
+  no_hang_persistent_workers: true
+  no_hang_timeout_s: 180
+  learning_rate: 1.0e-05
+  weight_decay: 1.0e-05
+  amp: true
+  grad_max_norm: 1.0
+  grad_accum_every: 1
+  pure_diffusion_training: true
+  visible_precip_conditioning: false
+  denoise_snapshot:
+    enabled: true
+    every_steps: 3000
+    every_epoch: true
+    first_step: 1
+    dir: denoise_snapshots
+    save_snapshot: false
+    save_figure: true
+    save_sampling_figure: true
+    sampling_use_visible_precip: true
+    sampling_timesteps: 100
+    channel: 3
+    sampler: ddim
+  load_weights: false
+  load_optimizer: false
+  load_scheduler: false
+  load_scaler: false
+  save_backup_weights: true
+  save_best_weights: true
+  training_metric: valid_loss
+  training_metric_direction: min
+  skip_validation: false
+  save_metric_vars: [precip]
+  use_scheduler: true
+  scheduler:
+    scheduler_type: cosine-annealing-restarts
+    first_cycle_steps: 800
+    cycle_mult: 2.0
+    max_lr: 8.0e-04
+    min_lr: 1.0e-05
+    warmup_steps: 400
+    gamma: 0.85
+  residual_prediction: false
+  update_learning_rate: false
+eval:
+  mode: ddp
+  ensemble_size: 8
+  eval_batch_size: 8
+  sampler: ddim
+  sampling_timesteps: 100
+  ddim_sampling_eta: 0.02
+  repaint_jump_length: 10
+  repaint_jump_n_sample: 5
+  precip_mask_ratio: 0.75
+  precip_mask_mode: cube_patch
+  visible_precip_conditioning: true
+  inpaint_mode: compose_visible
+  clamp_visible_precip: true
+  clamp_final_visible_precip: false
+  visible_blend_width_px: 0
+  visible_blend_strength: 0.25
+  visible_blend_passes: 1
+  save_norm_output: true
+  overwrite: true
+  save_denoise_trajectory: false
+  trajectory_channels: [0, 16, 32, 48, 64, 80, 96, 112]
+  trajectory_stride: 25
+loss:
+  latitude_weights: ''
+  use_latitude_weights: false
+  use_variable_weights: false
+  training_loss: mse
+pbs:
+  queue: main
+  account: NAML0001
+  walltime: '12:00:00'
+  nodes: 1
+  ncpus_per_node: 128
+  ngpus_per_node: 4
+  mem: 240GB
+  jobname: wofs-pure-diffusion-16level

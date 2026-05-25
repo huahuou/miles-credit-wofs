@@ -1,4 +1,4 @@
-"""Conditional DiffMAE for WoFS precip random-mask inpainting."""
+"""Conditional diffusion / DiffMAE variants for WoFS precip inpainting."""
 
 from __future__ import annotations
 
@@ -360,7 +360,7 @@ class ResidualConvRefiner(nn.Module):
 
 
 class WoFSDiffMAE(nn.Module):
-    """Diffusion model that inpaints normalized precip conditioned on unmasked WoFS context."""
+    """Diffusion model that inpaints normalized precip conditioned on WoFS context."""
 
     def __init__(
         self,
@@ -384,6 +384,8 @@ class WoFSDiffMAE(nn.Module):
         condition_encoder_depth: int = 0,
         condition_encoder_mlp_ratio: Optional[float] = None,
         condition_encoder_inputs: str = "all",
+        pure_diffusion: bool = False,
+        pure_diffusion_encoder_modalities: Optional[list[str]] = None,
         target_attention_window_size: int = 0,
         anti_patch_refiner: Optional[dict] = None,
         diffusion: Optional[dict] = None,
@@ -430,11 +432,13 @@ class WoFSDiffMAE(nn.Module):
             self.target_attention_window_size = tuple(int(v) for v in target_attention_window_size)
         else:
             self.target_attention_window_size = int(target_attention_window_size)
+        self.pure_diffusion = bool(pure_diffusion)
+        self.pure_diffusion_encoder_modalities = list(pure_diffusion_encoder_modalities or ["reflectivity"])
         self.condition_encoder_depth = int(condition_encoder_depth)
         self.condition_encoder_inputs = str(condition_encoder_inputs).strip().lower()
-        if self.condition_encoder_inputs not in {"all", "visible_precip"}:
+        if self.condition_encoder_inputs not in {"all", "visible_precip", "reflectivity"}:
             raise ValueError(
-                "condition_encoder_inputs must be 'all' or 'visible_precip', "
+                "condition_encoder_inputs must be 'all', 'visible_precip', or 'reflectivity', "
                 f"got {condition_encoder_inputs!r}"
             )
         self.condition_encoder = nn.ModuleList()
@@ -639,7 +643,7 @@ class WoFSDiffMAE(nn.Module):
     def _precip_3d_tokens(
         self,
         x: torch.Tensor,
-        precip_mask: torch.Tensor,
+        precip_mask: Optional[torch.Tensor],
         use_visible: bool = False,
     ) -> torch.Tensor:
         if self.precip_token_adapter is None:
@@ -648,7 +652,7 @@ class WoFSDiffMAE(nn.Module):
         pos = self.visible_level_pos_emb if use_visible else self.target_level_pos_emb
         tokens = tokens + pos.to(device=x.device, dtype=x.dtype) + self.level_token_emb
 
-        if not use_visible:
+        if not use_visible and precip_mask is not None:
             token_mask = self.token_mask_from_precip_mask(precip_mask)
             if token_mask.dim() == 3:
                 token_mask = token_mask.reshape(token_mask.shape[0], -1)
@@ -660,12 +664,14 @@ class WoFSDiffMAE(nn.Module):
     def _prepare_decoder_input(
         self,
         noisy_precip: torch.Tensor,
-        precip_mask: torch.Tensor,
+        precip_mask: Optional[torch.Tensor],
         decoder_input_mode: Optional[str] = None,
         precip_visible: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mode = self.default_decoder_input_mode if decoder_input_mode is None else str(decoder_input_mode).strip().lower()
+        if precip_mask is None:
+            return noisy_precip
         if mode in {"compose_visible", "visible_noise", "inpaint", "noisy_visible"}:
             if precip_visible is None:
                 return noisy_precip
@@ -681,7 +687,7 @@ class WoFSDiffMAE(nn.Module):
         noisy_precip: torch.Tensor,
         t: torch.Tensor,
         cond_tokens: list[torch.Tensor],
-        precip_mask: torch.Tensor,
+        precip_mask: Optional[torch.Tensor],
         precip_visible: Optional[torch.Tensor] = None,
         decoder_input_mode: Optional[str] = None,
     ) -> torch.Tensor:
@@ -862,13 +868,24 @@ class WoFSDiffMAE(nn.Module):
         cond: Dict[str, torch.Tensor],
         precip_visible: Optional[torch.Tensor] = None,
         precip_mask: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> tuple[list[torch.Tensor], list[bool]]:
+        if self.pure_diffusion:
+            precip_visible = None
         cond_tokens = []
         encode_flags = []
         for mod in self.conditioned_modalities:
             if mod in cond:
-                cond_tokens.append(self.condition_adapters[mod](cond[mod]))
-                encode_flags.append(self.condition_encoder_inputs == "all")
+                tokens = self.condition_adapters[mod](cond[mod])
+                should_encode = self.condition_encoder_inputs == "all"
+                if self.condition_encoder_inputs == "reflectivity":
+                    should_encode = mod == "reflectivity"
+                if self.pure_diffusion:
+                    should_encode = mod in self.pure_diffusion_encoder_modalities
+                if self.pure_diffusion and should_encode and t is not None:
+                    tokens = tokens + self.time_mlp(t).unsqueeze(1).to(tokens.dtype)
+                cond_tokens.append(tokens)
+                encode_flags.append(should_encode)
         if precip_visible is not None:
             if precip_mask is None:
                 raise ValueError("precip_mask is required when precip_visible is used for conditioning")
@@ -922,8 +939,14 @@ class WoFSDiffMAE(nn.Module):
         cond: Dict[str, torch.Tensor],
         precip_visible: Optional[torch.Tensor] = None,
         precip_mask: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
-        cond_tokens, encode_flags = self._condition_tokens(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        cond_tokens, encode_flags = self._condition_tokens(
+            cond,
+            precip_visible=precip_visible,
+            precip_mask=precip_mask,
+            t=t,
+        )
         return self._encode_condition_tokens(cond_tokens, encode_flags)
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -962,7 +985,7 @@ class WoFSDiffMAE(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         cond: Dict[str, torch.Tensor],
-        precip_mask: torch.Tensor,
+        precip_mask: Optional[torch.Tensor],
         precip_visible: Optional[torch.Tensor] = None,
         cond_tokens: Optional[list[torch.Tensor]] = None,
         compose_inpaint: bool = True,
@@ -1120,7 +1143,7 @@ class WoFSDiffMAE(nn.Module):
         self,
         x_start: torch.Tensor,
         cond: Dict[str, torch.Tensor],
-        precip_mask: torch.Tensor,
+        precip_mask: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
         precip_visible: Optional[torch.Tensor] = None,
@@ -1131,6 +1154,9 @@ class WoFSDiffMAE(nn.Module):
         if noise is None:
             noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise)
+        if self.pure_diffusion:
+            precip_mask = None
+            precip_visible = None
         model_out = self.forward(x_t, t, cond, precip_mask, precip_visible=precip_visible)
         if self.objective == "pred_noise":
             target = noise
@@ -1147,10 +1173,15 @@ class WoFSDiffMAE(nn.Module):
         noisy_precip: torch.Tensor,
         t: torch.Tensor,
         cond: Dict[str, torch.Tensor],
-        precip_mask: torch.Tensor,
+        precip_mask: Optional[torch.Tensor] = None,
         precip_visible: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cond_tokens = self._condition_tokens_once(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        cond_tokens = self._condition_tokens_once(
+            cond,
+            precip_visible=None if self.pure_diffusion else precip_visible,
+            precip_mask=precip_mask,
+            t=t,
+        )
         return self._level_forward_with_condition_tokens(
             noisy_precip,
             t,
@@ -1164,7 +1195,7 @@ class WoFSDiffMAE(nn.Module):
         noisy_precip: torch.Tensor,
         t: torch.Tensor,
         cond_tokens: list[torch.Tensor],
-        precip_mask: torch.Tensor,
+        precip_mask: Optional[torch.Tensor],
         precip_visible: Optional[torch.Tensor] = None,
         decoder_input_mode: Optional[str] = None,
     ) -> torch.Tensor:
@@ -1208,7 +1239,11 @@ class WoFSDiffMAE(nn.Module):
         start_time = self.num_timesteps - 1
         if sampler == "repaint" and sampling_timesteps is not None:
             start_time = min(start_time, max(0, int(sampling_timesteps) - 1))
-        cond_tokens = self._condition_tokens_once(cond, precip_visible=precip_visible, precip_mask=precip_mask)
+        cond_tokens = None if self.pure_diffusion else self._condition_tokens_once(
+            cond,
+            precip_visible=precip_visible,
+            precip_mask=precip_mask,
+        )
         imgs = [img] if return_all_timesteps else None
 
         if sampler == "ddpm":
@@ -1306,6 +1341,16 @@ class WoFSDiffMAE(nn.Module):
             if imgs is not None:
                 imgs.append(img)
         return torch.stack(imgs, dim=1) if imgs is not None else img
+
+
+class WoFSPureDiffusionAblation(WoFSDiffMAE):
+    """Pure diffusion WoFS precip ablation with reflectivity encoded context."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("pure_diffusion", True)
+        kwargs.setdefault("condition_encoder_inputs", "reflectivity")
+        kwargs.setdefault("pure_diffusion_encoder_modalities", ["reflectivity"])
+        super().__init__(*args, **kwargs)
 
 
 class SinusoidalTimeEmbedding(nn.Module):

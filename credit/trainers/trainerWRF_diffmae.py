@@ -1,4 +1,4 @@
-"""Trainer for WoFS conditional DiffMAE precip inpainting."""
+"""Trainer for WoFS conditional precip diffusion / DiffMAE inpainting."""
 
 from __future__ import annotations
 
@@ -80,6 +80,16 @@ class TrainerDiffMAE(BaseTrainer):
                 f"Mask mode {mode!r} is no longer supported by WoFSDiffMAE; use 'cube_patch' for 3D precip patches."
             )
         raise ValueError(f"Unsupported precip mask mode: {mode!r}")
+
+    def _snapshot_mask(self, batch_size: int, conf: dict, device: torch.device) -> torch.Tensor:
+        snapshot_conf = conf["trainer"].get("denoise_snapshot", {})
+        mask_conf = dict(conf.get("eval", {}))
+        mask_conf.update(snapshot_conf.get("mask", {}))
+        if "precip_mask_ratio" not in mask_conf and "mask_ratio" not in mask_conf:
+            mask_conf["precip_mask_ratio"] = conf.get("eval", {}).get("precip_mask_ratio", 0.75)
+        if "precip_mask_mode" not in mask_conf and "mask_mode" not in mask_conf:
+            mask_conf["precip_mask_mode"] = conf.get("eval", {}).get("precip_mask_mode", "cube_patch")
+        return self._sample_mask(batch_size, mask_conf, device, validation=False)
 
     @staticmethod
     def _plot_field(ax, field: torch.Tensor, title: str, cmap: str = "viridis") -> None:
@@ -182,15 +192,19 @@ class TrainerDiffMAE(BaseTrainer):
         )
         t_total = time.perf_counter()
         with torch.no_grad():
+            precip_mask = losses.get("precip_mask")
+            if precip_mask is None:
+                precip_mask = self._snapshot_mask(1, conf, batch["precip"].device)
             t_pred = time.perf_counter()
             logger.info("Denoise snapshot model_predictions start: x_t=%s t=%s mask=%s",
-                        tuple(losses["x_t"][:1].shape), tuple(losses["t"][:1].shape), tuple(losses["precip_mask"][:1].shape))
+                        tuple(losses["x_t"][:1].shape), tuple(losses["t"][:1].shape), tuple(precip_mask[:1].shape))
             pred_noise, pred_x0 = model.model_predictions(
                 losses["x_t"][:1],
                 losses["t"][:1],
                 self._condition_dict({k: v[:1] for k, v in batch.items()}),
-                losses["precip_mask"][:1],
-                precip_visible=batch["precip"][:1],
+                None if getattr(model, "pure_diffusion", False) else precip_mask[:1],
+                precip_visible=None if getattr(model, "pure_diffusion", False) else batch["precip"][:1],
+                compose_inpaint=not getattr(model, "pure_diffusion", False),
             )
             logger.info("Denoise snapshot model_predictions done: pred_noise=%s pred_x0=%s elapsed=%.3fs",
                         tuple(pred_noise.shape), tuple(pred_x0.shape), time.perf_counter() - t_pred)
@@ -212,7 +226,7 @@ class TrainerDiffMAE(BaseTrainer):
                 )
                 sample = model.sample_precip(
                     self._condition_dict({k: v[:1] for k, v in batch.items()}),
-                    losses["precip_mask"][:1],
+                    precip_mask[:1],
                     precip_visible=sample_visible,
                     sampling_timesteps=sampling_steps,
                     eta=eta,
@@ -235,7 +249,7 @@ class TrainerDiffMAE(BaseTrainer):
                         "target_precip": batch["precip"][:1].detach().cpu(),
                         "pred_x0": pred_x0[:1].detach().cpu(),
                         "pred_noise": pred_noise[:1].detach().cpu(),
-                        "precip_mask": losses["precip_mask"][:1].detach().cpu(),
+                        "precip_mask": precip_mask[:1].detach().cpu(),
                         "sample": None if sample is None else sample[:1].detach().cpu(),
                     },
                     tensor_path,
@@ -251,7 +265,7 @@ class TrainerDiffMAE(BaseTrainer):
                     target=batch["precip"][:1],
                     noisy=losses["x_t"][:1],
                     pred_x0=pred_x0[:1],
-                    precip_mask=losses["precip_mask"][:1],
+                    precip_mask=precip_mask[:1],
                     sample=None if sample is None else sample[:1],
                     channel=int(snapshot_conf.get("channel", 0)),
                 )
@@ -287,8 +301,12 @@ class TrainerDiffMAE(BaseTrainer):
                 batch = next(dl_iter)
             batch = self._move_batch(batch)
             model = self._unwrap_model()
-            precip_mask = self._sample_mask(batch["precip"].shape[0], trainer_conf, batch["precip"].device)
-            precip_visible = batch["precip"] if bool(trainer_conf.get("visible_precip_conditioning", False)) else None
+            pure_diffusion = bool(getattr(model, "pure_diffusion", False) or trainer_conf.get("pure_diffusion_training", False))
+            precip_mask = None
+            precip_visible = None
+            if not pure_diffusion:
+                precip_mask = self._sample_mask(batch["precip"].shape[0], trainer_conf, batch["precip"].device)
+                precip_visible = batch["precip"] if bool(trainer_conf.get("visible_precip_conditioning", False)) else None
 
             with autocast(enabled=amp):
                 losses = model.p_losses(
@@ -314,7 +332,8 @@ class TrainerDiffMAE(BaseTrainer):
             results_dict["train_loss"].append(loss_t.item())
             results_dict["train_precip_diffusion_loss"].append(loss_t.item())
 
-            losses["precip_mask"] = precip_mask
+            if precip_mask is not None:
+                losses["precip_mask"] = precip_mask
             self._maybe_save_denoise_snapshot(epoch, i, conf, batch, losses)
 
             if conf["trainer"]["use_scheduler"] and conf["trainer"]["scheduler"]["scheduler_type"] in update_on_batch:
@@ -328,7 +347,7 @@ class TrainerDiffMAE(BaseTrainer):
                     )
                 )
             if not np.isfinite(np.mean(results_dict["train_loss"])):
-                logger.warning("Non-finite DiffMAE loss encountered, stopping epoch early.")
+                logger.warning("Non-finite precip diffusion loss encountered, stopping epoch early.")
                 break
 
         pbar.close()
@@ -357,8 +376,17 @@ class TrainerDiffMAE(BaseTrainer):
                     break
                 batch = self._move_batch(batch)
                 model = self._unwrap_model()
-                precip_mask = self._sample_mask(batch["precip"].shape[0], trainer_conf, batch["precip"].device, validation=True)
-                precip_visible = batch["precip"] if bool(trainer_conf.get("visible_precip_conditioning", False)) else None
+                pure_diffusion = bool(getattr(model, "pure_diffusion", False) or trainer_conf.get("pure_diffusion_training", False))
+                precip_mask = None
+                precip_visible = None
+                if not pure_diffusion:
+                    precip_mask = self._sample_mask(
+                        batch["precip"].shape[0],
+                        trainer_conf,
+                        batch["precip"].device,
+                        validation=True,
+                    )
+                    precip_visible = batch["precip"] if bool(trainer_conf.get("visible_precip_conditioning", False)) else None
                 with autocast(enabled=amp):
                     losses = model.p_losses(
                         batch["precip"],

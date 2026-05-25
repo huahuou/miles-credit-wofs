@@ -24,7 +24,7 @@ from credit.models.wxformer.crossformer_wrf_ensemble import CrossFormerWRFEnsemb
 from credit.models.wxformer.aurora_crossformer_wrf import AuroraCrossFormerWRF
 from credit.models.wxformer.aurora_crossformer_wrf_da import AuroraCrossFormerWRFDA
 from credit.models.wofs_mae import WoFSMultiModalMAE
-from credit.models.wofs_diffmae import WoFSDiffMAE
+from credit.models.wofs_diffmae import WoFSDiffMAE, WoFSPureDiffusionAblation
 from credit.models.wofs_maskdit import WoFSMaskDiT
 
 
@@ -83,6 +83,10 @@ model_types = {
     "unet_downscaling": (DownscalingSegmentationModel, "Loading downscaling U-net"),
     "wofs-mae": (WoFSMultiModalMAE, "Multi-modal MAE for WoFS data assimilation"),
     "wofs-diffmae": (WoFSDiffMAE, "Conditional DiffMAE for WoFS precip inpainting"),
+    "wofs-pure-diffusion": (
+        WoFSPureDiffusionAblation,
+        "Pure diffusion ablation for WoFS precip with reflectivity conditioning",
+    ),
     "wofs-maskdit": (WoFSMaskDiT, "MaskDiT-style conditional diffusion model for WoFS precip inpainting"),
 }
 
@@ -120,7 +124,7 @@ def load_fsdp_or_checkpoint_policy(conf):
         }
     # FuXi
     # FuXi supports "spectral_norm = True" only
-    elif "wofs-diffmae" in conf["model"]["type"] or "wofs-maskdit" in conf["model"]["type"]:
+    elif "wofs-diffmae" in conf["model"]["type"] or "wofs-pure-diffusion" in conf["model"]["type"] or "wofs-maskdit" in conf["model"]["type"]:
         from credit.models.wofs_mae_adapters import Block
         from credit.models.wofs_diffmae import CrossSelfDecoderBlock
         from credit.models.wofs_maskdit import MaskDiTBlock

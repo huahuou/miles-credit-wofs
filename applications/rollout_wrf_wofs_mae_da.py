@@ -241,7 +241,7 @@ def _sample_mask(model: torch.nn.Module, eval_conf: dict, batch_size: int, devic
         )
     if mask_mode in {"channel_patch", "random_channel", "channel", "group_patch", "variable_patch", "grouped"}:
         return core.random_channel_precip_mask(batch_size, mask_ratio, device)
-    if mask_mode in {"spatial_patch", "spatial", "patch"}:
+    if mask_mode in {"spatial_patch", "spatial", "patch", "cube_patch", "3d_patch"}:
         return core.random_precip_mask(batch_size, mask_ratio, device)
     raise ValueError(f"Unsupported eval precip_mask_mode: {mask_mode!r}")
 

@@ -58,6 +58,10 @@ trainer_types = {
         TrainerDiffMAE,
         "Conditional DiffMAE trainer for WoFS precip random-mask inpainting.",
     ),
+    "standard-wrf-pure-diffusion": (
+        TrainerDiffMAE,
+        "Pure diffusion trainer for WoFS precip full-field denoising.",
+    ),
 }
 
 
