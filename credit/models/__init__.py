@@ -26,6 +26,7 @@ from credit.models.wxformer.aurora_crossformer_wrf_da import AuroraCrossFormerWR
 from credit.models.wofs_mae import WoFSMultiModalMAE
 from credit.models.wofs_diffmae import WoFSDiffMAE, WoFSPureDiffusionAblation
 from credit.models.wofs_maskdit import WoFSMaskDiT
+from credit.models.wofs_fcdm import WoFSFCDMXL
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ model_types = {
         "Pure diffusion ablation for WoFS precip with reflectivity conditioning",
     ),
     "wofs-maskdit": (WoFSMaskDiT, "MaskDiT-style conditional diffusion model for WoFS precip inpainting"),
+    "wofs-fcdm": (WoFSFCDMXL, "FCDM-XL style 2.5D conditional diffusion model for WoFS precip"),
 }
 
 
@@ -124,12 +126,13 @@ def load_fsdp_or_checkpoint_policy(conf):
         }
     # FuXi
     # FuXi supports "spectral_norm = True" only
-    elif "wofs-diffmae" in conf["model"]["type"] or "wofs-pure-diffusion" in conf["model"]["type"] or "wofs-maskdit" in conf["model"]["type"]:
+    elif "wofs-diffmae" in conf["model"]["type"] or "wofs-pure-diffusion" in conf["model"]["type"] or "wofs-maskdit" in conf["model"]["type"] or "wofs-fcdm" in conf["model"]["type"]:
         from credit.models.wofs_mae_adapters import Block
         from credit.models.wofs_diffmae import CrossSelfDecoderBlock
         from credit.models.wofs_maskdit import MaskDiTBlock
+        from credit.models.wofs_fcdm import ConvNeXtBlock as FCDMConvNeXtBlock
 
-        transformer_layers_cls = {Block, CrossSelfDecoderBlock, MaskDiTBlock}
+        transformer_layers_cls = {Block, CrossSelfDecoderBlock, MaskDiTBlock, FCDMConvNeXtBlock}
 
     elif "fuxi" in conf["model"]["type"] or ("wrf" in conf["model"]["type"]) or ("dscale" in conf["model"]["type"]):
         from timm.models.swin_transformer_v2 import SwinTransformerV2Stage

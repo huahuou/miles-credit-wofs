@@ -317,6 +317,22 @@ class TrainerDiffMAE(BaseTrainer):
                 )
                 loss = losses["loss"]
 
+            if not torch.isfinite(loss):
+                logger.warning(
+                    "Non-finite precip diffusion loss before backward: epoch=%s step=%s rank=%s loss=%s",
+                    epoch,
+                    i,
+                    self.rank,
+                    loss.detach().float().item(),
+                )
+                loss_t = torch.tensor([float("nan")], device=self.device)
+                if distributed:
+                    dist.all_reduce(loss_t, dist.ReduceOp.AVG, async_op=False)
+                results_dict["train_loss"].append(loss_t.item())
+                results_dict["train_precip_diffusion_loss"].append(loss_t.item())
+                optimizer.zero_grad(set_to_none=True)
+                break
+
             scaler.scale(loss / grad_accum_every).backward()
             if (i + 1) % grad_accum_every == 0:
                 if grad_max_norm is not None:

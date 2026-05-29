@@ -62,6 +62,10 @@ trainer_types = {
         TrainerDiffMAE,
         "Pure diffusion trainer for WoFS precip full-field denoising.",
     ),
+    "standard-wrf-fcdm": (
+        TrainerDiffMAE,
+        "FCDM-style conditional diffusion trainer for WoFS precip inpainting.",
+    ),
 }
 
 

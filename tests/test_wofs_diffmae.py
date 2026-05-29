@@ -3,6 +3,7 @@ import torch
 
 from credit.datasets.wrf_wofs_mae import WoFSMAEDataset
 from credit.models.wofs_diffmae import WoFSDiffMAE
+from credit.models.wofs_fcdm import WoFSFCDMXL
 from credit.trainers.trainerWRF_diffmae import TrainerDiffMAE
 from credit.transforms.concentration import forward_concentration_transform_numpy, parse_concentration_transform_payload
 from applications.rollout_wrf_wofs_mae_da import _build_condition_dict, _sample_mask
@@ -116,6 +117,38 @@ def _small_3d_model():
     )
 
 
+def _small_fcdm_model():
+    return WoFSFCDMXL(
+        modality_channels={
+            "background": 6,
+            "precip": 6,
+            "reflectivity": 3,
+            "surface": 1,
+            "forcing": 2,
+        },
+        precip_group_names=["rain", "hail"],
+        precip_group_channels=[3, 3],
+        level_count=3,
+        include_visible_precip=False,
+        include_mask_channel=False,
+        image_size=(16, 16),
+        fcdm_hidden_size=32,
+        fcdm_depth=[1, 1, 2, 1, 1],
+        fcdm_mlp_ratio=2.0,
+        fcdm_spatial_kernel_size=3,
+        fcdm_vertical_kernel_size=3,
+        fcdm_vertical_mixing_interval=1,
+        diffusion={
+            "timesteps": 32,
+            "sampling_timesteps": 4,
+            "objective": "pred_x0",
+            "beta_schedule": "sigmoid",
+            "ddim_sampling_eta": 0.0,
+            "inpaint_mode": "compose_visible",
+        },
+    )
+
+
 def _cond(batch=2):
     return {
         "background": torch.randn(batch, 2, 16, 16),
@@ -131,6 +164,15 @@ def _cond_grouped(batch=2):
         "surface": torch.randn(batch, 1, 16, 16),
         "forcing": torch.randn(batch, 2, 16, 16),
         "reflectivity": torch.randn(batch, 1, 16, 16),
+    }
+
+
+def _cond_fcdm(batch=2):
+    return {
+        "background": torch.randn(batch, 6, 16, 16),
+        "surface": torch.randn(batch, 1, 16, 16),
+        "forcing": torch.randn(batch, 2, 16, 16),
+        "reflectivity": torch.randn(batch, 3, 16, 16),
     }
 
 
@@ -527,6 +569,67 @@ def test_3d_precip_tokenization_forward_and_sampling_are_finite():
     assert torch.isfinite(losses["loss"])
 
     sample = model.sample_precip(cond, mask, sampling_timesteps=2)
+    assert sample.shape == precip.shape
+    assert torch.isfinite(sample).all()
+
+
+def test_fcdm_wrapper_forward_loss_and_sampling_are_finite():
+    model = _small_fcdm_model()
+    precip = torch.randn(2, 6, 16, 16)
+    cond = _cond_fcdm(batch=2)
+    mask = model.random_precip_mask(2, 0.5, torch.device("cpu"))
+
+    pixel_mask = model.expand_patch_mask(mask, 16, 16)
+    assert pixel_mask.shape == (2, 3, 16, 16)
+    assert model.backbone.x_embedder.weight.ndim == 5
+
+    losses = model.p_losses(precip, cond, mask)
+    assert losses["loss"].ndim == 0
+    assert torch.isfinite(losses["loss"])
+
+    sample = model.sample_precip(cond, mask, sampling_timesteps=2)
+    assert sample.shape == precip.shape
+    assert torch.isfinite(sample).all()
+
+
+def test_fcdm_wrapper_accepts_visible_precip_and_mask_channels_when_enabled():
+    model = WoFSFCDMXL(
+        modality_channels={
+            "background": 6,
+            "precip": 6,
+            "reflectivity": 3,
+            "surface": 1,
+            "forcing": 2,
+        },
+        precip_group_names=["rain", "hail"],
+        precip_group_channels=[3, 3],
+        level_count=3,
+        include_visible_precip=True,
+        include_mask_channel=True,
+        image_size=(16, 16),
+        fcdm_hidden_size=32,
+        fcdm_depth=[1, 1, 2, 1, 1],
+        fcdm_mlp_ratio=2.0,
+        fcdm_spatial_kernel_size=3,
+        fcdm_vertical_kernel_size=3,
+        fcdm_vertical_mixing_interval=1,
+        diffusion={
+            "timesteps": 32,
+            "sampling_timesteps": 4,
+            "objective": "pred_x0",
+            "beta_schedule": "sigmoid",
+            "ddim_sampling_eta": 0.0,
+            "inpaint_mode": "compose_visible",
+        },
+    )
+    precip = torch.randn(1, 6, 16, 16)
+    cond = _cond_fcdm(batch=1)
+    visible = torch.randn_like(precip)
+    mask = model.random_precip_mask(1, 0.5, torch.device("cpu"))
+
+    losses = model.p_losses(precip, cond, mask, precip_visible=visible)
+    assert torch.isfinite(losses["loss"])
+    sample = model.sample_precip(cond, mask, precip_visible=visible, sampling_timesteps=2)
     assert sample.shape == precip.shape
     assert torch.isfinite(sample).all()
 
